@@ -1,0 +1,8 @@
+description = "What every machine gets: networking, sudo, git, build tools, man pages, package cache cleanup"
+category    = "system"
+
+[packages]
+pacman = ["networkmanager", "sudo", "git", "base-devel", "man-db", "man-pages", "less", "pacman-contrib"]
+
+[units]
+system = ["NetworkManager.service", "paccache.timer"]

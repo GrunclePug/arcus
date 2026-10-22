@@ -1,0 +1,5 @@
+description = "AMD graphics: Mesa, Vulkan"
+category    = "hardware"
+
+[packages]
+pacman = ["mesa", "vulkan-radeon"]

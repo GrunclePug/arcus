@@ -1,0 +1,23 @@
+# VM smoke plan: UEFI, ext4 on LUKS. The passphrase comes on stdin.
+version = 1
+
+[disk]
+device     = "/dev/vda"
+filesystem = "ext4"
+encrypt    = true
+swap       = "zram"
+
+[system]
+hostname = "vmtest"
+timezone = "UTC"
+locale   = "en_US.UTF-8"
+keymap   = "us"
+kernel   = "linux"
+
+[user]
+name          = "tester"
+password_hash = "$6$arcusvmtest$tzEF88V32dcYDJZa4UQwMy1PUekFDO.C9AyBGC8H794K5gcJtv2P7UJecZYFSgtlB7xQ9XpOTvW4.uZmy2wgU1"  # "tester"
+wheel         = true
+
+[host]
+modules = ["base", "vm-qemu"]

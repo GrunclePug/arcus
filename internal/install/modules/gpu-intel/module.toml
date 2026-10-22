@@ -1,0 +1,5 @@
+description = "Intel graphics: Mesa, Vulkan, video decoding"
+category    = "hardware"
+
+[packages]
+pacman = ["mesa", "vulkan-intel", "intel-media-driver"]

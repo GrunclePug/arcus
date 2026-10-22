@@ -1,0 +1,28 @@
+# The laptop profile of github.com/grunclepug/dot on UEFI and xfs.
+version = 1
+
+[disk]
+device     = "/dev/vda"
+filesystem = "xfs"
+swap       = "none"
+
+[system]
+hostname = "vmtest"
+timezone = "UTC"
+locale   = "en_US.UTF-8"
+keymap   = "us"
+kernel   = "linux"
+multilib = true
+
+[user]
+name          = "tester"
+password_hash = "$6$arcusvmtest$tzEF88V32dcYDJZa4UQwMy1PUekFDO.C9AyBGC8H794K5gcJtv2P7UJecZYFSgtlB7xQ9XpOTvW4.uZmy2wgU1"  # "tester"
+wheel         = true
+
+[host]
+profiles = ["laptop"]
+modules  = ["amd-cpu"]
+
+[dotfiles]
+url  = "https://github.com/grunclepug/dot"
+path = "~/builds/dot"

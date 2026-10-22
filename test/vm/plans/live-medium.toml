@@ -1,0 +1,20 @@
+# Must be refused: the live medium is not a disk to install on.
+version = 1
+
+[disk]
+device     = "/dev/vdb"     # the ISO, attached as the second disk
+filesystem = "ext4"
+swap       = "none"
+
+[system]
+hostname = "vmtest"
+timezone = "UTC"
+locale   = "en_US.UTF-8"
+keymap   = "us"
+kernel   = "linux"
+
+[user]
+name = "tester"
+
+[host]
+modules = ["base"]

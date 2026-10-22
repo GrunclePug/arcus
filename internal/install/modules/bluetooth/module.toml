@@ -1,0 +1,8 @@
+description = "Bluetooth: bluez"
+category    = "hardware"
+
+[packages]
+pacman = ["bluez", "bluez-utils"]
+
+[units]
+system = ["bluetooth.service"]

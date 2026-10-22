@@ -1,0 +1,6 @@
+# The agent is started by udev when the VM has the guest channel.
+description = "QEMU guest agent"
+category    = "hardware"
+
+[packages]
+pacman = ["qemu-guest-agent"]

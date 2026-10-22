@@ -1,0 +1,44 @@
+# Lint and test every push and pull request. A v* tag also builds the
+# binaries and publishes them as a GitHub release.
+name: ci
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: make lint test
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Tag matches VERSION
+        run: test "$GITHUB_REF_NAME" = "v$(sed -n 's/^VERSION = //p' config.mk)"
+      - run: make release
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" --verify-tag
+          --title "arcus ${GITHUB_REF_NAME#v}" --generate-notes
+          bin/arcus bin/arcus-install bin/sha256sums.txt

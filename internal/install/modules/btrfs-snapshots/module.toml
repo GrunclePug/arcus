@@ -1,0 +1,11 @@
+# snapper keeps snapshots of / in the @snapshots subvolume, mounted at
+# /.snapshots. snap-pac takes one before and after every pacman
+# transaction, and grub-btrfs lists them in the boot menu.
+description = "btrfs snapshots of /: snapper, snap-pac, grub-btrfs"
+category    = "system"
+
+[packages]
+pacman = ["snapper", "snap-pac", "grub-btrfs", "inotify-tools"]
+
+[units]
+system = ["snapper-timeline.timer", "snapper-cleanup.timer", "grub-btrfsd.service"]
