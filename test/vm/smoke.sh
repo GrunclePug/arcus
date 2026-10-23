@@ -11,6 +11,8 @@
 # bios     BIOS + xfs + a swap partition + linux-lts: install, boot, check
 # dot      the laptop profile of github.com/grunclepug/dot: install, then
 #          check it in a chroot (downloads several GB)
+# matrix   every firmware, filesystem and encryption combination: install,
+#          boot, check (12 installs; MATRIX_FW=uefi or bios runs half)
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -19,9 +21,10 @@ iso=$("$here/iso.sh")
 cache=${XDG_CACHE_HOME:-$HOME/.cache}/arcus/vm
 ovmf=/usr/share/edk2/x64
 logs=$cache/logs
-work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
 mkdir -p "$logs"
+# On disk, not in /tmp: the installed disks take a few GiB each.
+work=$(mktemp -d "$cache/run.XXXXXX")
+trap 'rm -rf "$work"' EXIT
 (cd "$here/../.." && go build -o "$work/qga" ./test/vm/qga)
 
 boot=${iso%.iso} # the ISO's kernel, initramfs and boot options (iso.sh)
@@ -190,6 +193,47 @@ mount /dev/vda2 /mnt && mount /dev/vda1 /mnt/boot
 $in_chroot plan -host vmtest
 $in_chroot doctor -host vmtest && echo \"arcus-vm: doctor clean\""
 	expect dot "arcus-vm: installed" "Nothing to do." "arcus-vm: doctor clean"
+}
+
+# combination NAME uefi|bios FILESYSTEM yes|no: installs a plan for the
+# combination, boots it and checks that it is what the plan asked for.
+combination() {
+	name=$1 fw=$2 fs=$3 enc=$4
+	encrypt=false modules='"base", "vm-qemu"'
+	[ "$enc" = yes ] && encrypt=true
+	[ "$fs" = btrfs ] && modules='"base", "btrfs-snapshots", "vm-qemu"'
+	mkdir -p "$work/$name"
+	sed -e "s/^filesystem = .*/filesystem = \"$fs\"/" -e "s/^encrypt    = .*/encrypt    = $encrypt/" \
+		-e "s/^modules = .*/modules = [$modules]/" "$here/plans/uefi-ext4-luks.toml" > "$work/$name/combination.toml"
+	vm "$name" "$fw" 24G 'printf "arcusvm\narcusvm\n" | ./arcus-install run -yes combination.toml && echo "arcus-vm: installed"'
+	expect "$name" "arcus-vm: installed"
+	grep -aq "arcus-vm: installed" "$logs/$name.log" || return 0
+	installed "$name" "$fw" -smbios type=11,value=io.systemd.credential:cryptsetup.passphrase=arcusvm
+	booted "$name"
+	if [ "$fw" = uefi ]; then
+		guest "$name" "booted UEFI" 'test -d /sys/firmware/efi'
+	else
+		guest "$name" "booted BIOS" '! test -d /sys/firmware/efi'
+	fi
+	guest "$name" "$fs root" "test \"\$(findmnt -no FSTYPE /)\" = $fs"
+	if [ "$enc" = yes ]; then
+		guest "$name" "root is on LUKS" 'findmnt -no SOURCE / | grep -q "^/dev/mapper/root"'
+	else
+		guest "$name" "root is not encrypted" '! test -e /dev/mapper/root'
+	fi
+	guest "$name" "swap on zram" 'swapon --show=NAME --noheadings | grep -q zram'
+	stop "$name"
+	rm -f "$work/$name/disk.qcow2"
+}
+
+scenario_matrix() {
+	for fw in ${MATRIX_FW:-uefi bios}; do
+		for fs in btrfs ext4 xfs; do
+			for enc in no yes; do
+				combination "matrix-$fw-$fs-$enc" "$fw" "$fs" "$enc"
+			done
+		done
+	done
 }
 
 for s in ${*:-check install luks bios}; do

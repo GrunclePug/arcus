@@ -43,7 +43,7 @@ lint:
 
 # Boots the Arch ISO in QEMU and runs arcus-install there.
 # Needs qemu-base and edk2-ovmf; the ISO is cached in ~/.cache/arcus/vm.
-# SCENARIOS picks them (default: check install luks bios; also: dot).
+# SCENARIOS picks them (default: check install luks bios; also: dot, matrix).
 vm-test: build
 	test/vm/smoke.sh ${SCENARIOS}
 
