@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"os"
 	"os/exec"
 	"os/user"
@@ -14,7 +15,6 @@ import (
 	"strings"
 
 	"github.com/grunclepug/arcus/internal/config"
-	"github.com/grunclepug/arcus/internal/host"
 	"github.com/grunclepug/arcus/internal/layer"
 	"github.com/grunclepug/arcus/internal/module"
 	"github.com/grunclepug/arcus/internal/profile"
@@ -43,7 +43,6 @@ Flags (before the arguments):
   -n              only show the plan
   -f              off: also turn off modules that require it; off, apply: move
                   files edited since deployment aside to <path>.arcus-foreign
-  -host <name>    use the host file of another machine
 
 arcus runs as your user and asks sudo for the root steps.
 `
@@ -147,15 +146,13 @@ func (a *app) run(args []string) error {
 // opts are the flags shared by the commands.
 type opts struct {
 	yes, dry, force, fix bool
-	host                 string
 }
 
-// flags returns a flag set with -host, plus -y and -n for changing commands
-// and -f when force is wanted.
+// flags returns a flag set with -y and -n for changing commands and -f when
+// force is wanted.
 func (a *app) flags(name string, o *opts, changing, force bool) *flag.FlagSet {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(a.stderr)
-	fs.StringVar(&o.host, "host", "", "use the host file of `name`")
 	if changing {
 		fs.BoolVar(&o.yes, "y", false, "don't ask for confirmation")
 		fs.BoolVar(&o.dry, "n", false, "only show the plan")
@@ -198,15 +195,23 @@ func (a *app) loadPaths(paths config.Paths) error {
 	return nil
 }
 
-func (a *app) hostPath(o *opts) (string, error) {
-	name := o.host
-	if name == "" {
-		var err error
-		if name, err = a.hostname(); err != nil {
-			return "", fmt.Errorf("reading the hostname: %w", err)
-		}
+// hostPath returns the host file. Before 0.2.0 it was
+// hosts/<hostname>.toml in the config directory; one left there is refused
+// with the command that moves it, so on doesn't start a new, empty one.
+func (a *app) hostPath() (string, error) {
+	path := a.paths.HostFile()
+	if _, err := os.Stat(path); !errors.Is(err, iofs.ErrNotExist) {
+		return path, nil
 	}
-	return host.Path(a.paths.Config, name)
+	name, err := a.hostname()
+	if err != nil {
+		return path, nil
+	}
+	old := filepath.Join(a.paths.Config, "hosts", name+".toml")
+	if _, err := os.Stat(old); err == nil {
+		return "", fmt.Errorf("the host file moved out of the config directory; move it with: mkdir -p %s && mv %s %s", filepath.Dir(path), old, path)
+	}
+	return path, nil
 }
 
 // half is the user or the system half: its state directory and layer.

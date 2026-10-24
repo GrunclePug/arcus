@@ -105,9 +105,17 @@ func (e *env) module(name, manifest string, files map[string]string) string {
 	return dir
 }
 
+// hostPath returns the host file's path, creating its directory.
+func (e *env) hostPath() string {
+	e.t.Helper()
+	path := filepath.Join(e.home, ".local", "state", "arcus", "host.toml")
+	must(e.t, os.MkdirAll(filepath.Dir(path), 0o755))
+	return path
+}
+
 func (e *env) hostModules() []string {
 	e.t.Helper()
-	f, err := host.Load(filepath.Join(e.home, ".config", "arcus", "hosts", "testhost.toml"))
+	f, err := host.Load(e.hostPath())
 	if errors.Is(err, iofs.ErrNotExist) {
 		return nil
 	}
@@ -682,7 +690,7 @@ func (e *env) profileFile(name, content string) {
 
 func (e *env) hostFile() *host.File {
 	e.t.Helper()
-	f, err := host.Load(filepath.Join(e.home, ".config", "arcus", "hosts", "testhost.toml"))
+	f, err := host.Load(e.hostPath())
 	must(e.t, err)
 	return f
 }
@@ -833,7 +841,7 @@ func TestRegroupMovesFilesWithoutBackups(t *testing.T) {
 	must(t, os.RemoveAll(filepath.Join(modules, "nvim")))
 	must(t, os.Remove(filepath.Join(modules, "shell", "home/.config/tmux/tmux.conf")))
 	e.module("dev", "", map[string]string{"home/.config/nvim/init.lua": "nvim", "home/.config/tmux/tmux.conf": "tmux", "home/.inputrc": "nvim"})
-	must(t, os.WriteFile(filepath.Join(e.home, ".config", "arcus", "hosts", "testhost.toml"),
+	must(t, os.WriteFile(e.hostPath(),
 		[]byte("modules = [\n  \"shell\",\n  \"dev\",\n]\n"), 0o644))
 
 	must(t, e.run("plan"))
@@ -869,10 +877,9 @@ func TestStackFollowsDesiredOrder(t *testing.T) {
 	for _, name := range []string{"a", "b", "c"} {
 		e.module(name, "", map[string]string{"home/.rc": name})
 	}
-	hostFile := filepath.Join(e.home, ".config", "arcus", "hosts", "testhost.toml")
+	hostFile := e.hostPath()
 	order := func(names ...string) {
 		t.Helper()
-		must(t, os.MkdirAll(filepath.Dir(hostFile), 0o755))
 		quoted := make([]string, len(names))
 		for i, n := range names {
 			quoted[i] = strconv.Quote(n)
@@ -912,7 +919,7 @@ func TestHandOverRecordsTheNewOwner(t *testing.T) {
 	modules := filepath.Join(e.home, ".config", "arcus", "modules")
 	must(t, os.RemoveAll(filepath.Join(modules, "old")))
 	e.module("new", "[packages]\npacman = [\"foot\"]\n", nil)
-	must(t, os.WriteFile(filepath.Join(e.home, ".config", "arcus", "hosts", "testhost.toml"), []byte("modules = [\"new\"]\n"), 0o644))
+	must(t, os.WriteFile(e.hostPath(), []byte("modules = [\"new\"]\n"), 0o644))
 
 	must(t, e.run("plan"))
 	if !strings.Contains(e.out.String(), "foot: old → new") {
@@ -1010,12 +1017,12 @@ func TestMachine(t *testing.T) {
 	must(t, os.RemoveAll(filepath.Join(e.root, "etc/arcus/modules/machine")))
 	e.module("shell", "", nil)
 	must(t, e.run("on", "-y", "shell"))
-	must(t, os.WriteFile(filepath.Join(e.home, ".config", "arcus", "hosts", "testhost.toml"), []byte("profiles = [\"pc\"]\nmodules = [\"shell\"]\n"), 0o644))
+	must(t, os.WriteFile(e.hostPath(), []byte("profiles = [\"pc\"]\nmodules = [\"shell\"]\n"), 0o644))
 	must(t, e.run("machine", "-y"))
 	if !strings.Contains(e.out.String(), "Profile pc turns it on") {
 		t.Errorf("machine -y, the pc profile selects it:\n%s", e.out.String())
 	}
-	must(t, os.WriteFile(filepath.Join(e.home, ".config", "arcus", "hosts", "testhost.toml"), []byte("modules = [\"shell\"]\n"), 0o644))
+	must(t, os.WriteFile(e.hostPath(), []byte("modules = [\"shell\"]\n"), 0o644))
 	if !strings.Contains(e.read("etc/arcus/modules/machine/module.toml"), `"linux", "linux-firmware", "intel-ucode", "grub", "efibootmgr", "dosfstools", "e2fsprogs", "zram-generator"`) {
 		t.Fatalf("module.toml:\n%s", e.read("etc/arcus/modules/machine/module.toml"))
 	}
@@ -1092,7 +1099,7 @@ func TestOnSwapsConflicts(t *testing.T) {
 	}
 
 	e.profileFile("look", "modules = [\"aurora\"]\n")
-	must(t, os.WriteFile(filepath.Join(e.home, ".config", "arcus", "hosts", "testhost.toml"), []byte("profiles = [\"look\"]\n"), 0o644))
+	must(t, os.WriteFile(e.hostPath(), []byte("profiles = [\"look\"]\n"), 0o644))
 	if err := e.run("on", "-y", "nebula"); err == nil || !strings.Contains(err.Error(), "profile \"look\"") {
 		t.Errorf("on nebula against a profile: %v", err)
 	}
@@ -1116,5 +1123,24 @@ func TestAddedFileReplacesOne(t *testing.T) {
 	must(t, e.run("apply", "-y"))
 	if e.read("home/u/.config/fastfetch/config.jsonc") != "module" || e.read("home/u/.config/fastfetch/config.jsonc.orig") != "mine" {
 		t.Error("apply must deploy the module's file and keep the original")
+	}
+}
+
+// A host file left in the config directory by arcus before 0.2.0 is
+// refused with the move command, so on doesn't start an empty one.
+func TestOldHostFileRefused(t *testing.T) {
+	e := newEnv(t)
+	e.module("shell", "", nil)
+	old := filepath.Join(e.home, ".config", "arcus", "hosts", "testhost.toml")
+	must(t, os.MkdirAll(filepath.Dir(old), 0o755))
+	must(t, os.WriteFile(old, []byte("modules = [\"shell\"]\n"), 0o644))
+
+	for _, args := range [][]string{{"plan"}, {"on", "-y", "shell"}} {
+		if err := e.run(args...); err == nil || !strings.Contains(err.Error(), "mv "+old+" ") {
+			t.Errorf("%v: %v", args, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(e.home, ".local", "state", "arcus", "host.toml")); err == nil {
+		t.Error("a new host file was started")
 	}
 }

@@ -179,7 +179,7 @@ func (a *app) change(o *opts, create bool, edit func(*host.File) error) error {
 	}
 	defer lock.Release()
 
-	path, err := a.hostPath(o)
+	path, err := a.hostPath()
 	if err != nil {
 		return err
 	}
@@ -234,7 +234,7 @@ func (a *app) change(o *opts, create bool, edit func(*host.File) error) error {
 
 // hostSelection loads this machine's host file and resolves what it selects.
 func (a *app) hostSelection(o *opts) (plan.Input, error) {
-	path, err := a.hostPath(o)
+	path, err := a.hostPath()
 	if err != nil {
 		return plan.Input{}, err
 	}

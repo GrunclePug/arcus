@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	iofs "io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -496,7 +495,7 @@ func (x *installer) modules() error {
 		}
 		config = filepath.Join(repo, x.p.Dotfiles.Arcus)
 	}
-	if err := x.hostFile(filepath.Join(target, config)); err != nil {
+	if err := x.hostFile(filepath.Join(target, config), filepath.Join(target, home, ".local/state/arcus/host.toml")); err != nil {
 		return err
 	}
 	if err := x.chroot("chown", "-R", u+":", home); err != nil {
@@ -520,7 +519,7 @@ func (x *installer) modules() error {
 	// apply picks up where it stopped, so a failed first apply gets two
 	// more tries.
 	for attempt := 1; ; attempt++ {
-		err := x.asUser("/usr/local/bin/arcus", "apply", "-y", "-host", x.p.System.Hostname)
+		err := x.asUser("/usr/local/bin/arcus", "apply", "-y")
 		if err == nil || attempt == 3 {
 			return err
 		}
@@ -528,35 +527,22 @@ func (x *installer) modules() error {
 	}
 }
 
-// hostFile writes the host file from the plan, or keeps the repository's
-// own for this host name; either way it selects the machine module.
-func (x *installer) hostFile(config string) error {
+// hostFile writes the host file at path from the plan, which always
+// selects the machine module (Host).
+func (x *installer) hostFile(config, path string) error {
 	profiles, err := profile.Scan(filepath.Join(config, "profiles"))
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(config, "hosts", x.p.System.Hostname+".toml")
-	f, err := host.Load(path)
-	switch {
-	case err == nil:
-		fmt.Fprintf(x.out, "using the repository's host file %s\n", strings.TrimPrefix(path, target))
-		if selected, _, err := profiles.Expand(f.Profiles, f.Modules); err != nil || slices.Contains(selected, machine.Name) {
-			return err
-		}
-		f.Modules = append([]string{machine.Name}, f.Modules...)
-	case errors.Is(err, iofs.ErrNotExist):
-		hostProfiles, hostModules, err := Host(x.p, profiles)
-		if err != nil {
-			return err
-		}
-		f = host.New(path)
-		f.Profiles, f.Modules = hostProfiles, hostModules
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			return err
-		}
-	default:
+	hostProfiles, hostModules, err := Host(x.p, profiles)
+	if err != nil {
 		return err
 	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	f := host.New(path)
+	f.Profiles, f.Modules = hostProfiles, hostModules
 	return f.Save()
 }
 

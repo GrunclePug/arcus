@@ -57,15 +57,15 @@ func (a *app) cmdMachine(args []string) error {
 	if err := a.sudo([]string{"-machine", "-hash", facts.Hash(), "-home", a.paths.Home, "-config", a.paths.Config}); err != nil {
 		return fmt.Errorf("writing the machine module: %w", err)
 	}
-	fmt.Fprintln(a.stdout, a.machineHint(&o))
+	fmt.Fprintln(a.stdout, a.machineHint())
 	return nil
 }
 
 // machineHint says what comes after writing the machine module: whether the
 // host file already selects it, through a profile or its own modules.
-func (a *app) machineHint(o *opts) string {
+func (a *app) machineHint() string {
 	const off = "Turn it on with 'arcus on machine', or list it in a profile."
-	path, err := a.hostPath(o)
+	path, err := a.hostPath()
 	if err != nil {
 		return off
 	}

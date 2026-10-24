@@ -115,7 +115,7 @@ func (a *app) inUse(o *opts, name string) error {
 	if refs := a.references(name); len(refs) > 0 {
 		return fmt.Errorf("%s refer to %q; remove those references first", strings.Join(refs, ", "), name)
 	}
-	path, err := a.hostPath(o)
+	path, err := a.hostPath()
 	if err != nil {
 		return err
 	}
@@ -230,7 +230,7 @@ func (a *app) cmdMv(args []string) error {
 		return fmt.Errorf("%s already exists", newDir)
 	}
 
-	path, err := a.hostPath(&o)
+	path, err := a.hostPath()
 	if err != nil {
 		return err
 	}

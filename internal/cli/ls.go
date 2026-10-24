@@ -32,7 +32,7 @@ func (a *app) cmdLs(args []string) error {
 	}
 
 	f := &host.File{}
-	path, err := a.hostPath(&o)
+	path, err := a.hostPath()
 	if err != nil {
 		return err
 	}

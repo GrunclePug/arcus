@@ -73,8 +73,8 @@ func Load(path, home string) (*Config, error) {
 // Paths are the directories arcus reads and writes.
 type Paths struct {
 	Home        string // the main user's $HOME, where home/ trees deploy
-	Config      string // ~/.config/arcus: config.toml, hosts/, modules/
-	UserState   string // ~/.local/state/arcus: user-half state and ledgers
+	Config      string // ~/.config/arcus: config.toml, profiles/, modules/
+	UserState   string // ~/.local/state/arcus: the host file, user-half state and ledgers
 	SystemState string // <root>/var/lib/arcus: system-half state and ledgers
 	Cache       string // ~/.cache/arcus: own builds (build/, pkg/, src/)
 	Machine     string // <root>/etc/arcus/modules: machine-local modules
@@ -103,6 +103,11 @@ func UserPaths(home, root string, getenv func(string) string) Paths {
 	}
 	return p
 }
+
+// HostFile is this machine's selection: its profiles and its own modules.
+// It is state, not config: on and off write it, and it never goes in a
+// shared repository.
+func (p Paths) HostFile() string { return filepath.Join(p.UserState, "host.toml") }
 
 // ModuleDirs returns the module directories: config/modules, the extra
 // ones from config.toml, then the machine-local ones.

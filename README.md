@@ -11,7 +11,7 @@ The project is in early development: until 1.0, commands and file formats may st
 ## Features
 
 * **Layered modules**: modules stack in order, the later one wins a shared file, and any module can be turned off in any order with the files below it restored byte for byte.
-* **Profiles**: a profile such as `laptop` lists the modules a kind of machine gets; a host file picks profiles and adds the machine's own modules on top.
+* **Profiles**: a profile such as `laptop` lists the modules a kind of machine gets; the machine's host file picks profiles and adds its own modules on top.
 * **Every resource kind is reversible**: turning a module off removes the packages, units, groups and files it brought, whether arcus installed them or took them over, but never ones another module still wants or that are protected.
 * **Same result on any machine**: a machine set up by hand ends up like a fresh install of the same profile after `arcus machine`, `apply` and `clean`.
 * **Own builds**: a module can carry PKGBUILD recipes; arcus builds them with makepkg as you, installs them with pacman, and rebuilds when a recipe changes.
@@ -20,7 +20,8 @@ The project is in early development: until 1.0, commands and file formats may st
 * **Plan, then act**: every change is shown before it runs, including diffs of changed system files.
 * **Least privilege**: arcus runs as you and asks sudo only for root steps; the root side refuses unless it recomputes exactly the steps you confirmed.
 * **Crash-safe**: a write-ahead ledger is fsynced before every file change, Ctrl-C rolls back cleanly, and `arcus doctor -fix` repairs what a power loss leaves behind.
-* **Plain files**: modules, profiles and host files are hand-written TOML with comments; state is readable JSON.
+* **Plain files**: modules, profiles and the host file are TOML with comments; state is readable JSON.
+* **Config apart from state**: modules and profiles can live in a dotfiles repository; what a machine has on stays on the machine.
 * **Static binaries**: pure Go, no CGO; `arcus` needs only the standard library and one TOML parser.
 
 ## Installation
@@ -94,18 +95,18 @@ user   = ["mako.service"]
 now    = false
 ```
 
-A profile is a file that lists modules in stacking order, and the host file `~/.config/arcus/hosts/<hostname>.toml` picks profiles and adds the machine's own modules:
+A profile is a file that lists modules in stacking order, and the host file `~/.local/state/arcus/host.toml` picks profiles and adds the machine's own modules:
 
 ```toml
 # ~/.config/arcus/profiles/laptop.toml
 modules = ["base", "machine", "shell", "desktop", "wl-base", "river-classic", "battery"]
 
-# ~/.config/arcus/hosts/<hostname>.toml
+# ~/.local/state/arcus/host.toml
 profiles = ["laptop"]
 modules  = ["aurora"]
 ```
 
-`arcus on` and `arcus off` take a module or a profile, edit those two lists and leave the rest of the file as you wrote it.
+`arcus on` and `arcus off` take a module or a profile, edit those two lists and leave the rest of the file as you wrote it. The host file is state: it stays on the machine, so turning modules on and off never changes a shared dotfiles repository. Before 0.2.0 it was `~/.config/arcus/hosts/<hostname>.toml`; until it is moved, arcus refuses to run and prints the command that moves it.
 
 ### Configuration
 
@@ -114,12 +115,11 @@ modules  = ["aurora"]
 | | `-y` | off | Don't ask for confirmation |
 | | `-n` | off | Only show the plan |
 | | `-f` | off | `off`: also turn off modules that require it; `off`, `apply`: move files edited since deployment aside to `<path>.arcus-foreign` |
-| | `-host` | hostname | Use another machine's host file |
 | | `-fix` | off | `doctor`: apply the safe repairs |
 | | `-yes` | off | `arcus-install run`: don't ask to type the device name |
 | | `-version` | | Print the version (both binaries) |
-| `XDG_CONFIG_HOME` | | `~/.config` | Holds `arcus/config.toml`, `arcus/hosts/`, `arcus/profiles/` and `arcus/modules/` |
-| `XDG_STATE_HOME` | | `~/.local/state` | Holds the user half's state and ledgers in `arcus/` |
+| `XDG_CONFIG_HOME` | | `~/.config` | Holds `arcus/config.toml`, `arcus/profiles/` and `arcus/modules/` |
+| `XDG_STATE_HOME` | | `~/.local/state` | Holds the host file (`arcus/host.toml`) and the user half's state and ledgers in `arcus/` |
 | `XDG_CACHE_HOME` | | `~/.cache` | Holds own builds, their packages and sources in `arcus/` |
 | `aur_helper` in `config.toml` | | `yay` | AUR helper: `yay` or `paru` |
 | `protected` in `config.toml` | | base, base-devel, linux, linux-firmware, sudo, pacman, systemd, the AUR helper | Extra packages arcus never removes |

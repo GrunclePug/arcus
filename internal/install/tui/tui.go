@@ -235,7 +235,7 @@ func pages() []page {
 			}, newField("size", m.plan.Disk.SwapSize, false)), nil
 		}},
 		{build: func(m *model) (step, tea.Cmd) {
-			return newForm("Host name", "This machine's name; its host file is hosts/<name>.toml.", func(v []string) error {
+			return newForm("Host name", "This machine's name.", func(v []string) error {
 				m.plan.System.Hostname = v[0]
 				return m.check("system.hostname")
 			}, newField("host name", m.plan.System.Hostname, false)), nil

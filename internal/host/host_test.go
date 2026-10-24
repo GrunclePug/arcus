@@ -101,12 +101,7 @@ func TestLoadMissingIsNotEmpty(t *testing.T) {
 }
 
 func TestAddRemoveSaveRoundTrip(t *testing.T) {
-	dir := t.TempDir()
-	path, err := Path(dir, "arch-e14")
-	if err != nil {
-		t.Fatal(err)
-	}
-
+	path := filepath.Join(t.TempDir(), "host.toml")
 	f := New(path)
 	f.AddModule("base")
 	f.AddModule("wl-base")
@@ -117,7 +112,7 @@ func TestAddRemoveSaveRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	f, err = Load(path)
+	f, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,17 +168,6 @@ func TestSaveWritesThroughSymlink(t *testing.T) {
 	data, _ := os.ReadFile(real)
 	if !strings.HasPrefix(string(data), "# mine\n") || !strings.Contains(string(data), `"base"`) {
 		t.Errorf("content = %q", data)
-	}
-}
-
-func TestPathRejectsUnsafeNames(t *testing.T) {
-	for _, bad := range []string{"", "../x", "a/b", ".hidden", "-x"} {
-		if _, err := Path("/cfg", bad); err == nil {
-			t.Errorf("%q should be rejected", bad)
-		}
-	}
-	if p, err := Path("/cfg", "arch-e14"); err != nil || p != "/cfg/hosts/arch-e14.toml" {
-		t.Errorf("Path = %q, %v", p, err)
 	}
 }
 

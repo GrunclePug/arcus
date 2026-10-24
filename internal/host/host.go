@@ -20,16 +20,6 @@ import (
 	"github.com/grunclepug/arcus/internal/module"
 )
 
-var hostNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9.-]*$`)
-
-// Path returns the host file of the machine called name inside configDir.
-func Path(configDir, name string) (string, error) {
-	if !hostNameRegex.MatchString(name) {
-		return "", fmt.Errorf("invalid host name %q", name)
-	}
-	return filepath.Join(configDir, "hosts", name+".toml"), nil
-}
-
 // File is a loaded host file.
 type File struct {
 	Path string

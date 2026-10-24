@@ -125,7 +125,7 @@ guest() {
 # booted NAME: the checks every installed system must pass.
 booted() {
 	guest "$1" "boots to a running system" 'systemctl is-system-running --wait | grep -qx running || { systemctl --failed; exit 1; }'
-	guest "$1" "host file exists" 'test -f /home/tester/.config/arcus/hosts/vmtest.toml'
+	guest "$1" "host file exists" 'test -f /home/tester/.local/state/arcus/host.toml'
 	guest "$1" "arcus doctor is clean" 'runuser -u tester -- arcus doctor'
 	guest "$1" "arcus plan is empty" 'runuser -u tester -- arcus plan | grep -qx "Nothing to do."'
 	guest "$1" "the machine module matches the system" 'runuser -u tester -- arcus machine | grep -q "up to date"'
@@ -190,8 +190,8 @@ scenario_dot() {
 	in_chroot='arch-chroot /mnt runuser -u tester -- env -i HOME=/home/tester PATH=/usr/local/bin:/usr/bin LANG=C.UTF-8 arcus'
 	vm dot uefi 48G "./arcus-install run -yes dot.toml && echo \"arcus-vm: installed\"
 mount /dev/vda2 /mnt && mount /dev/vda1 /mnt/boot
-$in_chroot plan -host vmtest
-$in_chroot doctor -host vmtest && echo \"arcus-vm: doctor clean\""
+$in_chroot plan
+$in_chroot doctor && echo \"arcus-vm: doctor clean\""
 	expect dot "arcus-vm: installed" "Nothing to do." "arcus-vm: doctor clean"
 }
 
