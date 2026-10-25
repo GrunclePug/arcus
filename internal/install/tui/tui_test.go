@@ -105,7 +105,7 @@ func TestDefaults(t *testing.T) {
 	}
 	key(m, "pw", "enter")
 	key(m, "enter") // dotfiles: none
-	if !strings.Contains(screen(m), "[x] gpu-amd") || !strings.Contains(screen(m), "(always)") {
+	if !strings.Contains(screen(m), "[x] machine") || !strings.Contains(screen(m), "(always)") {
 		t.Fatalf("modules screen:\n%s", screen(m))
 	}
 	key(m, "enter", "r")
@@ -114,7 +114,7 @@ func TestDefaults(t *testing.T) {
 	if !r.Run || r.Password != "pw" || p.Disk.Device != "/dev/nvme0n1" || p.System.Timezone != "Europe/Berlin" || p.User.Name != "me" {
 		t.Errorf("result = %+v, plan = %+v", r, p)
 	}
-	if want := []string{"base", "btrfs-snapshots", "gpu-amd"}; !slices.Equal(p.Host.Modules, want) {
+	if want := []string{"base", "btrfs-snapshots"}; !slices.Equal(p.Host.Modules, want) {
 		t.Errorf("modules = %v, want %v", p.Host.Modules, want)
 	}
 	if err := p.Validate(); err != nil {

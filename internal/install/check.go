@@ -165,9 +165,6 @@ func consistent(p *Plan, desired []string, fail func(string, ...any)) {
 	if on("btrfs-snapshots") && p.Disk.Filesystem != "btrfs" {
 		fail("btrfs-snapshots needs filesystem = \"btrfs\"")
 	}
-	if on("gpu-nvidia") && p.System.Kernel != "linux" {
-		fail("gpu-nvidia installs nvidia-open, which is built for kernel = \"linux\"")
-	}
 }
 
 // liveMedium returns how archiso finds its boot medium, from the kernel

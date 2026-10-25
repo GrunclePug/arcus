@@ -91,7 +91,7 @@ func TestModulesAndMachineFacts(t *testing.T) {
 	if err := WriteModules(dir); err != nil {
 		t.Fatal(err)
 	}
-	if set, err := module.Scan(dir); err != nil || len(set) != 7 {
+	if set, err := module.Scan(dir); err != nil || len(set) != 4 {
 		t.Fatalf("%d installer modules (%v)", len(set), err)
 	}
 
@@ -189,10 +189,6 @@ func TestCheck(t *testing.T) {
 		{"keymap", freeDisk, func(p *Plan) { p.System.Keymap = "dvorak" }, "keymap"},
 		{"unknown module", freeDisk, func(p *Plan) { p.Host.Modules = append(p.Host.Modules, "nope") }, "nope"},
 		{"snapshots need btrfs", freeDisk, func(p *Plan) { p.Disk.Filesystem = "xfs" }, "btrfs-snapshots needs"},
-		{"nvidia needs linux", freeDisk, func(p *Plan) {
-			p.System.Kernel = "linux-lts"
-			p.Host.Modules = append(p.Host.Modules, "gpu-nvidia")
-		}, "gpu-nvidia"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p, _ := Load(writePlan(t, validPlan))
@@ -366,7 +362,7 @@ func TestDetect(t *testing.T) {
 		"sys/bus/pci/devices/b/vendor":    "0x8086\n",
 		"sys/bus/pci/devices/c/class":     "0x020000\n", // Intel network card: not a GPU
 		"sys/bus/pci/devices/c/vendor":    "0x8086\n",
-		"sys/bus/pci/devices/d/class":     "0x030000\n", // QEMU's standard VGA: no module
+		"sys/bus/pci/devices/d/class":     "0x030000\n", // QEMU's standard VGA: no driver
 		"sys/bus/pci/devices/d/vendor":    "0x1234\n",
 		"sys/class/dmi/id/sys_vendor":     "QEMU\n",
 		"sys/class/bluetooth/hci0/uevent": "",
@@ -381,7 +377,10 @@ func TestDetect(t *testing.T) {
 		}
 	}
 	h := Detect(root)
-	if want := []string{"gpu-amd", "gpu-intel", "vm-qemu", "bluetooth"}; !slices.Equal(h.Modules(), want) {
+	if want := []string{"0x1002", "0x8086", "0x1234"}; !slices.Equal(h.GPUs, want) {
+		t.Errorf("GPUs = %v, want %v", h.GPUs, want)
+	}
+	if want := []string{"vm-qemu", "bluetooth"}; !slices.Equal(h.Modules(), want) {
 		t.Errorf("modules = %v, want %v (%+v)", h.Modules(), want, h)
 	}
 	if got := Detect(t.TempDir()).Modules(); len(got) != 0 {

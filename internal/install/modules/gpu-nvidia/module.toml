@@ -1,7 +1,0 @@
-# nvidia-open is built for the linux kernel; other kernels need
-# nvidia-open-dkms, which this module doesn't install.
-description = "NVIDIA graphics: open kernel modules, driver"
-category    = "hardware"
-
-[packages]
-pacman = ["nvidia-open", "nvidia-utils"]

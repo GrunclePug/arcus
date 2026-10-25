@@ -580,7 +580,7 @@ func (x *installer) aurHelper(set module.Set, configDir string) error {
 }
 
 func (x *installer) bootloader() error {
-	nvidia := slices.Contains(x.desired, "gpu-nvidia") && x.p.Dotfiles.URL == ""
+	nvidia := slices.Contains(x.facts.GPUs, machine.NVIDIA)
 	if h := hooks(x.p.Disk.Encrypt, nvidia); h != "" {
 		if err := write(filepath.Join(target, "etc/mkinitcpio.conf.d/10-arcus.conf"), h, 0o644); err != nil {
 			return err
