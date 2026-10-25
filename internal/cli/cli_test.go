@@ -810,7 +810,9 @@ func TestOwnBuilds(t *testing.T) {
 	}
 }
 
-func TestFailedBuildInstallsNothing(t *testing.T) {
+// Repository packages come before the build, so they stay, recorded; the
+// failed build installs nothing and leaves the host file alone.
+func TestFailedBuildInstallsNoOwnBuild(t *testing.T) {
 	e := newEnv(t)
 	t.Setenv("XDG_CACHE_HOME", "")
 	e.module("x11", "[packages]\npacman = [\"libx11\"]\nlocal = [\"dwm-arcus\"]\n", map[string]string{
@@ -820,8 +822,59 @@ func TestFailedBuildInstallsNothing(t *testing.T) {
 	if err := e.run("on", "-y", "x11"); err == nil || !strings.Contains(err.Error(), "building dwm-arcus") {
 		t.Fatalf("got %v", err)
 	}
-	if len(e.sys.Packages()) != 0 || e.hostModules() != nil {
-		t.Error("a failed build must stop before the package stage and leave the host file alone")
+	if !slices.Equal(e.sys.Packages(), []string{"libx11"}) || e.hostModules() != nil {
+		t.Errorf("packages %v: a failed build must install no own build and leave the host file alone", e.sys.Packages())
+	}
+	if got := e.state(true).Owned[state.Pacman]["x11"]; !slices.Equal(got, []string{"libx11"}) {
+		t.Errorf("libx11 not recorded: %v", got)
+	}
+}
+
+// Installed packages that the packages to install conflict with are shown
+// in the plan and removed right before the install that replaces them: the
+// repository ones before the build, which then finds its dependencies.
+func TestConflictingPackagesAreReplaced(t *testing.T) {
+	e := newEnv(t)
+	t.Setenv("XDG_CACHE_HOME", "")
+	e.module("stream", "[packages]\npacman = [\"river\"]\nlocal = [\"waylock-arcus\"]\n", map[string]string{
+		"pkg/waylock-arcus/PKGBUILD": "pkgname=waylock-arcus\npkgver=1.6.0\npkgrel=1\n",
+	})
+	e.sys.SetPackages("river-classic", "waylock")
+	e.sys.SetMeta("river conflicts river-classic", "waylock-arcus provides waylock", "waylock-arcus conflicts waylock")
+
+	must(t, e.run("plan", "stream"))
+	for _, want := range []string{
+		"root  remove packages that conflict with what is installed next: river-classic\n        x river-classic: conflicts with river\nroot  install packages for stream: river",
+		"root  remove packages that conflict with what is installed next: waylock\n        x waylock: conflicts with waylock-arcus\nroot  install own build for stream: waylock-arcus",
+	} {
+		if !strings.Contains(e.out.String(), want) {
+			t.Fatalf("plan lacks %q:\n%s", want, e.out.String())
+		}
+	}
+
+	must(t, e.run("on", "-y", "stream"))
+	if got := e.sys.Packages(); !slices.Equal(got, []string{"river", "waylock-arcus"}) {
+		t.Errorf("packages = %v", got)
+	}
+	var order []string
+	for _, line := range e.sys.Log() {
+		for _, call := range []string{"pacman -Rdd", "pacman -S ", "makepkg", "pacman -U"} {
+			if strings.HasPrefix(line, call) {
+				order = append(order, line)
+			}
+		}
+	}
+	if len(order) != 5 || order[0] != "pacman -Rdd --noconfirm river-classic" || !strings.HasPrefix(order[1], "pacman -S ") ||
+		!strings.HasPrefix(order[2], "makepkg") || order[3] != "pacman -Rdd --noconfirm waylock" || !strings.HasPrefix(order[4], "pacman -U") {
+		t.Errorf("calls:\n%s", strings.Join(order, "\n"))
+	}
+	st := e.state(true)
+	if !slices.Equal(st.Owned[state.Pacman]["stream"], []string{"river"}) || !slices.Equal(st.Owned[state.Local]["stream"], []string{"waylock-arcus"}) {
+		t.Errorf("owned = %v", st.Owned)
+	}
+	must(t, e.run("plan"))
+	if !strings.Contains(e.out.String(), "Nothing to do.") {
+		t.Errorf("not converged:\n%s", e.out.String())
 	}
 }
 

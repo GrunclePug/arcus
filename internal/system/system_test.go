@@ -114,19 +114,47 @@ func TestFailureIsReported(t *testing.T) {
 	}
 }
 
-func TestParseRequiredBy(t *testing.T) {
+func TestParseInfo(t *testing.T) {
 	info := `Name            : xorg-xrandr
 Version         : 1.5.3-1
+Provides        : xrandr=1.5.3
 Required By     : steam  arandr
                   autorandr
 Optional For    : None
+Conflicts With  : None
 
-Name            : dmenu
+Name            : waylock-arcus
+Provides        : waylock
+Conflicts With  : waylock  swaylock<2
 Required By     : None
 `
-	got := parseRequiredBy(info)
-	want := map[string][]string{"xorg-xrandr": {"steam", "arandr", "autorandr"}, "dmenu": nil}
+	got := parseInfo(info)
+	want := map[string]Package{
+		"xorg-xrandr":   {Provides: []string{"xrandr=1.5.3"}, RequiredBy: []string{"steam", "arandr", "autorandr"}},
+		"waylock-arcus": {Provides: []string{"waylock"}, Conflicts: []string{"waylock", "swaylock<2"}},
+	}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("parseRequiredBy = %v, want %v", got, want)
+		t.Errorf("parseInfo = %v, want %v", got, want)
+	}
+}
+
+// A split package's own section replaces what pkgbase declares.
+func TestParseSrcInfo(t *testing.T) {
+	info := `pkgbase = waylock-arcus
+	pkgver = 1.6.0
+	provides = waylock
+	conflicts = waylock
+	depends = pam
+
+pkgname = waylock-arcus
+
+pkgname = waylock-arcus-debug
+	conflicts = waylock-debug
+`
+	if got, want := parseSrcInfo(info, "waylock-arcus"), (Package{Provides: []string{"waylock"}, Conflicts: []string{"waylock"}}); !reflect.DeepEqual(got, want) {
+		t.Errorf("waylock-arcus = %v, want %v", got, want)
+	}
+	if got, want := parseSrcInfo(info, "waylock-arcus-debug"), (Package{Provides: []string{"waylock"}, Conflicts: []string{"waylock-debug"}}); !reflect.DeepEqual(got, want) {
+		t.Errorf("waylock-arcus-debug = %v, want %v", got, want)
 	}
 }

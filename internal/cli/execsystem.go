@@ -123,11 +123,7 @@ func (a *app) execSystem(args []string) error {
 	if !s.Root() {
 		return fmt.Errorf("exec-system: %d is not a root stage", *stage)
 	}
-	sit, err := a.situation(in, h)
-	if err != nil {
-		return err
-	}
-	steps, err := plan.System(in, sit)
+	sit, steps, err := a.systemPlan(in, h)
 	if err != nil {
 		return err
 	}

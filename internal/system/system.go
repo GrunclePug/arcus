@@ -83,6 +83,14 @@ func (r *Runner) PacmanInstallFiles(files []string) error {
 	return r.run("pacman", r.pkgArgs("-U", files)...)
 }
 
+// PacmanRemoveConflicting removes installed packages that packages about
+// to be installed conflict with. Dependency checks are skipped: what needs
+// a conflicting package is usually satisfied by its replacement, which is
+// installed next, in the same root stage.
+func (r *Runner) PacmanRemoveConflicting(pkgs []string) error {
+	return r.run("pacman", r.pkgArgs("-Rdd", pkgs)...)
+}
+
 // Makepkg builds the PKGBUILD in dir, as the user, writing the package to
 // pkgdest and downloads to srcdest. Missing dependencies are installed
 // through sudo and removed again after the build.
@@ -219,6 +227,27 @@ func Unrequired() (map[string]bool, error) {
 	return query(false, "pacman", "-Qqt")
 }
 
+// Package is what pacman reports about a package, as far as arcus needs
+// it. Provides and Conflicts keep their version constraints ("foo=1.2",
+// "bar<2").
+type Package struct {
+	Provides, Conflicts, RequiredBy []string
+}
+
+// Info returns what pacman reports about packages, by name: installed ones
+// with -Qi (all of them when no names are given), ones in the repositories
+// with -Si, and package files with -Qip.
+func Info(op string, names ...string) (map[string]Package, error) {
+	var stdout, stderr bytes.Buffer
+	cmd := exec.Command("pacman", append([]string{op}, names...)...)
+	cmd.Env = append(os.Environ(), "LC_ALL=C") // the field names, untranslated
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("pacman %s: %w: %s", op, err, strings.TrimSpace(stderr.String()))
+	}
+	return parseInfo(stdout.String()), nil
+}
+
 // RequiredBy returns, for each of the installed packages named, the
 // installed packages that depend on it, as pacman -Qi lists them.
 func RequiredBy(names []string) (map[string][]string, error) {
@@ -226,20 +255,20 @@ func RequiredBy(names []string) (map[string][]string, error) {
 	if len(names) == 0 {
 		return out, nil
 	}
-	var stdout, stderr bytes.Buffer
-	cmd := exec.Command("pacman", append([]string{"-Qi"}, names...)...)
-	cmd.Env = append(os.Environ(), "LC_ALL=C") // the field names, untranslated
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("pacman -Qi: %w: %s", err, strings.TrimSpace(stderr.String()))
+	info, err := Info("-Qi", names...)
+	if err != nil {
+		return nil, err
 	}
-	return parseRequiredBy(stdout.String()), nil
+	for name, p := range info {
+		out[name] = p.RequiredBy
+	}
+	return out, nil
 }
 
-// parseRequiredBy reads the Name and Required By fields of pacman -Qi
-// output. A long value may go on over indented lines.
-func parseRequiredBy(info string) map[string][]string {
-	out := map[string][]string{}
+// parseInfo reads the Name, Provides, Conflicts With and Required By fields
+// of pacman -Qi or -Si output. A long value may go on over indented lines.
+func parseInfo(info string) map[string]Package {
+	out := map[string]Package{}
 	var name, field string
 	for line := range strings.Lines(info) {
 		value := line
@@ -251,19 +280,86 @@ func parseRequiredBy(info string) map[string][]string {
 			}
 			field, value = strings.TrimSpace(k), v
 		}
-		switch field {
-		case "Name":
+		if field == "Name" {
 			name = strings.TrimSpace(value)
-			out[name] = nil
-		case "Required By":
-			for _, f := range strings.Fields(value) {
-				if f != "None" {
-					out[name] = append(out[name], f)
-				}
+			out[name] = Package{}
+			continue
+		}
+		p := out[name]
+		for _, f := range strings.Fields(value) {
+			if f == "None" {
+				continue
+			}
+			switch field {
+			case "Provides":
+				p.Provides = append(p.Provides, f)
+			case "Conflicts With":
+				p.Conflicts = append(p.Conflicts, f)
+			case "Required By":
+				p.RequiredBy = append(p.RequiredBy, f)
 			}
 		}
+		out[name] = p
 	}
 	return out
+}
+
+// SrcInfo returns what the PKGBUILD in dir declares for pkg, from makepkg
+// --printsrcinfo. It runs the PKGBUILD, so only as the user.
+func SrcInfo(dir, pkg string) (Package, error) {
+	var stdout, stderr bytes.Buffer
+	cmd := exec.Command("makepkg", "--printsrcinfo")
+	cmd.Dir = dir
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return Package{}, fmt.Errorf("makepkg --printsrcinfo in %s: %w: %s", dir, err, strings.TrimSpace(stderr.String()))
+	}
+	return parseSrcInfo(stdout.String(), pkg), nil
+}
+
+// parseSrcInfo reads the provides and conflicts of pkg from .SRCINFO text.
+// A field set in pkg's own section replaces the one of the pkgbase section.
+func parseSrcInfo(info, pkg string) Package {
+	var base, own Package
+	ownSet := map[string]bool{}
+	section := "pkgbase"
+	for line := range strings.Lines(info) {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), " = ")
+		if !ok {
+			continue
+		}
+		if k == "pkgname" {
+			section = v
+			continue
+		}
+		var p *Package
+		switch section {
+		case "pkgbase":
+			p = &base
+		case pkg:
+			p = &own
+		default:
+			continue
+		}
+		switch k {
+		case "provides":
+			p.Provides = append(p.Provides, v)
+		case "conflicts":
+			p.Conflicts = append(p.Conflicts, v)
+		default:
+			continue
+		}
+		if section == pkg {
+			ownSet[k] = true
+		}
+	}
+	if !ownSet["provides"] {
+		own.Provides = base.Provides
+	}
+	if !ownSet["conflicts"] {
+		own.Conflicts = base.Conflicts
+	}
+	return own
 }
 
 // EnabledUnits returns the enabled system or user units.

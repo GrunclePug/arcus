@@ -375,6 +375,78 @@ func (a *app) situation(in plan.Input, h *half) (plan.Half, error) {
 	return s, nil
 }
 
+// systemPlan plans the system half, including the removal of installed
+// packages that the packages it installs conflict with.
+func (a *app) systemPlan(in plan.Input, h *half) (plan.Half, []plan.Step, error) {
+	sit, err := a.situation(in, h)
+	if err != nil {
+		return sit, nil, err
+	}
+	steps, err := plan.System(in, sit)
+	if err != nil {
+		return sit, nil, err
+	}
+	var repo []string
+	var local []plan.Step
+	for _, s := range steps {
+		switch s.Op {
+		case plan.Install:
+			repo = append(repo, s.Names...)
+		case plan.InstallLocal:
+			local = append(local, s)
+		}
+	}
+	if len(repo) == 0 && len(local) == 0 {
+		return sit, steps, nil
+	}
+	if sit.Packages, err = system.Info("-Qi"); err != nil {
+		return sit, nil, err
+	}
+	sit.Incoming = map[string]system.Package{}
+	if len(repo) > 0 {
+		if sit.Incoming, err = system.Info("-Si", repo...); err != nil {
+			return sit, nil, err
+		}
+	}
+	for _, s := range local {
+		pkg := s.Names[0]
+		info, ok, err := a.localInfo(s)
+		if err != nil {
+			return sit, nil, err
+		}
+		if ok {
+			sit.Incoming[pkg] = info
+		}
+	}
+	steps, err = plan.Conflicts(in, sit, steps)
+	return sit, steps, err
+}
+
+// localInfo returns what an own build will provide and conflict with: from
+// its package when it is already built from this recipe, otherwise from
+// its PKGBUILD. The root process doesn't run a PKGBUILD, so before the
+// build it reports nothing; only the stage after the build installs it.
+func (a *app) localInfo(s plan.Step) (system.Package, bool, error) {
+	pkg := s.Names[0]
+	if file, err := a.packageFile(pkg, s.Recipe); err == nil {
+		info, err := system.Info("-Qip", file)
+		if err != nil {
+			return system.Package{}, false, err
+		}
+		p, ok := info[pkg]
+		return p, ok, nil
+	}
+	if a.euid == 0 {
+		return system.Package{}, false, nil
+	}
+	m := a.modules[s.Module]
+	if m == nil {
+		return system.Package{}, false, fmt.Errorf("module %q does not exist", s.Module)
+	}
+	p, err := system.SrcInfo(m.RecipeDir(pkg), pkg)
+	return p, err == nil, err
+}
+
 // plan computes the steps of both halves. The system half is read under a
 // shared lock, which is released again before any root step runs.
 func (a *app) plan(in plan.Input) ([]plan.Step, error) {
@@ -385,11 +457,7 @@ func (a *app) plan(in plan.Input) ([]plan.Step, error) {
 	}
 	defer lock.Release()
 
-	ss, err := a.situation(in, sh)
-	if err != nil {
-		return nil, err
-	}
-	sys, err := plan.System(in, ss)
+	_, sys, err := a.systemPlan(in, sh)
 	if err != nil {
 		return nil, err
 	}
@@ -485,6 +553,8 @@ func describe(s plan.Step) string {
 		return fmt.Sprintf("build %s from %s/pkg/%s", names, s.Module, names)
 	case plan.InstallLocal:
 		return fmt.Sprintf("install own build for %s: %s", s.Module, names)
+	case plan.RemoveConflicting:
+		return fmt.Sprintf("remove packages that conflict with what is installed next: %s", names)
 	case plan.HandOver:
 		return fmt.Sprintf("record %s under the modules that list them now:", kindNames[s.Of])
 	case plan.Adopt:
@@ -602,6 +672,12 @@ func (a *app) runSteps(h *half, st *state.State, steps []plan.Step, in plan.Inpu
 				return err
 			}
 			i = j - 1
+		case plan.RemoveConflicting:
+			// Recorded for no module; the root process planned them again
+			// from the system as it is and matched the confirmed hash.
+			if err := r.PacmanRemoveConflicting(s.Names); err != nil {
+				return err
+			}
 		case plan.Install, plan.Enable, plan.Join, plan.Mkdir:
 			if err := a.add(st, steps[i:j], r, save); err != nil {
 				return err

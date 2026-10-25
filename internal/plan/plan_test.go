@@ -10,6 +10,7 @@ import (
 	"github.com/grunclepug/arcus/internal/layer"
 	"github.com/grunclepug/arcus/internal/module"
 	"github.com/grunclepug/arcus/internal/state"
+	"github.com/grunclepug/arcus/internal/system"
 )
 
 func set(names ...string) map[string]bool {
@@ -205,7 +206,7 @@ func TestOwnBuilds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	install := Step{Stage: Packages, Op: InstallLocal, Module: "wl-base", Names: []string{"waylock-arcus"}, Recipe: hash}
+	install := Step{Stage: LocalPackages, Op: InstallLocal, Module: "wl-base", Names: []string{"waylock-arcus"}, Recipe: hash}
 	if !reflect.DeepEqual(steps, []Step{install}) {
 		t.Fatalf("missing build: %+v", steps)
 	}
@@ -260,5 +261,51 @@ func TestNeeded(t *testing.T) {
 		if got := Needed(tt.remove, tt.requiredBy); !reflect.DeepEqual(got, tt.want) {
 			t.Errorf("Needed(%v, %v) = %v, want %v", tt.remove, tt.requiredBy, got, tt.want)
 		}
+	}
+}
+
+// An installed package that a package to install conflicts with, either
+// way round and through what it provides, is removed right before that
+// install; a versioned conflict is left to pacman.
+func TestConflicts(t *testing.T) {
+	m := &module.Module{Name: "stream"}
+	m.Packages.Pacman = []string{"river", "foot"}
+	m.Packages.Local = []string{"waylock-arcus"}
+	in := Input{Desired: []string{"stream"}, Modules: module.Set{"stream": m}}
+	h := Half{
+		Packages: map[string]system.Package{
+			"river-classic": {Conflicts: []string{"river"}},
+			"waylock":       {RequiredBy: []string{"pg-lock"}},
+			"alacritty":     {},
+			"old-term":      {Provides: []string{"terminal=1"}},
+			"pg-lock":       {},
+		},
+		Incoming: map[string]system.Package{
+			"river":         {},
+			"foot":          {Conflicts: []string{"terminal<2"}},
+			"waylock-arcus": {Provides: []string{"waylock=1.6.0"}, Conflicts: []string{"waylock"}},
+		},
+	}
+	install := Step{Stage: Packages, Op: Install, Module: "stream", Names: []string{"river", "foot"}}
+	local := Step{Stage: LocalPackages, Op: InstallLocal, Module: "stream", Names: []string{"waylock-arcus"}}
+	got, err := Conflicts(in, h, []Step{install, local})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Step{
+		{Stage: Packages, Op: RemoveConflicting, Names: []string{"river-classic"}, Changes: []string{"x river-classic: conflicts with river"}},
+		install,
+		{Stage: LocalPackages, Op: RemoveConflicting, Names: []string{"waylock"}, Changes: []string{"x waylock: conflicts with waylock-arcus; needed by pg-lock"}},
+		local,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got  %+v\nwant %+v", got, want)
+	}
+
+	// A package that a desired module lists is never removed for another.
+	h.Packages["alacritty"] = system.Package{Conflicts: []string{"foot"}}
+	m.Packages.Pacman = append(m.Packages.Pacman, "alacritty")
+	if _, err := Conflicts(in, h, []Step{install}); err == nil || err.Error() != "foot conflicts with alacritty, which module stream lists" {
+		t.Fatalf("got %v", err)
 	}
 }

@@ -16,19 +16,23 @@ import (
 	"github.com/grunclepug/arcus/internal/layer"
 	"github.com/grunclepug/arcus/internal/module"
 	"github.com/grunclepug/arcus/internal/state"
+	"github.com/grunclepug/arcus/internal/system"
 )
 
 // Stage groups steps that run together, in this order: teardown first (so a
 // conflicting package or file is gone before its replacement arrives), then
-// packages, then setup. Root stages run in one sudo call each.
+// packages, then setup. Repository packages come before own builds are
+// built, so a build finds the dependencies its module lists installed.
+// Root stages run in one sudo call each.
 type Stage int
 
 const (
 	UserTeardown   Stage = iota + 1 // user units disabled, home layers off
 	SystemTeardown                  // groups left, system units disabled, system layers off
 	AURRemove                       // AUR packages removed
+	Packages                        // pacman packages and own builds removed, pacman packages installed
 	Build                           // own builds made from their recipes (makepkg, as the user)
-	Packages                        // pacman packages and own builds removed, then installed
+	LocalPackages                   // own builds installed
 	AURInstall                      // AUR packages installed
 	SystemSetup                     // system layers on, system units enabled, groups joined
 	UserSetup                       // home layers on, user units enabled
@@ -36,7 +40,8 @@ const (
 
 var stageNames = map[Stage]string{
 	UserTeardown: "user teardown", SystemTeardown: "system teardown", AURRemove: "AUR removal",
-	Build: "build", Packages: "package", AURInstall: "AUR install", SystemSetup: "system setup", UserSetup: "user setup",
+	Packages: "package", Build: "build", LocalPackages: "own build install", AURInstall: "AUR install",
+	SystemSetup: "system setup", UserSetup: "user setup",
 }
 
 // Name returns a short description for messages.
@@ -49,7 +54,7 @@ func (s Stage) Name() string {
 
 // Root reports whether the stage runs as root.
 func (s Stage) Root() bool {
-	return s == SystemTeardown || s == Packages || s == SystemSetup
+	return s == SystemTeardown || s == Packages || s == LocalPackages || s == SystemSetup
 }
 
 // Step operations.
@@ -67,6 +72,8 @@ const (
 	BuildLocal   = "build" // own builds: makepkg into the cache
 	InstallLocal = "install-local"
 	RemoveLocal  = "remove-local"
+
+	RemoveConflicting = "remove-conflicting" // installed packages that the next install conflicts with
 
 	HandOver = "hand-over" // ownership moves to the modules that list the resources now
 	Adopt    = "adopt"     // resources already there become recorded for the module that lists them
@@ -188,6 +195,12 @@ type Half struct {
 	Units      map[string]bool // enabled units of this half
 	Groups     map[string]bool // system half: the main user's groups
 	Dirs       map[string]bool // user half: home directories that exist
+
+	// Conflicts checks need these, when the half installs packages: every
+	// installed package (Packages), and the packages to install (Incoming).
+	// An own build not built yet may be missing from Incoming in the root
+	// process; it is only installed in a later root stage, after the build.
+	Packages, Incoming map[string]system.Package
 }
 
 // System plans the root half: pacman packages, system files, system units
@@ -235,7 +248,7 @@ func User(in Input, h Half) ([]Step, error) {
 }
 
 // Merge orders the steps of both halves by stage, keeping the order within
-// a stage. Every own build the system half installs is built first, as the
+// a stage. Every own build the system half installs is built before, as the
 // user, in the build stage.
 func Merge(system, user []Step) []Step {
 	steps := append(slices.Clone(system), user...)
@@ -367,6 +380,100 @@ func Needed(remove []string, requiredBy map[string][]string) []string {
 	return slices.DeleteFunc(slices.Clone(remove), func(n string) bool { return !needed[n] })
 }
 
+// Conflicts adds, before the packages a root stage installs, the removal of
+// the installed packages they conflict with: pacman with --noconfirm
+// refuses to replace them itself. A conflict counts when either package
+// names the other, or something it provides, without a version
+// constraint; one with a constraint is left to pacman, which then refuses
+// rather than having arcus remove a package that may not conflict. It is
+// an error if a desired module lists the conflicting package, or it is
+// protected.
+func Conflicts(in Input, h Half, steps []Step) ([]Step, error) {
+	listed := map[string]string{}
+	for _, kind := range []string{state.Pacman, state.AUR, state.Local} {
+		for _, name := range in.Desired {
+			for _, n := range in.Declares(kind)[name] {
+				if listed[n] == "" {
+					listed[n] = name
+				}
+			}
+		}
+	}
+	gone := map[string]bool{}
+	for _, s := range steps {
+		if s.Op == Remove || s.Op == RemoveLocal {
+			for _, n := range s.Names {
+				gone[n] = true
+			}
+		}
+	}
+
+	var out []Step
+	for i, s := range steps {
+		installs := (s.Op == Install && s.Stage == Packages) || s.Op == InstallLocal
+		if !installs || (i > 0 && steps[i-1].Op == s.Op && steps[i-1].Stage == s.Stage) {
+			out = append(out, s)
+			continue
+		}
+		var targets []string
+		for _, t := range steps[i:] {
+			if t.Op != s.Op || t.Stage != s.Stage {
+				break
+			}
+			targets = append(targets, t.Names...)
+		}
+		slices.Sort(targets)
+		var names, changes []string
+		for _, q := range slices.Sorted(maps.Keys(h.Packages)) {
+			if gone[q] {
+				continue
+			}
+			for _, t := range targets {
+				p, ok := h.Incoming[t]
+				if !ok || t == q || !(conflicts(p, q, h.Packages[q]) || conflicts(h.Packages[q], t, p)) {
+					continue
+				}
+				if module := listed[q]; module != "" {
+					return nil, fmt.Errorf("%s conflicts with %s, which module %s lists", t, q, module)
+				}
+				if slices.Contains(in.Protected, q) {
+					return nil, fmt.Errorf("%s conflicts with %s, which is protected", t, q)
+				}
+				names = append(names, q)
+				line := fmt.Sprintf("x %s: conflicts with %s", q, t)
+				if by := h.Packages[q].RequiredBy; len(by) > 0 {
+					line += fmt.Sprintf("; needed by %s", strings.Join(by, " "))
+				}
+				changes = append(changes, line)
+				gone[q] = true
+				break
+			}
+		}
+		if len(names) > 0 {
+			out = append(out, Step{Stage: s.Stage, Op: RemoveConflicting, Names: names, Changes: changes})
+		}
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+// conflicts reports whether p, by its conflicts, rules out the package
+// named other.
+func conflicts(p system.Package, other string, o system.Package) bool {
+	for _, c := range p.Conflicts {
+		if strings.ContainsAny(c, "<>=") {
+			continue
+		}
+		if c == other || slices.ContainsFunc(o.Provides, func(prov string) bool {
+			name, _, _ := strings.Cut(prov, "=")
+			return name == c
+		}) {
+			return true
+		}
+	}
+	return false
+}
+
 // handOvers lists the resources of kind that reconciling moves to another
 // module, as "<name>: <old> → <new>".
 func handOvers(in Input, st *state.State, kind string, present map[string]bool) []string {
@@ -450,7 +557,7 @@ func localInstalls(in Input, h Half) ([]Step, error) {
 			if h.Installed[pkg] && h.State.Built[pkg] == hash && !slices.Contains(in.Rebuild, pkg) {
 				continue
 			}
-			steps = append(steps, Step{Stage: Packages, Op: InstallLocal, Module: name, Names: []string{pkg}, Recipe: hash})
+			steps = append(steps, Step{Stage: LocalPackages, Op: InstallLocal, Module: name, Names: []string{pkg}, Recipe: hash})
 		}
 	}
 	return steps, nil
