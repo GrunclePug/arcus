@@ -49,6 +49,13 @@ case $op in
   -Qq) cat "$dir/pkgs"; exit 0 ;;
   -Qqe) out=$(grep -vxF -f "$dir/deps" "$dir/pkgs"); [ -n "$out" ] || exit 1; echo "$out"; exit 0 ;;
   -Qqt) required > "$dir/req"; out=$(grep -vxF -f "$dir/req" "$dir/pkgs"); [ -n "$out" ] || exit 1; echo "$out"; exit 0 ;;
+  -Qi)
+    for p in $names; do
+      grep -qx "$p" "$dir/pkgs" || { echo "error: package '$p' was not found" >&2; exit 1; }
+      by=$(while read -r q d; do [ "$d" = "$p" ] && grep -qx "$q" "$dir/pkgs" && printf '%s  ' "$q"; done < "$dir/requires")
+      printf 'Name            : %s\nRequired By     : %s\n\n' "$p" "${by:-None}"
+    done
+    exit 0 ;;
 esac
 if [ -f "$dir/fail" ] && grep -qx "$(basename "$0")" "$dir/fail"; then exit 1; fi
 if [ -f "$dir/slow" ]; then sleep "$(cat "$dir/slow")"; fi

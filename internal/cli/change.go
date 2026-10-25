@@ -357,6 +357,21 @@ func (a *app) situation(in plan.Input, h *half) (plan.Half, error) {
 		}
 		*q.into = m
 	}
+	// What depends on the packages this plan would remove, so those that
+	// other packages still need can stay.
+	kinds := []string{state.AUR}
+	if h.name == "system" {
+		kinds = []string{state.Pacman, state.Local}
+	}
+	var leaving []string
+	for _, k := range kinds {
+		leaving = append(leaving, in.Removals(st, k, s.Installed)...)
+	}
+	if len(leaving) > 0 {
+		if s.RequiredBy, err = system.RequiredBy(leaving); err != nil {
+			return plan.Half{}, err
+		}
+	}
 	return s, nil
 }
 
@@ -439,8 +454,19 @@ func describe(s plan.Step) string {
 		return fmt.Sprintf("deploy the %s of %s", files, s.Module)
 	case plan.Restack:
 		return fmt.Sprintf("redeploy the %s from %s up, in order: %s", files, s.Module, names)
-	case plan.Remove:
-		return fmt.Sprintf("remove %s: %s", pkgs, names)
+	case plan.Remove, plan.RemoveLocal:
+		what := pkgs
+		if s.Op == plan.RemoveLocal {
+			what = "own builds"
+		}
+		if len(s.Names) == 0 {
+			return fmt.Sprintf("keep %s that other packages need, marked as dependencies: %s", what, strings.Join(s.Kept, " "))
+		}
+		desc := fmt.Sprintf("remove %s: %s", what, names)
+		if len(s.Kept) > 0 {
+			desc += fmt.Sprintf("; keep %s, which other packages need, as dependencies", strings.Join(s.Kept, " "))
+		}
+		return desc
 	case plan.Install:
 		return fmt.Sprintf("install %s for %s: %s", pkgs, s.Module, names)
 	case plan.Disable:
@@ -459,8 +485,6 @@ func describe(s plan.Step) string {
 		return fmt.Sprintf("build %s from %s/pkg/%s", names, s.Module, names)
 	case plan.InstallLocal:
 		return fmt.Sprintf("install own build for %s: %s", s.Module, names)
-	case plan.RemoveLocal:
-		return fmt.Sprintf("remove own builds: %s", names)
 	case plan.HandOver:
 		return fmt.Sprintf("record %s under the modules that list them now:", kindNames[s.Of])
 	case plan.Adopt:
@@ -677,10 +701,12 @@ func (a *app) remove(st *state.State, steps []plan.Step, in plan.Input, r *syste
 	if err != nil {
 		return err
 	}
-	var want []string
+	var want, remove, kept []string
 	for _, s := range steps {
-		want = append(want, s.Names...)
+		remove = append(remove, s.Names...)
+		kept = append(kept, s.Kept...)
 	}
+	want = slices.Concat(remove, kept)
 	got := in.Removals(st, kind, present)
 	if !slices.Equal(slices.Sorted(slices.Values(got)), slices.Sorted(slices.Values(want))) {
 		return fmt.Errorf("the %s to remove changed since the plan was shown (now %v); run the command again", kind, got)
@@ -688,10 +714,20 @@ func (a *app) remove(st *state.State, steps []plan.Step, in plan.Input, r *syste
 
 	switch steps[0].Op {
 	case plan.Remove, plan.RemoveLocal:
-		if kind == state.Pacman || kind == state.Local {
-			err = r.PacmanRemove(want)
-		} else {
-			err = r.AURRemove(a.cfg.AURHelper, want)
+		pacman := kind == state.Pacman || kind == state.Local
+		if len(kept) > 0 {
+			if pacman {
+				err = r.PacmanMark(false, kept)
+			} else {
+				err = r.AURMarkDeps(a.cfg.AURHelper, kept)
+			}
+		}
+		if err == nil && len(remove) > 0 {
+			if pacman {
+				err = r.PacmanRemove(remove)
+			} else {
+				err = r.AURRemove(a.cfg.AURHelper, remove)
+			}
 		}
 	case plan.Disable:
 		for _, s := range steps {

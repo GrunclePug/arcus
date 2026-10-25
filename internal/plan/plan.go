@@ -90,6 +90,9 @@ type Step struct {
 	Changes []string `json:"changes,omitempty"` // "+ path", "- path", "~ path" (changed module), "! path" (replaced)
 	Recipe  string   `json:"recipe,omitempty"`  // own builds: hash of the recipe to build or install
 	Of      string   `json:"of,omitempty"`      // hand-over: the resource kind
+	// Package removals: released packages that stay installed, marked as
+	// dependencies, because packages outside the removal need them.
+	Kept []string `json:"kept,omitempty"`
 }
 
 // Kind returns the ownership kind a resource step works on, or "" for layers.
@@ -179,9 +182,12 @@ type Half struct {
 	State     *state.State
 	Layer     *layer.Stacker
 	Installed map[string]bool // installed packages
-	Units     map[string]bool // enabled units of this half
-	Groups    map[string]bool // system half: the main user's groups
-	Dirs      map[string]bool // user half: home directories that exist
+	// RequiredBy lists, for the installed packages this half owns, the
+	// installed packages that depend on each.
+	RequiredBy map[string][]string
+	Units      map[string]bool // enabled units of this half
+	Groups     map[string]bool // system half: the main user's groups
+	Dirs       map[string]bool // user half: home directories that exist
 }
 
 // System plans the root half: pacman packages, system files, system units
@@ -195,8 +201,8 @@ func System(in Input, h Half) ([]Step, error) {
 		return nil, err
 	}
 	steps = append(steps, layers.off...)
-	steps = append(steps, removals(in, h.State, Remove, Packages, state.Pacman, h.Installed)...)
-	steps = append(steps, removals(in, h.State, RemoveLocal, Packages, state.Local, h.Installed)...)
+	steps = append(steps, packageRemovals(in, h, Remove, Packages, state.Pacman)...)
+	steps = append(steps, packageRemovals(in, h, RemoveLocal, Packages, state.Local)...)
 	steps = append(steps, additions(in, h.State, Install, Packages, state.Pacman, h.Installed)...)
 	local, err := localInstalls(in, h)
 	if err != nil {
@@ -220,7 +226,7 @@ func User(in Input, h Half) ([]Step, error) {
 	steps = append(steps, layers.off...)
 	// After the layers, so a directory that held only deployed files is empty.
 	steps = append(steps, removals(in, h.State, Rmdir, UserTeardown, state.HomeDirs, h.Dirs)...)
-	steps = append(steps, removals(in, h.State, Remove, AURRemove, state.AUR, h.Installed)...)
+	steps = append(steps, packageRemovals(in, h, Remove, AURRemove, state.AUR)...)
 	steps = append(steps, additions(in, h.State, Install, AURInstall, state.AUR, h.Installed)...)
 	steps = append(steps, additions(in, h.State, Mkdir, UserSetup, state.HomeDirs, h.Dirs)...)
 	steps = append(steps, layers.on...)
@@ -316,6 +322,49 @@ func removals(in Input, st *state.State, op string, stage Stage, kind string, pr
 		steps = append(steps, Step{Stage: stage, Op: op, Module: owner, Names: byOwner[owner], Now: now})
 	}
 	return steps
+}
+
+// packageRemovals plans the removal of the packages of kind that
+// reconciling releases. Those that an installed package outside the removal
+// still needs stay, marked as dependencies, so pacman removes them with the
+// last package that needs them; removing them would fail the whole
+// transaction.
+func packageRemovals(in Input, h Half, op string, stage Stage, kind string) []Step {
+	steps := removals(in, h.State, op, stage, kind, h.Installed)
+	if len(steps) != 1 || steps[0].Op != op {
+		return steps // nothing to remove, or only a hand-over
+	}
+	s := &steps[0]
+	kept := Needed(s.Names, h.RequiredBy)
+	if len(kept) > 0 {
+		s.Names = slices.DeleteFunc(s.Names, func(n string) bool { return slices.Contains(kept, n) })
+		s.Kept = kept
+		for _, n := range kept {
+			s.Changes = append(s.Changes, fmt.Sprintf("= %s: needed by %s", n, strings.Join(h.RequiredBy[n], " ")))
+		}
+	}
+	return steps
+}
+
+// Needed returns the packages of remove that an installed package needs
+// which isn't being removed, directly or through another needed one.
+func Needed(remove []string, requiredBy map[string][]string) []string {
+	needed := map[string]bool{}
+	for changed := true; changed; {
+		changed = false
+		for _, n := range remove {
+			if needed[n] {
+				continue
+			}
+			for _, by := range requiredBy[n] {
+				if !slices.Contains(remove, by) || needed[by] {
+					needed[n], changed = true, true
+					break
+				}
+			}
+		}
+	}
+	return slices.DeleteFunc(slices.Clone(remove), func(n string) bool { return !needed[n] })
 }
 
 // handOvers lists the resources of kind that reconciling moves to another

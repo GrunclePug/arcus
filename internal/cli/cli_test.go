@@ -937,6 +937,42 @@ func TestHandOverRecordsTheNewOwner(t *testing.T) {
 	lacks(t, e.sys.Packages(), "foot")
 }
 
+// A package that a module releases but another installed package still
+// needs stays installed, marked as a dependency, instead of failing the
+// whole removal; pacman takes it out with the last package that needs it.
+func TestOffKeepsPackagesOthersNeed(t *testing.T) {
+	e := newEnv(t)
+	e.module("x11", "[packages]\npacman = [\"xrandr\", \"picom\"]\naur = [\"applet\", \"helper\"]\n", nil)
+	must(t, e.run("on", "-y", "x11"))
+	e.sys.SetPackages(append(e.sys.Packages(), "steam", "tray")...)
+	e.sys.SetRequires("steam xrandr", "tray helper")
+
+	must(t, e.run("off", "-n", "x11"))
+	out := e.out.String()
+	for _, want := range []string{
+		"remove packages: picom; keep xrandr, which other packages need, as dependencies",
+		"= xrandr: needed by steam",
+		"remove AUR packages: applet; keep helper, which other packages need, as dependencies",
+		"= helper: needed by tray",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("off -n lacks %q:\n%s", want, out)
+		}
+	}
+
+	must(t, e.run("off", "-y", "x11"))
+	contains(t, e.sys.Packages(), "xrandr", "helper", "steam", "tray")
+	lacks(t, e.sys.Packages(), "picom", "applet")
+	contains(t, e.sys.Deps(), "xrandr", "helper")
+	if owned := e.state(true).Owned[state.Pacman]; len(owned["x11"]) != 0 {
+		t.Errorf("x11 still owns %v", owned["x11"])
+	}
+	must(t, e.run("plan"))
+	if !strings.Contains(e.out.String(), "Nothing to do.") {
+		t.Errorf("plan after off:\n%s", e.out.String())
+	}
+}
+
 // clean marks what modules list (and protected packages) as explicitly
 // installed, marks other needed packages as dependencies and removes the
 // rest with the dependencies nothing needs any more.

@@ -242,3 +242,23 @@ func TestOwnBuilds(t *testing.T) {
 		t.Fatalf("off: %+v", steps)
 	}
 }
+
+func TestNeeded(t *testing.T) {
+	tests := []struct {
+		remove     []string
+		requiredBy map[string][]string
+		want       []string
+	}{
+		{[]string{"a", "b"}, nil, []string{}},
+		{[]string{"a", "b"}, map[string][]string{"a": {"steam"}}, []string{"a"}},
+		// b needs a, and both go: nothing outside needs either.
+		{[]string{"a", "b"}, map[string][]string{"a": {"b"}}, []string{}},
+		// steam needs b, which needs a: both stay.
+		{[]string{"a", "b"}, map[string][]string{"a": {"b"}, "b": {"steam"}}, []string{"a", "b"}},
+	}
+	for _, tt := range tests {
+		if got := Needed(tt.remove, tt.requiredBy); !reflect.DeepEqual(got, tt.want) {
+			t.Errorf("Needed(%v, %v) = %v, want %v", tt.remove, tt.requiredBy, got, tt.want)
+		}
+	}
+}

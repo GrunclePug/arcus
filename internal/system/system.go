@@ -105,6 +105,12 @@ func (r *Runner) AURRemove(helper string, pkgs []string) error {
 	return r.run(helper, r.pkgArgs("-Rns", pkgs)...)
 }
 
+// AURMarkDeps marks packages as installed as a dependency, through the AUR
+// helper, which asks sudo for pacman itself.
+func (r *Runner) AURMarkDeps(helper string, pkgs []string) error {
+	return r.run(helper, append([]string{"-D", "--asdeps"}, pkgs...)...)
+}
+
 // userScope is how arcus addresses user units: through the unit files
 // (--root=/), which needs no running user manager. The installer's chroot
 // and shells outside a login session have none. Queries go through the
@@ -211,6 +217,53 @@ func Explicit() (map[string]bool, error) {
 // depends on.
 func Unrequired() (map[string]bool, error) {
 	return query(false, "pacman", "-Qqt")
+}
+
+// RequiredBy returns, for each of the installed packages named, the
+// installed packages that depend on it, as pacman -Qi lists them.
+func RequiredBy(names []string) (map[string][]string, error) {
+	out := map[string][]string{}
+	if len(names) == 0 {
+		return out, nil
+	}
+	var stdout, stderr bytes.Buffer
+	cmd := exec.Command("pacman", append([]string{"-Qi"}, names...)...)
+	cmd.Env = append(os.Environ(), "LC_ALL=C") // the field names, untranslated
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("pacman -Qi: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return parseRequiredBy(stdout.String()), nil
+}
+
+// parseRequiredBy reads the Name and Required By fields of pacman -Qi
+// output. A long value may go on over indented lines.
+func parseRequiredBy(info string) map[string][]string {
+	out := map[string][]string{}
+	var name, field string
+	for line := range strings.Lines(info) {
+		value := line
+		if line != "" && line[0] != ' ' && line[0] != '\t' {
+			k, v, ok := strings.Cut(line, ":")
+			if !ok {
+				field = ""
+				continue
+			}
+			field, value = strings.TrimSpace(k), v
+		}
+		switch field {
+		case "Name":
+			name = strings.TrimSpace(value)
+			out[name] = nil
+		case "Required By":
+			for _, f := range strings.Fields(value) {
+				if f != "None" {
+					out[name] = append(out[name], f)
+				}
+			}
+		}
+	}
+	return out
 }
 
 // EnabledUnits returns the enabled system or user units.

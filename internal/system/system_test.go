@@ -5,6 +5,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -110,5 +111,22 @@ func TestFailureIsReported(t *testing.T) {
 	r := &Runner{Stdout: io.Discard, Stderr: io.Discard}
 	if err := r.PacmanInstall([]string{"foot"}); err == nil || !strings.Contains(err.Error(), "pacman -S --needed foot") {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestParseRequiredBy(t *testing.T) {
+	info := `Name            : xorg-xrandr
+Version         : 1.5.3-1
+Required By     : steam  arandr
+                  autorandr
+Optional For    : None
+
+Name            : dmenu
+Required By     : None
+`
+	got := parseRequiredBy(info)
+	want := map[string][]string{"xorg-xrandr": {"steam", "arandr", "autorandr"}, "dmenu": nil}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("parseRequiredBy = %v, want %v", got, want)
 	}
 }
