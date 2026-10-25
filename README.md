@@ -99,7 +99,7 @@ A profile is a file that lists modules in stacking order, and the host file `~/.
 
 ```toml
 # ~/.config/arcus/profiles/laptop.toml
-modules = ["base", "machine", "shell", "desktop", "wl-base", "river-classic", "battery"]
+modules = ["base", "machine", "shell", "desktop", "wl-base", "stream", "battery"]
 
 # ~/.local/state/arcus/host.toml
 profiles = ["laptop"]
