@@ -249,7 +249,7 @@ func (a *app) userHalf() *half {
 		name:  "user",
 		dir:   a.paths.UserState,
 		layer: layer.NewHome(a.paths.Home, a.paths.UserState, a.dirs()),
-		kinds: []string{state.AUR, state.UserUnits, state.HomeDirs},
+		kinds: []string{state.AUR, state.UserUnits, state.HomeDirs, state.HomeLinks},
 	}
 }
 

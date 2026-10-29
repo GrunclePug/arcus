@@ -16,7 +16,8 @@ import (
 
 // Resource kinds whose ownership is recorded. Each half records only its own
 // kinds: the system half pacman packages, own builds, system units and
-// groups; the user half AUR packages, user units and home directories.
+// groups; the user half AUR packages, user units, home directories and
+// home links.
 const (
 	Pacman      = "pacman"
 	Local       = "local" // own builds from recipes
@@ -24,7 +25,8 @@ const (
 	SystemUnits = "system-units"
 	UserUnits   = "user-units"
 	Groups      = "groups"
-	HomeDirs    = "home-dirs" // directories in $HOME, removed only when empty
+	HomeDirs    = "home-dirs"  // directories in $HOME, removed only when empty
+	HomeLinks   = "home-links" // symlinks in $HOME, removed only while they still point at their target
 )
 
 // Version is the state file format. Load refuses any other, so an older

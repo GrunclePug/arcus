@@ -82,6 +82,7 @@ description = "Shared Wayland session pieces"
 category  = "desktop"
 requires  = ["base"]
 dirs      = ["Pictures/Screenshots"]   # created if missing; removed on off only when empty
+links     = { ".config/app/data" = "Sync/app/data" }   # symlinks in $HOME, both sides relative to it; removed on off only while unchanged
 conflicts = []
 groups    = ["video"]
 

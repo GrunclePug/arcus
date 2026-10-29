@@ -13,6 +13,7 @@ import (
 
 	"github.com/grunclepug/arcus/internal/host"
 	"github.com/grunclepug/arcus/internal/machine"
+	"github.com/grunclepug/arcus/internal/module"
 	"github.com/grunclepug/arcus/internal/plan"
 	"github.com/grunclepug/arcus/internal/profile"
 	"github.com/grunclepug/arcus/internal/state"
@@ -300,6 +301,8 @@ func (a *app) present(kind string) (map[string]bool, error) {
 		return system.Groups(a.user)
 	case state.HomeDirs:
 		return a.homeDirs()
+	case state.HomeLinks:
+		return a.homeLinks()
 	}
 	return nil, fmt.Errorf("unknown kind %q", kind)
 }
@@ -327,6 +330,33 @@ func (a *app) homeDirs() (map[string]bool, error) {
 	return present, nil
 }
 
+// homeLinks reports which of the home links that a module lists or the
+// user half records exist and point at their target.
+func (a *app) homeLinks() (map[string]bool, error) {
+	st, err := a.userHalf().loadState()
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, m := range a.modules {
+		names = append(names, m.LinkNames()...)
+	}
+	for _, owned := range st.Owned[state.HomeLinks] {
+		names = append(names, owned...)
+	}
+	present := map[string]bool{}
+	for _, n := range names {
+		p, target, ok := module.SplitLink(n)
+		if !ok {
+			continue
+		}
+		if got, err := os.Readlink(filepath.Join(a.paths.Home, p)); err == nil && got == filepath.Join(a.paths.Home, target) {
+			present[n] = true
+		}
+	}
+	return present, nil
+}
+
 // situation loads a half's state and queries what its plan depends on.
 func (a *app) situation(in plan.Input, h *half) (plan.Half, error) {
 	st, err := h.loadState()
@@ -339,7 +369,7 @@ func (a *app) situation(in plan.Input, h *half) (plan.Half, error) {
 		kinds []string
 		into  *map[string]bool
 	}
-	queries := []query{{[]string{state.AUR}, &s.Installed}, {[]string{state.UserUnits}, &s.Units}, {[]string{state.HomeDirs}, &s.Dirs}}
+	queries := []query{{[]string{state.AUR}, &s.Installed}, {[]string{state.UserUnits}, &s.Units}, {[]string{state.HomeDirs}, &s.Dirs}, {[]string{state.HomeLinks}, &s.Links}}
 	if h.name == "system" {
 		queries = []query{
 			{[]string{state.Pacman, state.Local}, &s.Installed},
@@ -494,7 +524,7 @@ func (a *app) printPlan(steps []plan.Step) {
 
 var kindNames = map[string]string{
 	state.Pacman: "packages", state.AUR: "AUR packages", state.Local: "own builds",
-	state.SystemUnits: "system units", state.UserUnits: "user units", state.Groups: "groups", state.HomeDirs: "home directories",
+	state.SystemUnits: "system units", state.UserUnits: "user units", state.Groups: "groups", state.HomeDirs: "home directories", state.HomeLinks: "home links",
 }
 
 func describe(s plan.Step) string {
@@ -549,6 +579,10 @@ func describe(s plan.Step) string {
 		return fmt.Sprintf("create home directories for %s: %s", s.Module, names)
 	case plan.Rmdir:
 		return fmt.Sprintf("remove home directories that are empty: %s", names)
+	case plan.Link:
+		return fmt.Sprintf("create home links for %s: %s", s.Module, strings.Join(s.Names, ", "))
+	case plan.Unlink:
+		return fmt.Sprintf("remove home links that still point at their target: %s", strings.Join(s.Names, ", "))
 	case plan.BuildLocal:
 		return fmt.Sprintf("build %s from %s/pkg/%s", names, s.Module, names)
 	case plan.InstallLocal:
@@ -678,12 +712,12 @@ func (a *app) runSteps(h *half, st *state.State, steps []plan.Step, in plan.Inpu
 			if err := r.PacmanRemoveConflicting(s.Names); err != nil {
 				return err
 			}
-		case plan.Install, plan.Enable, plan.Join, plan.Mkdir:
+		case plan.Install, plan.Enable, plan.Join, plan.Mkdir, plan.Link:
 			if err := a.add(st, steps[i:j], r, save); err != nil {
 				return err
 			}
 			i = j - 1
-		case plan.Remove, plan.RemoveLocal, plan.Disable, plan.Leave, plan.Rmdir:
+		case plan.Remove, plan.RemoveLocal, plan.Disable, plan.Leave, plan.Rmdir, plan.Unlink:
 			if err := a.remove(st, steps[i:j], in, r, save); err != nil {
 				return err
 			}
@@ -757,6 +791,12 @@ func (a *app) add(st *state.State, steps []plan.Step, r *system.Runner, save fun
 				break
 			}
 		}
+	case plan.Link:
+		for _, n := range all {
+			if runErr = a.link(n); runErr != nil {
+				break
+			}
+		}
 	}
 
 	after, err := a.present(kind)
@@ -817,6 +857,18 @@ func (a *app) remove(st *state.State, steps []plan.Step, in plan.Input, r *syste
 				break
 			}
 		}
+	case plan.Unlink:
+		// Only links that still point at their target go; anything else
+		// there now is the user's.
+		for _, n := range want {
+			p, target, _ := module.SplitLink(n)
+			host := filepath.Join(a.paths.Home, p)
+			if got, rerr := os.Readlink(host); rerr == nil && got == filepath.Join(a.paths.Home, target) {
+				if err = os.Remove(host); err != nil {
+					break
+				}
+			}
+		}
 	case plan.Rmdir:
 		// Only empty ones go; a directory with files in it is left alone.
 		for _, d := range want {
@@ -837,4 +889,21 @@ func (a *app) remove(st *state.State, steps []plan.Step, in plan.Input, r *syste
 		}
 	}
 	return save()
+}
+
+// link creates a home link, and its parent directories. It refuses to
+// replace anything already at the path.
+func (a *app) link(name string) error {
+	p, target, ok := module.SplitLink(name)
+	if !ok {
+		return fmt.Errorf("bad link %q", name)
+	}
+	host := filepath.Join(a.paths.Home, p)
+	if _, err := os.Lstat(host); err == nil {
+		return fmt.Errorf("~/%s already exists and isn't a link to ~/%s: move it away, then apply again", p, target)
+	}
+	if err := os.MkdirAll(filepath.Dir(host), 0o755); err != nil {
+		return err
+	}
+	return os.Symlink(filepath.Join(a.paths.Home, target), host)
 }

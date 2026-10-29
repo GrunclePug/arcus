@@ -87,6 +87,9 @@ func TestLoadRejects(t *testing.T) {
 		{"bad group", "p", `groups = ["Video"]`, "invalid name"},
 		{"dir outside home", "p", `dirs = ["../etc"]`, "dirs: \"../etc\""},
 		{"absolute dir", "p", `dirs = ["/srv"]`, "dirs: \"/srv\""},
+		{"link outside home", "p", `links = { "a" = "../etc/passwd" }`, "links: \"../etc/passwd\""},
+		{"absolute link", "p", `links = { "/etc/x" = "a" }`, "links: \"/etc/x\""},
+		{"link to itself", "p", `links = { "a" = "a" }`, "points at itself"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

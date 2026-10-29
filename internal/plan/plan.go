@@ -79,6 +79,8 @@ const (
 	Adopt    = "adopt"     // resources already there become recorded for the module that lists them
 	Mkdir    = "mkdir"     // home directories
 	Rmdir    = "rmdir"
+	Link     = "link" // home links
+	Unlink   = "unlink"
 
 	// arcus clean: install reasons follow the modules, the rest is removed.
 	MarkExplicit   = "mark-explicit"
@@ -123,6 +125,8 @@ func (s Step) Kind() string {
 		return state.Groups
 	case s.Op == Mkdir || s.Op == Rmdir:
 		return state.HomeDirs
+	case s.Op == Link || s.Op == Unlink:
+		return state.HomeLinks
 	}
 	return ""
 }
@@ -160,6 +164,8 @@ func (in Input) Declares(kind string) map[string][]string {
 			out[name] = m.Groups
 		case state.HomeDirs:
 			out[name] = m.Dirs
+		case state.HomeLinks:
+			out[name] = m.LinkNames()
 		}
 	}
 	return out
@@ -195,6 +201,7 @@ type Half struct {
 	Units      map[string]bool // enabled units of this half
 	Groups     map[string]bool // system half: the main user's groups
 	Dirs       map[string]bool // user half: home directories that exist
+	Links      map[string]bool // user half: home links that point at their target
 
 	// Conflicts checks need these, when the half installs packages: every
 	// installed package (Packages), and the packages to install (Incoming).
@@ -238,10 +245,12 @@ func User(in Input, h Half) ([]Step, error) {
 	}
 	steps = append(steps, layers.off...)
 	// After the layers, so a directory that held only deployed files is empty.
+	steps = append(steps, removals(in, h.State, Unlink, UserTeardown, state.HomeLinks, h.Links)...)
 	steps = append(steps, removals(in, h.State, Rmdir, UserTeardown, state.HomeDirs, h.Dirs)...)
 	steps = append(steps, packageRemovals(in, h, Remove, AURRemove, state.AUR)...)
 	steps = append(steps, additions(in, h.State, Install, AURInstall, state.AUR, h.Installed)...)
 	steps = append(steps, additions(in, h.State, Mkdir, UserSetup, state.HomeDirs, h.Dirs)...)
+	steps = append(steps, additions(in, h.State, Link, UserSetup, state.HomeLinks, h.Links)...)
 	steps = append(steps, layers.on...)
 	steps = append(steps, additions(in, h.State, Enable, UserSetup, state.UserUnits, h.Units)...)
 	return steps, nil

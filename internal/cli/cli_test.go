@@ -1169,6 +1169,63 @@ func TestHomeDirs(t *testing.T) {
 	}
 }
 
+// links owns symlinks in $HOME: created on, taken over when already right,
+// moved when the target changes, and removed on off only while unchanged.
+func TestHomeLinks(t *testing.T) {
+	e := newEnv(t)
+	e.module("sync", `links = { ".config/app/data" = "Sync/app/data", ".local/share/x" = "Sync/x" }`, nil)
+	// One of them is already there and right.
+	must(t, os.MkdirAll(filepath.Join(e.home, ".local/share"), 0o755))
+	must(t, os.Symlink(filepath.Join(e.home, "Sync/x"), filepath.Join(e.home, ".local/share/x")))
+
+	must(t, e.run("plan", "sync"))
+	for _, want := range []string{"take over home links for sync (already there): .local/share/x -> Sync/x", "create home links for sync: .config/app/data -> Sync/app/data"} {
+		if !strings.Contains(e.out.String(), want) {
+			t.Errorf("plan lacks %q:\n%s", want, e.out.String())
+		}
+	}
+	must(t, e.run("on", "-y", "sync"))
+	link := filepath.Join(e.home, ".config/app/data")
+	if got, err := os.Readlink(link); err != nil || got != filepath.Join(e.home, "Sync/app/data") {
+		t.Fatalf("link = %q, %v", got, err)
+	}
+	must(t, e.run("plan"))
+	if !strings.Contains(e.out.String(), "Nothing to do.") {
+		t.Errorf("plan after on:\n%s", e.out.String())
+	}
+
+	// A new target replaces the link.
+	e.module("sync", `links = { ".config/app/data" = "Sync/other", ".local/share/x" = "Sync/x" }`, nil)
+	must(t, e.run("apply", "-y"))
+	if got, _ := os.Readlink(link); got != filepath.Join(e.home, "Sync/other") {
+		t.Errorf("after the target changed, link = %q", got)
+	}
+
+	// A link the user pointed elsewhere stays on off.
+	must(t, os.Remove(filepath.Join(e.home, ".local/share/x")))
+	must(t, os.Symlink("/elsewhere", filepath.Join(e.home, ".local/share/x")))
+	must(t, e.run("off", "-y", "sync"))
+	if _, err := os.Lstat(link); !errors.Is(err, iofs.ErrNotExist) {
+		t.Error("the unchanged link must go")
+	}
+	if got, _ := os.Readlink(filepath.Join(e.home, ".local/share/x")); got != "/elsewhere" {
+		t.Errorf("a changed link must stay, got %q", got)
+	}
+	if got := e.state(false).Owned[state.HomeLinks]; len(got) != 0 {
+		t.Errorf("still recorded: %v", got)
+	}
+
+	// Something else at the path is never replaced.
+	must(t, os.MkdirAll(filepath.Dir(link), 0o755))
+	must(t, os.WriteFile(link, []byte("mine"), 0o644))
+	if err := e.run("on", "-y", "sync"); err == nil || !strings.Contains(err.Error(), "already exists and isn't a link") {
+		t.Errorf("on over a file: %v", err)
+	}
+	if e.read("home/u/.config/app/data") != "mine" {
+		t.Error("the file was replaced")
+	}
+}
+
 // Turning on a module that conflicts with one the host file lists swaps
 // them; one a profile brings in is refused.
 func TestOnSwapsConflicts(t *testing.T) {

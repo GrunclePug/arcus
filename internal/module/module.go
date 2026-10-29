@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	iofs "io/fs"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
@@ -55,6 +56,9 @@ type Manifest struct {
 	Conflicts   []string `toml:"conflicts"`
 	Groups      []string `toml:"groups"`
 	Dirs        []string `toml:"dirs"` // directories in $HOME that must exist
+	// Links are symlinks in $HOME to other places in $HOME, both relative:
+	// {".config/aurlock/approved" = "Sync/aurlock/approved"}.
+	Links map[string]string `toml:"links"`
 
 	Packages struct {
 		Pacman []string `toml:"pacman"`
@@ -118,11 +122,21 @@ func (m *Module) validate() error {
 		{"units.user", m.Units.User, unitNameRegex},
 	}
 	for i, d := range m.Dirs {
-		if d == "" || path.IsAbs(d) || path.Clean(d) != d || d == "." || strings.HasPrefix(d, "..") {
+		if !homeRelative(d) {
 			return fmt.Errorf("dirs: %q must be a relative path inside $HOME", d)
 		}
 		if slices.Contains(m.Dirs[:i], d) {
 			return fmt.Errorf("dirs: %q is listed twice", d)
+		}
+	}
+	for p, target := range m.Links {
+		for _, s := range []string{p, target} {
+			if !homeRelative(s) {
+				return fmt.Errorf("links: %q must be a relative path inside $HOME", s)
+			}
+		}
+		if p == target {
+			return fmt.Errorf("links: %q points at itself", p)
 		}
 	}
 	if m.Category != "" && !moduleNameRegex.MatchString(m.Category) {
@@ -275,4 +289,26 @@ func CompareCategories(a, b string) int {
 		return 2
 	}
 	return cmp.Or(cmp.Compare(rank(a), rank(b)), cmp.Compare(a, b))
+}
+
+func homeRelative(p string) bool {
+	return p != "" && !path.IsAbs(p) && path.Clean(p) == p && p != "." && !strings.HasPrefix(p, "..")
+}
+
+// LinkNames are the module's links as resource names, "path -> target", in
+// order. The name holds both, so changing a link's target releases the old
+// link and adds the new one.
+func (m *Manifest) LinkNames() []string {
+	var names []string
+	for _, p := range slices.Sorted(maps.Keys(m.Links)) {
+		names = append(names, p+linkArrow+m.Links[p])
+	}
+	return names
+}
+
+const linkArrow = " -> "
+
+// SplitLink returns the path and target of a link name.
+func SplitLink(name string) (p, target string, ok bool) {
+	return strings.Cut(name, linkArrow)
 }
