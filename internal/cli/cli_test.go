@@ -503,8 +503,11 @@ func TestInterruptLetsPackageManagerFinish(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	e.ctx = ctx
+	// Interrupt once the transaction is under way, however slow the machine.
 	go func() {
-		time.Sleep(100 * time.Millisecond)
+		for deadline := time.Now().Add(10 * time.Second); !e.sys.Started() && time.Now().Before(deadline); {
+			time.Sleep(5 * time.Millisecond)
+		}
 		cancel()
 	}()
 

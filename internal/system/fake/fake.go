@@ -25,8 +25,8 @@ type System struct {
 // -Qi, -Si, -Qip and makepkg --printsrcinfo report. Like pacman, -Rns refuses to remove a package that another one
 // still needs and also removes the dependencies nothing needs any more.
 // Every call is appended to $dir/log. If $dir/slow exists, a package
-// transaction sleeps that many seconds first and writes $dir/done when it
-// finishes.
+// transaction writes $dir/started, sleeps that many seconds and writes
+// $dir/done when it finishes.
 const pkgScript = `#!/bin/sh
 dir=%DIR%
 echo "$(basename "$0") $*" >> "$dir/log"
@@ -69,7 +69,7 @@ case $op in
   -Si|-Qip) for p in $names; do info "$p"; echo; done; exit 0 ;;
 esac
 if [ -f "$dir/fail" ] && grep -qx "$(basename "$0")" "$dir/fail"; then exit 1; fi
-if [ -f "$dir/slow" ]; then sleep "$(cat "$dir/slow")"; fi
+if [ -f "$dir/slow" ]; then touch "$dir/started"; sleep "$(cat "$dir/slow")"; fi
 case $op in
   -S|-U) for p in $names; do grep -qx "$p" "$dir/pkgs" || echo "$p" >> "$dir/pkgs"; done ;;
   -D)
@@ -257,9 +257,15 @@ func (s *System) Log() []string { return s.lines("log") }
 // Fail makes the named tool (pacman, yay, ...) fail its next transactions.
 func (s *System) Fail(tool string) { s.set("fail", []string{tool}) }
 
-// Slow makes package transactions take seconds, writing a "done" marker
-// when they finish.
+// Slow makes package transactions take seconds, writing a "started" marker
+// when they begin and a "done" marker when they finish.
 func (s *System) Slow(seconds string) { s.set("slow", []string{seconds}) }
+
+// Started reports whether a slow package transaction has begun.
+func (s *System) Started() bool {
+	_, err := os.Stat(filepath.Join(s.Dir, "started"))
+	return err == nil
+}
 
 // Done reports whether a slow package transaction ran to completion.
 func (s *System) Done() bool {
