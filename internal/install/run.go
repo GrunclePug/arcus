@@ -561,6 +561,11 @@ func (x *installer) aurHelper(set module.Set, configDir string) error {
 	if err != nil {
 		return err
 	}
+	// aurlock comes from an own build, which apply installs before the AUR
+	// packages.
+	if cfg.AURHelper == "aurlock" {
+		return nil
+	}
 	pkg := cfg.AURHelper + "-bin"
 	// Not /tmp: arch-chroot mounts a fresh one for every command.
 	build := "/var/tmp/arcus-" + pkg

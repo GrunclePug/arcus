@@ -31,6 +31,7 @@ func TestLoad(t *testing.T) {
 			return slices.Equal(c.ModuleDirs, []string{"/home/u/dot/modules", "/srv/p"})
 		}},
 		{"paru", `aur_helper = "paru"`, "", func(c *Config) bool { return c.AURHelper == "paru" && slices.Contains(c.Protected, "paru") }},
+		{"aurlock", `aur_helper = "aurlock"`, "", func(c *Config) bool { return c.AURHelper == "aurlock" && slices.Contains(c.Protected, "aurlock") }},
 		{"unknown helper", `aur_helper = "pikaur"`, "aur_helper must be", nil},
 		{"relative dir", `module_dirs = ["modules"]`, "must be absolute", nil},
 		{"unknown key", `aur = "yay"`, "unknown keys: aur", nil},

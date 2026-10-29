@@ -29,7 +29,7 @@ The project is in early development: until 1.0, commands and file formats may st
 
 ### Requirements
 
-* Arch Linux with sudo, and yay or paru for AUR packages
+* Arch Linux with sudo, and yay, paru or aurlock for AUR packages
 * `base-devel` for own builds
 * To build from source: Go 1.27.3 or newer and Make
 
@@ -122,7 +122,7 @@ modules  = ["aurora"]
 | `XDG_CONFIG_HOME` | | `~/.config` | Holds `arcus/config.toml`, `arcus/profiles/` and `arcus/modules/` |
 | `XDG_STATE_HOME` | | `~/.local/state` | Holds the host file (`arcus/host.toml`) and the user half's state and ledgers in `arcus/` |
 | `XDG_CACHE_HOME` | | `~/.cache` | Holds own builds, their packages and sources in `arcus/` |
-| `aur_helper` in `config.toml` | | `yay` | AUR helper: `yay` or `paru` |
+| `aur_helper` in `config.toml` | | `yay` | AUR helper: `yay`, `paru` or `aurlock`. The installer builds yay or paru from the AUR; aurlock has to come from a module's own build. |
 | `protected` in `config.toml` | | base, base-devel, linux, linux-firmware, sudo, pacman, systemd, the AUR helper | Extra packages arcus never removes |
 | `module_dirs` in `config.toml` | | none | Extra directories of user modules |
 

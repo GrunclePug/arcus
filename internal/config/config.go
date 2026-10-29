@@ -20,9 +20,10 @@ import (
 // protected list in config.toml extends this one.
 var DefaultProtected = []string{"base", "base-devel", "linux", "linux-firmware", "sudo", "pacman", "systemd"}
 
-// AURHelpers are the supported AUR helpers. Both take pacman's -S --needed
-// and -Rns and call sudo themselves.
-var AURHelpers = []string{"yay", "paru"}
+// AURHelpers are the supported AUR helpers. All take pacman's -S --needed
+// and -Rns and call sudo themselves. aurlock isn't in the AUR: a module
+// installs it as an own build.
+var AURHelpers = []string{"yay", "paru", "aurlock"}
 
 // Config is the content of config.toml. Every field is optional.
 type Config struct {

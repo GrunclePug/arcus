@@ -1,6 +1,7 @@
-// Package fake puts stand-ins for pacman, yay, paru, makepkg, systemctl, id
-// and gpasswd on PATH for tests. They keep their "system" in text files in a
-// temporary directory and log every call, so nothing real is touched.
+// Package fake puts stand-ins for pacman, yay, paru, aurlock, makepkg,
+// systemctl, id and gpasswd on PATH for tests. They keep their "system" in
+// text files in a temporary directory and log every call, so nothing real
+// is touched.
 package fake
 
 import (
@@ -166,7 +167,7 @@ func New(t *testing.T) *System {
 		t.Fatal(err)
 	}
 	scripts := map[string]string{
-		"pacman": pkgScript, "yay": pkgScript, "paru": pkgScript, "makepkg": makepkgScript,
+		"pacman": pkgScript, "yay": pkgScript, "paru": pkgScript, "aurlock": pkgScript, "makepkg": makepkgScript,
 		"systemctl": systemctlScript, "id": idScript, "gpasswd": gpasswdScript,
 	}
 	for name, script := range scripts {
