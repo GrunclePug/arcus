@@ -21,7 +21,8 @@ type Removal struct {
 	Remove []string
 	// Transfer moves ownership of still-needed resources to another module
 	// that is on, so they are removed when the last module using them goes.
-	// Protected and absent resources are in neither list.
+	// Absent resources are in neither list, and so are protected ones that no
+	// other module declares.
 	Transfer map[string][]string
 }
 
@@ -31,7 +32,8 @@ type Removal struct {
 //   - order: the other modules that are on, in stack order. It fixes which
 //     module inherits a shared resource.
 //   - others: what each of those modules declares, keyed by name.
-//   - protected: never removed.
+//   - protected: never removed, though still handed to another module that
+//     declares it.
 //   - present: the current set, or nil if unknown. Resources that are already
 //     gone are skipped, since pacman aborts the whole transaction on an
 //     unknown target.
@@ -39,7 +41,7 @@ func Removals(owned, order []string, others map[string][]string, protected []str
 	r := Removal{Transfer: map[string][]string{}}
 outer:
 	for _, n := range owned {
-		if slices.Contains(protected, n) || (present != nil && !present[n]) {
+		if present != nil && !present[n] {
 			continue
 		}
 		for _, name := range order {
@@ -48,7 +50,9 @@ outer:
 				continue outer
 			}
 		}
-		r.Remove = append(r.Remove, n)
+		if !slices.Contains(protected, n) {
+			r.Remove = append(r.Remove, n)
+		}
 	}
 	return r
 }

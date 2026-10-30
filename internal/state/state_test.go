@@ -139,6 +139,14 @@ func TestRemovals(t *testing.T) {
 			want:      Removal{Remove: []string{"river"}, Transfer: map[string][]string{}},
 		},
 		{
+			name:      "protected packages still move to a module that declares them",
+			owned:     []string{"aurlock", "git"},
+			order:     []string{"aurlock"},
+			others:    map[string][]string{"aurlock": {"aurlock"}},
+			protected: []string{"aurlock"},
+			want:      Removal{Remove: []string{"git"}, Transfer: map[string][]string{"aurlock": {"aurlock"}}},
+		},
+		{
 			name:    "already-removed resources are skipped",
 			owned:   []string{"river", "foot"},
 			present: set("river"),
