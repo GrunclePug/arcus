@@ -862,6 +862,25 @@ func TestAdoptMarksExplicit(t *testing.T) {
 	contains(t, e.sys.Deps(), "foot")
 }
 
+// When clean would only mark packages a module lists, doctor shows no
+// bullet, so it shows no hint either.
+func TestDoctorNoHintForMarksOnly(t *testing.T) {
+	e := newEnv(t)
+	e.sys.SetPackages("foot")
+	e.module("m", "[packages]\npacman = [\"foot\"]\n", nil)
+	must(t, e.run("on", "-y", "m"))
+	e.sys.SetDeps("foot") // marked a dependency again since
+
+	must(t, e.run("clean", "-n"))
+	if !strings.Contains(e.out.String(), "mark as explicitly installed (a module lists them or they are protected): foot") {
+		t.Fatalf("clean -n:\n%s", e.out.String())
+	}
+	must(t, e.run("doctor"))
+	if out := e.out.String(); strings.Contains(out, "→") || !strings.Contains(out, "No problems found.") {
+		t.Errorf("doctor:\n%s", out)
+	}
+}
+
 // The root process reads the user half's state where the user's arcus
 // keeps it, also under XDG_STATE_HOME: otherwise it would take an AUR
 // package arcus already records for one being taken over, and refuse the

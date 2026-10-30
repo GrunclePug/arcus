@@ -147,12 +147,15 @@ func (a *app) doctorHost(o *opts, r *report) {
 		r.problem("querying packages: %v", err)
 		return
 	}
+	// Packages to mark explicitly installed need no hint: a module lists them.
+	noted := false
 	for _, s := range clean {
 		if s.Op == plan.RemoveUnlisted || s.Op == plan.MarkDeps {
 			fmt.Fprintf(r.w, "  · %s: %s\n", notes[s.Op], strings.Join(s.Names, " "))
+			noted = true
 		}
 	}
-	if len(clean) > 0 {
+	if noted {
 		fmt.Fprintln(r.w, "    → add what you want to keep to a module; 'arcus clean' shows its plan for the rest and asks first")
 	}
 }
