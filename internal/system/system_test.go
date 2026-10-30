@@ -158,3 +158,50 @@ pkgname = waylock-arcus-debug
 		t.Errorf("waylock-arcus-debug = %v, want %v", got, want)
 	}
 }
+
+func TestEnabledOffPreset(t *testing.T) {
+	sys := fake.New(t)
+	sys.SetUnits(false, "sshd.service", "getty@.service", "fstrim.timer")
+	sys.SetPresets(false, "getty@.service")
+	got, err := EnabledOffPreset(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"fstrim.timer", "sshd.service"}; !slices.Equal(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+	if got, err := EnabledOffPreset(true); err != nil || len(got) != 0 {
+		t.Errorf("no user units: %v, %v", got, err)
+	}
+}
+
+func TestWithAlso(t *testing.T) {
+	root := t.TempDir()
+	dirs := UnitDirs(root, filepath.Join(root, "home/.config"), false)
+	write := func(dir, name, content string) {
+		t.Helper()
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(dirs[1], "nm.service", "[Unit]\nAlso=not-install.service\n[Install]\nWantedBy=multi-user.target\nAlso=nm-dispatcher.service\nAlso = nm-wait.service other.socket\n")
+	write(dirs[1], "other.socket", "[Install]\nAlso=nm.service\n")
+	write(dirs[1], "tpl@.service", "[Install]\nAlso=tpl-helper.service\n")
+	// The copy in /etc wins over the vendor's.
+	write(dirs[1], "over.service", "[Install]\nAlso=vendor.service\n")
+	write(dirs[0], "over.service", "[Install]\n")
+
+	got := WithAlso(dirs, []string{"nm.service", "tpl@a.service", "over.service", "nofile.timer"})
+	want := []string{"nm.service", "tpl@a.service", "over.service", "nofile.timer", "nm-dispatcher.service", "nm-wait.service", "other.socket", "tpl-helper.service"}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %v\nwant %v", got, want)
+	}
+	for in, want := range map[string]string{"a@b.service": "a@.service", "a@.service": "a@.service", "a.service": "a.service"} {
+		if got := Template(in); got != want {
+			t.Errorf("Template(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

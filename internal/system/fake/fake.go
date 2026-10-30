@@ -130,7 +130,7 @@ if [ "$1" = --root=/ ]; then shift; fi
 op=$1; shift
 touch "$db"
 case $op in
-  list-unit-files) out=$(while read -r u; do [ -n "$u" ] && echo "$u enabled enabled"; done < "$db"); [ -n "$out" ] || exit 1; echo "$out"; exit 0 ;;
+  list-unit-files) out=$(while read -r u; do [ -n "$u" ] || continue; p=disabled; grep -qsx "$u" "$db-preset" && p=enabled; echo "$u enabled $p"; done < "$db"); [ -n "$out" ] || exit 1; echo "$out"; exit 0 ;;
 esac
 for u in "$@"; do
   case $u in -*) continue ;; esac
@@ -242,6 +242,16 @@ func (s *System) SetUnits(user bool, units ...string) {
 		s.set("user-units", units)
 	} else {
 		s.set("units", units)
+	}
+}
+
+// SetPresets replaces the system (or user) units that the vendor preset
+// enables; list-unit-files reports every other unit as preset disabled.
+func (s *System) SetPresets(user bool, units ...string) {
+	if user {
+		s.set("user-units-preset", units)
+	} else {
+		s.set("units-preset", units)
 	}
 }
 

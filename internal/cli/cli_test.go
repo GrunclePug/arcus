@@ -7,6 +7,7 @@ import (
 	"fmt"
 	iofs "io/fs"
 	"os"
+	"os/user"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -590,6 +591,69 @@ func TestDoctor(t *testing.T) {
 	}
 	must(t, e.run("apply", "-y"))
 	must(t, e.run("doctor"))
+}
+
+// doctor reports what no module declares and a stale machine module, and
+// -fix leaves them alone.
+func TestDoctorMachine(t *testing.T) {
+	e := newEnv(t)
+	e.wlBase()
+	must(t, os.WriteFile(filepath.Join(e.home, ".config/arcus/config.toml"), []byte(`aur_helper = "aurlock"`+"\n"), 0o644))
+	e.module("net", "[units]\nsystem = [\"nm.service\"]\n", nil)
+	e.module("split", "[packages]\naur = [\"split-a\"]\n", nil) // off: approvals count every module
+	for path, content := range map[string]string{
+		"proc/cpuinfo":                          "vendor_id\t: GenuineIntel\n",
+		"proc/self/mounts":                      "/dev/sda2 / ext4 rw 0 0\n/dev/sda1 /boot vfat rw 0 0\n",
+		"usr/lib/systemd/system/nm.service":     "[Install]\nWantedBy=multi-user.target\nAlso=nm-dispatcher.service\n",
+		"home/u/.config/aurlock/approved":       "# pkgbase  commit  version  maintainer  approved  network\nwlr-randr-git c 1 m d offline\nsplit c 1 m d offline\nstray c 1 m d offline\n",
+		"home/u/.local/state/aurlock/installed": "# pkgname  pkgbase  commit  version  installed\nsplit-a split c 1 d\n",
+	} {
+		must(t, os.MkdirAll(filepath.Join(e.root, filepath.Dir(path)), 0o755))
+		must(t, os.WriteFile(filepath.Join(e.root, path), []byte(content), 0o644))
+	}
+	must(t, os.MkdirAll(filepath.Join(e.root, "sys/firmware/efi"), 0o755))
+	e.sys.SetPackages("linux", "linux-firmware", "grub", "efibootmgr")
+	must(t, e.run("machine", "-y"))
+	must(t, e.run("on", "-y", "wl-base"))
+	must(t, e.run("on", "-y", "net"))
+	// systemctl enable would do this through Also=.
+	e.sys.SetUnits(false, append(e.sys.Units(false), "nm-dispatcher.service")...)
+	if err := e.run("doctor"); err == nil || !strings.Contains(e.out.String(), "aurlock approvals no module lists: stray\n") {
+		t.Fatalf("doctor with one stray approval (%v):\n%s", err, e.out.String())
+	}
+	if out := e.out.String(); strings.Count(out, "✗") != 1 {
+		t.Errorf("doctor found more than the stray approval:\n%s", out)
+	}
+
+	e.sys.SetUnits(false, append(e.sys.Units(false), "sshd.service", "getty@.service")...)
+	e.sys.SetPresets(false, "getty@.service")
+	e.sys.SetUnits(true, append(e.sys.Units(true), "pipewire.socket")...)
+	me, err := user.Current()
+	must(t, err)
+	e.sys.SetGroups(append(e.sys.Groups(), me.Username, "wheel", "users", "input", "audio")...)
+	must(t, os.WriteFile(filepath.Join(e.root, "proc/cpuinfo"), []byte("vendor_id\t: AuthenticAMD\n"), 0o644))
+	for _, args := range [][]string{{"doctor"}, {"doctor", "-fix"}} {
+		err := e.run(args...)
+		out := e.out.String()
+		if err == nil {
+			t.Errorf("%v found no problems:\n%s", args, out)
+		}
+		for _, want := range []string{
+			"the machine module is out of date: run 'arcus machine'",
+			"system units enabled that no module lists: sshd.service\n",
+			"user units enabled that no module lists: pipewire.socket\n",
+			"groups no module lists: audio input\n",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("%v lacks %q:\n%s", args, want, out)
+			}
+		}
+	}
+	contains(t, e.sys.Units(false), "sshd.service")
+	contains(t, e.sys.Groups(), "input")
+	if e.read("etc/arcus/modules/machine/module.toml") == "<missing>" || strings.Contains(e.read("etc/arcus/modules/machine/module.toml"), "amd-ucode") {
+		t.Error("doctor -fix rewrote the machine module")
+	}
 }
 
 func TestNewMvRm(t *testing.T) {

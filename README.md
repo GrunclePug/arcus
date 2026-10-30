@@ -66,12 +66,14 @@ arcus on shell             # turn it on and record it in this machine's host fil
 arcus ls                   # every profile and module, its status and stack rank
 arcus off shell            # turn it off again
 arcus apply                # make the system match the host file
-arcus doctor               # check state, ledgers and deployed files; list packages no module lists
+arcus doctor               # check state, ledgers and deployed files; list what no module declares
 arcus clean                # remove packages no module lists (shows its plan, asks first)
 arcus rebuild dwm-arcus    # rebuild an own build whose recipe didn't change
 arcus machine              # write this machine's module: kernel, bootloader, filesystems, swap
 arcus update               # replace arcus with the latest release
 ```
+
+`arcus doctor` also reports what the modules don't account for: a machine module older than what `arcus machine` would write, units enabled against their vendor preset and groups that no module that's on lists (following `Also=` in the unit files), and, with aurlock, approvals no module lists. It only reports these; `-fix` never disables a unit, leaves a group or rewrites the machine module.
 
 On the Arch ISO, `arcus-install` opens a TUI that writes an install plan and runs it, or saves it to `/root/plan.toml`. `arcus-install detect` shows the hardware modules a machine needs, `arcus-install check plan.toml` validates a plan against the machine without changing anything, and `arcus-install run plan.toml` installs it.
 

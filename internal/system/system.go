@@ -183,23 +183,32 @@ func (r *Runner) LeaveGroup(user, group string) error {
 	return r.run("gpasswd", "-d", user, group)
 }
 
-// query runs a read-only command and returns the whitespace-separated
-// fields of its output, using only the first field of each line when
-// firstField is set. pacman and systemctl exit 1 when nothing matches,
-// which is an empty set, not an error.
-func query(firstField bool, name string, args ...string) (map[string]bool, error) {
+// output runs a read-only command and returns what it prints. pacman and
+// systemctl exit 1 when nothing matches, which is no output, not an error.
+func output(name string, args ...string) (string, error) {
 	var stdout, stderr bytes.Buffer
 	cmd := exec.Command(name, args...)
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
 		var exit *exec.ExitError
 		if errors.As(err, &exit) && exit.ExitCode() == 1 && stdout.Len() == 0 && stderr.Len() == 0 {
-			return map[string]bool{}, nil
+			return "", nil
 		}
-		return nil, fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return "", fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.String(), nil
+}
+
+// query runs a read-only command and returns the whitespace-separated
+// fields of its output, using only the first field of each line when
+// firstField is set.
+func query(firstField bool, name string, args ...string) (map[string]bool, error) {
+	out, err := output(name, args...)
+	if err != nil {
+		return nil, err
 	}
 	set := map[string]bool{}
-	for line := range strings.Lines(stdout.String()) {
+	for line := range strings.Lines(out) {
 		fields := strings.Fields(line)
 		if firstField && len(fields) > 0 {
 			fields = fields[:1]
@@ -362,13 +371,102 @@ func parseSrcInfo(info, pkg string) Package {
 	return own
 }
 
-// EnabledUnits returns the enabled system or user units.
-func EnabledUnits(user bool) (map[string]bool, error) {
+// listEnabled is the systemctl call that lists the enabled system or user
+// unit files: unit, state and vendor preset on each line.
+func listEnabled(user bool) []string {
 	args := []string{"list-unit-files", "--state=enabled", "--no-legend", "--no-pager"}
 	if user {
-		return query(true, "systemctl", slices.Concat(userScope, args)...)
+		return slices.Concat(userScope, args)
 	}
-	return query(true, "systemctl", slices.Concat([]string{"--root=/"}, args)...)
+	return slices.Concat([]string{"--root=/"}, args)
+}
+
+// EnabledUnits returns the enabled system or user units.
+func EnabledUnits(user bool) (map[string]bool, error) {
+	return query(true, "systemctl", listEnabled(user)...)
+}
+
+// EnabledOffPreset returns the enabled system or user units that their
+// vendor preset doesn't enable, so a module or a hand did, sorted.
+func EnabledOffPreset(user bool) ([]string, error) {
+	out, err := output("systemctl", listEnabled(user)...)
+	if err != nil {
+		return nil, err
+	}
+	var units []string
+	for line := range strings.Lines(out) {
+		f := strings.Fields(line)
+		if len(f) > 0 && (len(f) < 3 || f[2] != "enabled") {
+			units = append(units, f[0])
+		}
+	}
+	slices.Sort(units)
+	return units, nil
+}
+
+// UnitDirs are the directories systemd reads unit files from, most
+// important first: the system's under root, or the user's, with their own
+// in configHome (~/.config).
+func UnitDirs(root, configHome string, user bool) []string {
+	if user {
+		return []string{filepath.Join(configHome, "systemd/user"), filepath.Join(root, "etc/systemd/user"), filepath.Join(root, "usr/lib/systemd/user")}
+	}
+	return []string{filepath.Join(root, "etc/systemd/system"), filepath.Join(root, "usr/lib/systemd/system")}
+}
+
+// WithAlso returns units together with what their [Install] sections name
+// in Also=, recursively: the units systemctl enable enables with them. Each
+// unit file is the first one found in dirs; an instance (a@b.service) is
+// read from its template (a@.service). A unit without a file adds nothing.
+func WithAlso(dirs, units []string) []string {
+	var out []string
+	seen := map[string]bool{}
+	queue := slices.Clone(units)
+	for len(queue) > 0 {
+		u := queue[0]
+		queue = queue[1:]
+		if seen[u] {
+			continue
+		}
+		seen[u] = true
+		out = append(out, u)
+		queue = append(queue, installAlso(dirs, Template(u))...)
+	}
+	return out
+}
+
+// Template returns the template of an instance (a@b.service gives
+// a@.service) and any other unit unchanged.
+func Template(unit string) string {
+	at, dot := strings.Index(unit, "@"), strings.LastIndex(unit, ".")
+	if at < 0 || dot < at {
+		return unit
+	}
+	return unit[:at+1] + unit[dot:]
+}
+
+// installAlso reads the Also= lines of a unit file's [Install] section.
+func installAlso(dirs []string, file string) []string {
+	for _, dir := range dirs {
+		data, err := os.ReadFile(filepath.Join(dir, file))
+		if err != nil {
+			continue
+		}
+		var also []string
+		install := false
+		for line := range strings.Lines(string(data)) {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "[") {
+				install = line == "[Install]"
+				continue
+			}
+			if key, value, ok := strings.Cut(line, "="); install && ok && strings.TrimSpace(key) == "Also" {
+				also = append(also, strings.Fields(value)...)
+			}
+		}
+		return also
+	}
+	return nil
 }
 
 // Groups returns the groups user belongs to.

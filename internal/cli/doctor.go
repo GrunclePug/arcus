@@ -2,14 +2,20 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
+	iofs "io/fs"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 
 	"github.com/grunclepug/arcus/internal/layer"
+	"github.com/grunclepug/arcus/internal/machine"
 	"github.com/grunclepug/arcus/internal/plan"
 	"github.com/grunclepug/arcus/internal/state"
+	"github.com/grunclepug/arcus/internal/system"
 )
 
 // report collects doctor findings.
@@ -101,6 +107,8 @@ func (a *app) cmdDoctor(args []string) error {
 
 	fmt.Fprintln(a.stdout, "Host file:")
 	a.doctorHost(&o, r)
+	fmt.Fprintln(a.stdout, "Machine:")
+	a.doctorMachine(&o, r)
 	a.doctorVersion(r)
 
 	switch {
@@ -147,6 +155,173 @@ func (a *app) doctorHost(o *opts, r *report) {
 	if len(clean) > 0 {
 		fmt.Fprintln(r.w, "    → add what you want to keep to a module; 'arcus clean' shows its plan for the rest and asks first")
 	}
+}
+
+// doctorMachine reports what the machine has that its modules don't say: a
+// machine module the system has moved on from, units and groups no module
+// that's on lists, and aurlock approvals no module lists at all. It only
+// reports. Writing the machine module changes packages, and disabling a
+// unit or leaving a group can break what was set up on purpose, so -fix
+// leaves all of it alone.
+func (a *app) doctorMachine(o *opts, r *report) {
+	a.doctorMachineModule(r)
+	if in, err := a.hostSelection(o); err == nil { // doctorHost reports the error
+		a.doctorUnits(in, r)
+		a.doctorGroups(in, r)
+	}
+	a.doctorApprovals(r)
+}
+
+// doctorMachineModule compares the machine module with what 'arcus machine'
+// would write now, such as drivers for hardware it learned to detect since.
+func (a *app) doctorMachineModule(r *report) {
+	dir := filepath.Join(a.paths.Machine, machine.Name)
+	if _, err := os.Stat(dir); errors.Is(err, iofs.ErrNotExist) {
+		return
+	}
+	facts, err := a.machineFacts()
+	if err != nil {
+		r.problem("detecting the machine: %v", err)
+		return
+	}
+	changes, err := fileChanges(dir, facts.Files())
+	if err != nil {
+		r.problem("reading the machine module: %v", err)
+		return
+	}
+	if len(changes) > 0 {
+		r.problem("the machine module is out of date: run 'arcus machine'")
+	}
+}
+
+// doctorUnits reports units enabled outside their vendor preset that no
+// module that's on lists, nor pulls in through Also= in its unit files.
+func (a *app) doctorUnits(in plan.Input, r *report) {
+	found := false
+	for _, kind := range []string{state.SystemUnits, state.UserUnits} {
+		user := kind == state.UserUnits
+		enabled, err := system.EnabledOffPreset(user)
+		if err != nil {
+			r.problem("querying %s: %v", kindNames[kind], err)
+			continue
+		}
+		var declared []string
+		for _, names := range in.Declares(kind) {
+			declared = append(declared, names...)
+		}
+		listed := map[string]bool{}
+		for _, u := range system.WithAlso(system.UnitDirs(a.root, a.xdg("XDG_CONFIG_HOME", ".config"), user), declared) {
+			listed[u], listed[system.Template(u)] = true, true
+		}
+		extra := slices.DeleteFunc(enabled, func(u string) bool { return listed[u] })
+		if len(extra) > 0 {
+			r.problem("%s enabled that no module lists: %s", kindNames[kind], strings.Join(extra, " "))
+			found = true
+		}
+	}
+	if found {
+		fmt.Fprintln(r.w, "    → list the ones to keep in a module's [units]; arcus disables nothing it didn't enable")
+	}
+}
+
+// doctorGroups reports the user's groups that no module that's on lists,
+// apart from those the user has from the start: their own group, wheel
+// (the installer's) and users (Arch's default).
+func (a *app) doctorGroups(in plan.Input, r *report) {
+	groups, err := system.Groups(a.user)
+	if err != nil {
+		r.problem("querying groups: %v", err)
+		return
+	}
+	listed := map[string]bool{a.user: true, "wheel": true, "users": true}
+	for _, names := range in.Declares(state.Groups) {
+		for _, g := range names {
+			listed[g] = true
+		}
+	}
+	var extra []string
+	for g := range groups {
+		if !listed[g] {
+			extra = append(extra, g)
+		}
+	}
+	if len(extra) > 0 {
+		slices.Sort(extra)
+		r.problem("groups no module lists: %s", strings.Join(extra, " "))
+		fmt.Fprintln(r.w, "    → list the ones to keep in a module's groups")
+	}
+}
+
+// doctorApprovals reports aurlock approvals for packages no module lists,
+// whether it's on or off: approvals sync between machines, so one may be
+// for a package only another machine installs. Approvals are by package
+// base and modules list package names; aurlock's record of what it
+// installed here links the two where they differ.
+func (a *app) doctorApprovals(r *report) {
+	if a.cfg.AURHelper != "aurlock" {
+		return
+	}
+	approved, err := readColumns(filepath.Join(a.xdg("XDG_CONFIG_HOME", ".config"), "aurlock", "approved"))
+	if errors.Is(err, iofs.ErrNotExist) {
+		return
+	}
+	if err != nil {
+		r.problem("reading the aurlock approvals: %v", err)
+		return
+	}
+	installed, err := readColumns(filepath.Join(a.xdg("XDG_STATE_HOME", ".local/state"), "aurlock", "installed"))
+	if err != nil && !errors.Is(err, iofs.ErrNotExist) {
+		r.problem("reading what aurlock installed: %v", err)
+		return
+	}
+
+	listed := map[string]bool{}
+	for _, m := range a.modules {
+		for _, p := range m.Packages.AUR {
+			listed[p] = true
+		}
+	}
+	for _, f := range installed { // pkgname pkgbase ...
+		if len(f) > 1 && listed[f[0]] {
+			listed[f[1]] = true
+		}
+	}
+	var extra []string
+	for _, f := range approved { // pkgbase commit ...
+		if !listed[f[0]] && !slices.Contains(extra, f[0]) {
+			extra = append(extra, f[0])
+		}
+	}
+	if len(extra) > 0 {
+		slices.Sort(extra)
+		r.problem("aurlock approvals no module lists: %s", strings.Join(extra, " "))
+		fmt.Fprintln(r.w, "    → list them in a module's aur, or drop the approvals with 'aurlock forget'")
+	}
+}
+
+// xdg returns the directory an XDG variable names, or fallback under $HOME
+// when it is unset or relative.
+func (a *app) xdg(variable, fallback string) string {
+	if dir := a.getenv(variable); filepath.IsAbs(dir) {
+		return dir
+	}
+	return filepath.Join(a.paths.Home, fallback)
+}
+
+// readColumns reads a file of whitespace-separated columns, skipping blank
+// lines and # comments.
+func readColumns(path string) ([][]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var rows [][]string
+	for line := range strings.Lines(string(data)) {
+		if f := strings.Fields(line); len(f) > 0 && !strings.HasPrefix(f[0], "#") {
+			rows = append(rows, f)
+		}
+	}
+	return rows, nil
 }
 
 var notes = map[string]string{
