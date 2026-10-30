@@ -79,8 +79,10 @@ func (r *Runner) PacmanMark(explicit bool, pkgs []string) error {
 
 // PacmanInstallFiles installs package files built by makepkg. Unlike -S it
 // has no --needed: a rebuilt package of the same version is reinstalled.
+// They are explicitly installed even if they replace a package that was
+// installed as a dependency.
 func (r *Runner) PacmanInstallFiles(files []string) error {
-	return r.run("pacman", r.pkgArgs("-U", files)...)
+	return r.run("pacman", r.pkgArgs("-U", append([]string{"--asexplicit"}, files...))...)
 }
 
 // PacmanRemoveConflicting removes installed packages that packages about

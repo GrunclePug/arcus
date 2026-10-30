@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/grunclepug/arcus/internal/layer"
@@ -111,6 +112,54 @@ func TestRestackWhenAModuleChanged(t *testing.T) {
 	}
 }
 
+// Packages taken over, pacman and AUR, become explicitly installed in one
+// root step, unless they are already.
+func TestMarkAdopted(t *testing.T) {
+	modules := module.Set{"a": {Name: "a"}}
+	modules["a"].Packages.Pacman = []string{"dep", "explicit", "missing"}
+	modules["a"].Packages.AUR = []string{"aur-dep", "aur-explicit", "aur-owned"}
+	user := &state.State{}
+	user.Own(state.AUR, "a", []string{"aur-owned"})
+	in := Input{Desired: []string{"a"}, Modules: modules}
+	h := Half{
+		State:     &state.State{},
+		Layer:     layer.NewSystem(t.TempDir(), t.TempDir(), nil),
+		Installed: set("dep", "explicit", "aur-dep", "aur-explicit", "aur-owned"),
+		User:      user,
+		Explicit:  set("explicit", "aur-explicit"),
+	}
+	marks := func(h Half) []string {
+		steps, err := System(in, h)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range steps {
+			if s.Op == MarkAdopted {
+				if s.Stage != Packages {
+					t.Errorf("stage = %v", s.Stage)
+				}
+				return s.Names
+			}
+		}
+		return nil
+	}
+
+	if got := Adopted(in, h); !slices.Equal(got, []string{"aur-dep", "aur-explicit", "dep", "explicit"}) {
+		t.Errorf("adopted = %v", got)
+	}
+	if got := marks(h); !slices.Equal(got, []string{"aur-dep", "dep"}) {
+		t.Errorf("marked = %v", got)
+	}
+	h.User = nil // no AUR package is installed: the user half isn't read
+	if got := marks(h); !slices.Equal(got, []string{"dep"}) {
+		t.Errorf("marked without the user half = %v", got)
+	}
+	h.Explicit = set("dep", "explicit")
+	if got := marks(h); got != nil {
+		t.Errorf("marked though all are explicit: %v", got)
+	}
+}
+
 func TestSystemPackagesAndGroups(t *testing.T) {
 	modules := module.Set{
 		"a": {Name: "a"},
@@ -140,6 +189,7 @@ func TestSystemPackagesAndGroups(t *testing.T) {
 		{Stage: Packages, Op: Adopt, Of: state.Pacman, Module: "a", Names: []string{"wmenu"}},
 		{Stage: Packages, Op: Install, Module: "a", Names: []string{"foot"}},
 		{Stage: Packages, Op: Install, Module: "b", Names: []string{"river"}},
+		{Stage: Packages, Op: MarkAdopted, Names: []string{"wmenu"}},
 		// No layer steps: neither module has a system/ tree.
 		{Stage: SystemSetup, Op: Join, Module: "b", Names: []string{"video"}},
 	}

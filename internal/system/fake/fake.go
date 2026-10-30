@@ -71,7 +71,11 @@ esac
 if [ -f "$dir/fail" ] && grep -qx "$(basename "$0")" "$dir/fail"; then exit 1; fi
 if [ -f "$dir/slow" ]; then touch "$dir/started"; sleep "$(cat "$dir/slow")"; fi
 case $op in
-  -S|-U) for p in $names; do grep -qx "$p" "$dir/pkgs" || echo "$p" >> "$dir/pkgs"; done ;;
+  -S|-U)
+    for p in $names; do
+      grep -qx "$p" "$dir/pkgs" || echo "$p" >> "$dir/pkgs"
+      case " $* " in *" --asexplicit "*) grep -vx "$p" "$dir/deps" > "$dir/deps.tmp"; mv "$dir/deps.tmp" "$dir/deps" ;; esac
+    done ;;
   -D)
     for p in $names; do
       grep -vx "$p" "$dir/deps" > "$dir/deps.tmp"; mv "$dir/deps.tmp" "$dir/deps"

@@ -402,7 +402,34 @@ func (a *app) situation(in plan.Input, h *half) (plan.Half, error) {
 			return plan.Half{}, err
 		}
 	}
+	if h.name == "system" {
+		if err := a.adoptInfo(in, &s); err != nil {
+			return plan.Half{}, err
+		}
+	}
 	return s, nil
+}
+
+// adoptInfo reads what marking the packages taken over needs: the user
+// half's state, when a module lists an AUR package that is installed, then
+// which packages are explicitly installed, when anything is taken over.
+func (a *app) adoptInfo(in plan.Input, s *plan.Half) error {
+	for _, names := range in.Declares(state.AUR) {
+		if slices.ContainsFunc(names, func(n string) bool { return s.Installed[n] }) {
+			st, err := a.userHalf().loadState()
+			if err != nil {
+				return err
+			}
+			s.User = st
+			break
+		}
+	}
+	if len(plan.Adopted(in, *s)) == 0 {
+		return nil
+	}
+	var err error
+	s.Explicit, err = system.Explicit()
+	return err
 }
 
 // systemPlan plans the system half, including the removal of installed
@@ -593,6 +620,8 @@ func describe(s plan.Step) string {
 		return fmt.Sprintf("record %s under the modules that list them now:", kindNames[s.Of])
 	case plan.Adopt:
 		return fmt.Sprintf("take over %s for %s (already there): %s", kindNames[s.Of], s.Module, names)
+	case plan.MarkAdopted:
+		return fmt.Sprintf("mark the packages taken over as explicitly installed: %s", names)
 	case plan.MarkExplicit:
 		return fmt.Sprintf("mark as explicitly installed (a module lists them or they are protected): %s", names)
 	case plan.MarkDeps:
@@ -616,6 +645,7 @@ func (a *app) execute(steps []plan.Step, in plan.Input, o *opts) error {
 			args := []string{
 				"-stage", strconv.Itoa(int(stage)), "-hash", plan.Hash(group),
 				"-home", a.paths.Home, "-config", a.paths.Config, "-cache", a.paths.Cache,
+				"-state", a.paths.UserState,
 			}
 			if len(a.rebuild) > 0 {
 				args = append(args, "-rebuild", strings.Join(a.rebuild, ","))
@@ -729,6 +759,10 @@ func (a *app) runSteps(h *half, st *state.State, steps []plan.Step, in plan.Inpu
 			}
 			st.Own(s.Kind(), s.Module, slices.DeleteFunc(slices.Clone(s.Names), func(n string) bool { return !present[n] }))
 			if err := save(); err != nil {
+				return err
+			}
+		case plan.MarkAdopted:
+			if err := r.PacmanMark(true, s.Names); err != nil {
 				return err
 			}
 		case plan.HandOver:

@@ -82,6 +82,10 @@ const (
 	Link     = "link" // home links
 	Unlink   = "unlink"
 
+	// Packages taken over that were installed as dependencies become
+	// explicitly installed, like the ones arcus installs.
+	MarkAdopted = "mark-adopted"
+
 	// arcus clean: install reasons follow the modules, the rest is removed.
 	MarkExplicit   = "mark-explicit"
 	MarkDeps       = "mark-deps"
@@ -208,6 +212,12 @@ type Half struct {
 	// An own build not built yet may be missing from Incoming in the root
 	// process; it is only installed in a later root stage, after the build.
 	Packages, Incoming map[string]system.Package
+
+	// Marking the packages taken over needs these, in the system half: the
+	// user half's state, for the AUR packages it takes over, and the
+	// packages installed explicitly. Each is nil when it can't matter.
+	User     *state.State
+	Explicit map[string]bool
 }
 
 // System plans the root half: pacman packages, system files, system units
@@ -224,6 +234,9 @@ func System(in Input, h Half) ([]Step, error) {
 	steps = append(steps, packageRemovals(in, h, Remove, Packages, state.Pacman)...)
 	steps = append(steps, packageRemovals(in, h, RemoveLocal, Packages, state.Local)...)
 	steps = append(steps, additions(in, h.State, Install, Packages, state.Pacman, h.Installed)...)
+	if names := slices.DeleteFunc(Adopted(in, h), func(n string) bool { return h.Explicit[n] }); len(names) > 0 {
+		steps = append(steps, Step{Stage: Packages, Op: MarkAdopted, Names: names})
+	}
 	local, err := localInstalls(in, h)
 	if err != nil {
 		return nil, err
@@ -542,6 +555,24 @@ func additions(in Input, st *state.State, op string, stage Stage, kind string, p
 		}
 	}
 	return append(adopt, steps...)
+}
+
+// Adopted returns the packages that the plan of the system half takes over,
+// and those of the user half if h.User is set, sorted. Own builds are never
+// taken over: they are installed again, as explicitly installed.
+func Adopted(in Input, h Half) []string {
+	steps := additions(in, h.State, Install, Packages, state.Pacman, h.Installed)
+	if h.User != nil {
+		steps = append(steps, additions(in, h.User, Install, AURInstall, state.AUR, h.Installed)...)
+	}
+	var names []string
+	for _, s := range steps {
+		if s.Op == Adopt {
+			names = append(names, s.Names...)
+		}
+	}
+	slices.Sort(names)
+	return names
 }
 
 // localInstalls plans one install per own build that is missing, was built

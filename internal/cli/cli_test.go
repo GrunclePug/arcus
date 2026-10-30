@@ -819,6 +819,69 @@ func (e *env) count(prefix string) int {
 	return n
 }
 
+// Packages taken over that were installed as dependencies become
+// explicitly installed, pacman and AUR alike, so clean has nothing left to
+// mark. Released, they still stay as dependencies when something needs them.
+func TestAdoptMarksExplicit(t *testing.T) {
+	e := newEnv(t)
+	e.sys.SetPackages("foot", "wmenu", "applet", "steam")
+	e.sys.SetDeps("foot", "applet")
+	e.sys.SetRequires("steam foot")
+	e.module("m", "[packages]\npacman = [\"foot\", \"wmenu\"]\naur = [\"applet\"]\n", nil)
+
+	must(t, e.run("plan", "m"))
+	for _, want := range []string{
+		"root  take over packages for m (already there): foot wmenu",
+		"root  mark the packages taken over as explicitly installed: applet foot\n",
+		"user  take over AUR packages for m (already there): applet",
+	} {
+		if !strings.Contains(e.out.String(), want) {
+			t.Errorf("plan lacks %q:\n%s", want, e.out.String())
+		}
+	}
+
+	must(t, e.run("on", "-y", "m"))
+	if got := e.sys.Deps(); len(got) != 0 {
+		t.Errorf("deps = %v", got)
+	}
+	if e.count("pacman -D --asexplicit applet foot") != 1 || e.count("pacman -D") != 1 {
+		t.Errorf("log:\n%s", strings.Join(e.sys.Log(), "\n"))
+	}
+	must(t, e.run("plan"))
+	if !strings.Contains(e.out.String(), "Nothing to do.") {
+		t.Errorf("plan after on:\n%s", e.out.String())
+	}
+	must(t, e.run("clean", "-n"))
+	if strings.Contains(e.out.String(), "mark as") {
+		t.Errorf("clean still marks:\n%s", e.out.String())
+	}
+
+	must(t, e.run("off", "-y", "m"))
+	contains(t, e.sys.Packages(), "foot", "steam")
+	lacks(t, e.sys.Packages(), "wmenu", "applet")
+	contains(t, e.sys.Deps(), "foot")
+}
+
+// The root process reads the user half's state where the user's arcus
+// keeps it, also under XDG_STATE_HOME: otherwise it would take an AUR
+// package arcus already records for one being taken over, and refuse the
+// confirmed steps.
+func TestAdoptReadsTheUserStateDir(t *testing.T) {
+	e := newEnv(t)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(e.root, "state"))
+	e.module("a", "[packages]\naur = [\"applet\"]\n", nil)
+	e.module("b", "[packages]\npacman = [\"foot\"]\n", nil)
+	must(t, e.run("on", "-y", "a"))
+	e.sys.SetPackages(append(e.sys.Packages(), "foot")...)
+	e.sys.SetDeps("applet", "foot") // applet: recorded for a, so not taken over
+
+	must(t, e.run("on", "-y", "b"))
+	if e.count("pacman -D --asexplicit foot") != 1 {
+		t.Errorf("log:\n%s", strings.Join(e.sys.Log(), "\n"))
+	}
+	contains(t, e.sys.Deps(), "applet")
+}
+
 // Own builds come from a recipe in the module, are built as the user,
 // installed with pacman -U, and rebuilt only when the recipe changes or a
 // rebuild is asked for.
@@ -866,6 +929,9 @@ func TestOwnBuilds(t *testing.T) {
 	if e.count("makepkg") != 3 || e.count("pacman -U") != 3 {
 		t.Error("rebuild did not build and reinstall")
 	}
+	e.sys.SetDeps("waylock-arcus")
+	must(t, e.run("rebuild", "-y", "waylock-arcus"))
+	lacks(t, e.sys.Deps(), "waylock-arcus") // reinstalled as explicitly installed
 	if err := e.run("rebuild", "-y", "dwm-arcus"); err == nil || !strings.Contains(err.Error(), "not an own build") {
 		t.Fatalf("rebuild of an unknown build: %v", err)
 	}
@@ -1103,6 +1169,8 @@ func TestClean(t *testing.T) {
 	e.sys.SetRequires("foot lib", "foot pixman", "tool tool-lib")
 	e.module("m", "[packages]\npacman = [\"foot\", \"go\"]\n", nil)
 	must(t, e.run("on", "-y", "m"))
+	lacks(t, e.sys.Deps(), "foot") // taken over, so marked explicitly installed
+	e.sys.SetDeps("foot", "tool-lib", "orphan", "pixman")
 	before := e.sys.Packages()
 
 	must(t, e.run("clean", "-n"))

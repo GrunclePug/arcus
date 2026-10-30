@@ -32,6 +32,7 @@ func (a *app) execSystem(args []string) error {
 	home := fs.String("home", "", "the user's home")
 	configDir := fs.String("config", "", "the user's arcus config directory")
 	cacheDir := fs.String("cache", "", "the user's arcus cache directory (own builds)")
+	stateDir := fs.String("state", "", "the user's arcus state directory (the AUR packages it takes over)")
 	rebuild := fs.String("rebuild", "", "comma-separated own builds to rebuild")
 	force := fs.Bool("f", false, "move edited files aside")
 	doctor := fs.Bool("doctor", false, "repair the system half")
@@ -66,6 +67,12 @@ func (a *app) execSystem(args []string) error {
 			return fmt.Errorf("exec-system: %q is not an absolute path", *cacheDir)
 		}
 		paths.Cache = *cacheDir
+	}
+	if *stateDir != "" {
+		if !filepath.IsAbs(*stateDir) {
+			return fmt.Errorf("exec-system: %q is not an absolute path", *stateDir)
+		}
+		paths.UserState = *stateDir
 	}
 	if *rebuild != "" {
 		a.rebuild = strings.Split(*rebuild, ",")
