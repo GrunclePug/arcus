@@ -39,6 +39,9 @@ func TestDetect(t *testing.T) {
 		"sys/bus/pci/devices/0000:0e:00.0/class":  "0x030000\n",
 		"sys/bus/pci/devices/0000:0e:00.0/vendor": "0x10de\n",
 		"proc/self/mounts":                        "/dev/mapper/root / btrfs rw,noatime,subvol=/@ 0 0\n/dev/mapper/root /home btrfs rw,noatime,subvol=/@home 0 0\n/dev/vda1 /boot vfat rw 0 0\nproc /proc proc rw 0 0\ntmpfs /tmp tmpfs rw 0 0\n",
+		"sys/block/nvme0n1/device/model":          "SSD\n",
+		"sys/block/nvme0n1/removable":             "0\n",
+		"sys/block/nvme0n1/queue/rotational":      "0\n",
 	} {
 		file := filepath.Join(root, path)
 		if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
@@ -53,7 +56,7 @@ func TestDetect(t *testing.T) {
 	}
 	installed := map[string]bool{"linux": true, "linux-firmware": true, "grub": true, "zram-generator": true, "xfsprogs": true}
 	got := Detect(root, installed)
-	want := Facts{UEFI: true, Kernels: []string{"linux"}, Firmware: true, GRUB: true, Filesystems: []string{"btrfs", "vfat"}, CPU: "AuthenticAMD", GPUs: []string{NVIDIA}, Zram: true}
+	want := Facts{UEFI: true, Kernels: []string{"linux"}, Firmware: true, GRUB: true, Filesystems: []string{"btrfs", "vfat"}, CPU: "AuthenticAMD", GPUs: []string{NVIDIA}, Zram: true, SSD: true}
 	if got.Hash() != want.Hash() {
 		t.Errorf("detected %+v, want %+v", got, want)
 	}
@@ -63,7 +66,7 @@ func TestDetect(t *testing.T) {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "module.toml"))
-	if err != nil || !strings.Contains(string(data), `"btrfs-progs", "dosfstools", "zram-generator"`) {
+	if err != nil || !strings.Contains(string(data), `"btrfs-progs", "dosfstools", "zram-generator"`) || !strings.Contains(string(data), `system = ["fstrim.timer"]`) {
 		t.Errorf("module.toml: %s (%v)", data, err)
 	}
 	got.Zram = false
@@ -72,5 +75,34 @@ func TestDetect(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "system")); !os.IsNotExist(err) {
 		t.Error("rewriting without zram must drop its files")
+	}
+}
+
+// Only a physical, fixed, non-rotational disk counts as an SSD.
+func TestSSD(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		files map[string]string
+		want  bool
+	}{
+		{"no disks", nil, false},
+		{"a hard disk", map[string]string{"sda/device/model": "", "sda/removable": "0", "sda/queue/rotational": "1"}, false},
+		{"a hard disk and an SSD", map[string]string{"sda/device/model": "", "sda/removable": "0", "sda/queue/rotational": "1", "nvme0n1/device/model": "", "nvme0n1/removable": "0", "nvme0n1/queue/rotational": "0"}, true},
+		{"a removable stick", map[string]string{"sdb/device/model": "", "sdb/removable": "1", "sdb/queue/rotational": "0"}, false},
+		{"loop, zram and device-mapper", map[string]string{"loop0/removable": "0", "loop0/queue/rotational": "0", "zram0/removable": "0", "zram0/queue/rotational": "0", "dm-0/removable": "0", "dm-0/queue/rotational": "0"}, false},
+	} {
+		root := t.TempDir()
+		for path, content := range tc.files {
+			file := filepath.Join(root, "sys/block", path)
+			if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(file, []byte(content+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if got := SSD(root); got != tc.want {
+			t.Errorf("%s: SSD = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }

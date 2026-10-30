@@ -42,7 +42,7 @@ func WriteModules(dir string) error {
 }
 
 // MachineFacts returns the facts of the machine module for the plan on this
-// machine (root: its /proc). The installed system finds the same facts with
+// machine (root: its /proc and /sys). The installed system finds the same facts with
 // 'arcus machine'.
 func MachineFacts(p *Plan, uefi bool, root string) machine.Facts {
 	boot := "ext4"
@@ -57,6 +57,7 @@ func MachineFacts(p *Plan, uefi bool, root string) machine.Facts {
 		CPU:         machine.CPU(filepath.Join(root, "proc/cpuinfo")),
 		GPUs:        machine.GPUs(root),
 		Zram:        p.Disk.Swap == "zram",
+		SSD:         machine.SSD(root),
 	}
 }
 
