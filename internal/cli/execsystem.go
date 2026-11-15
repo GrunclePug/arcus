@@ -16,7 +16,7 @@ import (
 	"github.com/grunclepug/arcus/internal/system"
 )
 
-// Login names as shadow-utils accepts them by default; Arch allows upper case.
+// Login names as useradd accepts them, except a leading digit or dot.
 var userNameRegex = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.-]*\$?$`)
 
 // execSystem is the root side of arcus. The user's arcus runs it through
