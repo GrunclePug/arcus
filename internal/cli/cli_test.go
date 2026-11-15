@@ -1444,3 +1444,16 @@ func TestOldHostFileRefused(t *testing.T) {
 		t.Error("a new host file was started")
 	}
 }
+
+func TestUserNameRegex(t *testing.T) {
+	for _, ok := range []string{"u", "alice", "Alice", "_svc", "first.last", "a-b_c", "machine$"} {
+		if !userNameRegex.MatchString(ok) {
+			t.Errorf("%q should be a valid login name", ok)
+		}
+	}
+	for _, bad := range []string{"", "-u", ".u", "1u", "a b", "a/b", "a;b", "../x", "a$b"} {
+		if userNameRegex.MatchString(bad) {
+			t.Errorf("%q should be rejected", bad)
+		}
+	}
+}
