@@ -151,10 +151,10 @@ pkgname = waylock-arcus
 pkgname = waylock-arcus-debug
 	conflicts = waylock-debug
 `
-	if got, want := parseSrcInfo(info, "waylock-arcus"), (Package{Provides: []string{"waylock"}, Conflicts: []string{"waylock"}}); !reflect.DeepEqual(got, want) {
+	if got, want := parseSrcInfo(info, "waylock-arcus"), (Package{Depends: []string{"pam"}, Provides: []string{"waylock"}, Conflicts: []string{"waylock"}}); !reflect.DeepEqual(got, want) {
 		t.Errorf("waylock-arcus = %v, want %v", got, want)
 	}
-	if got, want := parseSrcInfo(info, "waylock-arcus-debug"), (Package{Provides: []string{"waylock"}, Conflicts: []string{"waylock-debug"}}); !reflect.DeepEqual(got, want) {
+	if got, want := parseSrcInfo(info, "waylock-arcus-debug"), (Package{Depends: []string{"pam"}, Provides: []string{"waylock"}, Conflicts: []string{"waylock-debug"}}); !reflect.DeepEqual(got, want) {
 		t.Errorf("waylock-arcus-debug = %v, want %v", got, want)
 	}
 }

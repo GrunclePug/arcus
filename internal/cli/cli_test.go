@@ -1609,3 +1609,73 @@ func TestDoctorReleasesTheHoldFirst(t *testing.T) {
 		})
 	}
 }
+
+func TestOwnBuildDependencies(t *testing.T) {
+	for _, kind := range []string{"depends", "makedepends", "checkdepends"} {
+		t.Run(kind, func(t *testing.T) {
+			e := newEnv(t)
+			t.Setenv("XDG_CACHE_HOME", "")
+			e.module("builds", "[packages]\nlocal = [\"consumer\", \"base\", \"other\"]\n", map[string]string{
+				"pkg/consumer/PKGBUILD": "pkgname=consumer\npkgver=1\npkgrel=1\n",
+				"pkg/base/PKGBUILD":     "pkgname=base\npkgver=1\npkgrel=1\n",
+				"pkg/other/PKGBUILD":    "pkgname=other\npkgver=1\npkgrel=1\n",
+			})
+			e.sys.SetMeta("consumer " + kind + " base>=1")
+			must(t, e.run("plan", "builds"))
+			text := e.out.String()
+			if strings.Index(text, "install own build for builds: base") > strings.Index(text, "build consumer from") {
+				t.Fatal(text)
+			}
+			must(t, e.run("on", "-y", "builds"))
+			log := strings.Join(e.sys.Log(), "\n")
+			firstInstall := strings.Index(log, "pacman -U")
+			consumer := strings.Index(log, "in consumer")
+			if firstInstall < 0 || consumer < firstInstall || e.count("pacman -U") != 2 {
+				t.Fatal(log)
+			}
+			contains(t, e.sys.Packages(), "base", "consumer", "other")
+			must(t, e.run("apply", "-y"))
+			if e.count("pacman -U") != 2 {
+				t.Fatal("apply rebuilt unchanged packages")
+			}
+		})
+	}
+}
+
+func TestOwnBuildCycle(t *testing.T) {
+	e := newEnv(t)
+	e.module("cycle", "[packages]\nlocal = [\"a\", \"b\"]\n", map[string]string{
+		"pkg/a/PKGBUILD": "pkgname=a\npkgver=1\npkgrel=1\n",
+		"pkg/b/PKGBUILD": "pkgname=b\npkgver=1\npkgrel=1\n",
+	})
+	e.sys.SetMeta("a depends b", "b makedepends a")
+	err := e.run("on", "-y", "cycle")
+	if err == nil || !strings.Contains(err.Error(), "dependency cycle") || !strings.Contains(err.Error(), "a, b") {
+		t.Fatalf("cycle: %v", err)
+	}
+	if e.count("makepkg") != 0 || e.sudos != 0 {
+		t.Fatal("cycle acted before refusing")
+	}
+}
+
+func TestOwnBuildBatchHashRefusesChangedRecipe(t *testing.T) {
+	e := newEnv(t)
+	dir := e.module("builds", "[packages]\nlocal = [\"a\"]\n", map[string]string{
+		"pkg/a/PKGBUILD": "pkgname=a\npkgver=1\npkgrel=1\n",
+	})
+	a := e.app("")
+	sudo := a.sudo
+	a.sudo = func(args []string) error {
+		if slices.Contains(args, "-local") {
+			must(t, os.WriteFile(filepath.Join(dir, "pkg/a/PKGBUILD"), []byte("pkgname=a\npkgver=2\npkgrel=1\n"), 0o644))
+		}
+		return sudo(args)
+	}
+	err := a.run([]string{"on", "-y", "builds"})
+	if err == nil || !strings.Contains(err.Error(), "root steps changed") {
+		t.Fatalf("changed recipe: %v", err)
+	}
+	if e.count("pacman -U") != 0 {
+		t.Fatal("installed changed recipe")
+	}
+}

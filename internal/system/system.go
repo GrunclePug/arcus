@@ -242,7 +242,8 @@ func Unrequired() (map[string]bool, error) {
 // it. Provides and Conflicts keep their version constraints ("foo=1.2",
 // "bar<2").
 type Package struct {
-	Provides, Conflicts, RequiredBy []string
+	Depends, MakeDepends, CheckDepends []string
+	Provides, Conflicts, RequiredBy    []string
 }
 
 // Info returns what pacman reports about packages, by name: installed ones
@@ -352,10 +353,16 @@ func parseSrcInfo(info, pkg string) Package {
 		default:
 			continue
 		}
-		switch k {
-		case "provides":
+		switch {
+		case k == "depends" || strings.HasPrefix(k, "depends_"):
+			p.Depends = append(p.Depends, v)
+		case k == "makedepends" || strings.HasPrefix(k, "makedepends_"):
+			p.MakeDepends = append(p.MakeDepends, v)
+		case k == "checkdepends" || strings.HasPrefix(k, "checkdepends_"):
+			p.CheckDepends = append(p.CheckDepends, v)
+		case k == "provides":
 			p.Provides = append(p.Provides, v)
-		case "conflicts":
+		case k == "conflicts":
 			p.Conflicts = append(p.Conflicts, v)
 		default:
 			continue
@@ -370,6 +377,9 @@ func parseSrcInfo(info, pkg string) Package {
 	if !ownSet["conflicts"] {
 		own.Conflicts = base.Conflicts
 	}
+	own.Depends = append(base.Depends, own.Depends...)
+	own.MakeDepends = append(base.MakeDepends, own.MakeDepends...)
+	own.CheckDepends = append(base.CheckDepends, own.CheckDepends...)
 	return own
 }
 

@@ -121,6 +121,9 @@ fi
 echo "makepkg $* in $(basename "$PWD")" >> "$dir/log"
 if [ -f "$dir/fail" ] && grep -qx makepkg "$dir/fail"; then exit 1; fi
 . ./PKGBUILD
+for dep in $(awk -v p="$pkgname" '$1 == p && ($2 == "depends" || $2 == "makedepends" || $2 == "checkdepends") { print $3 }' "$dir/meta" | sed 's/[<>=].*//'); do
+  if ! grep -qx "$dep" "$dir/pkgs"; then echo "missing build dependency: $dep" >&2; exit 1; fi
+done
 mkdir -p "$PKGDEST"
 cat $(find . -type f | sort) > "$PKGDEST/$pkgname-$pkgver-$pkgrel-x86_64.pkg.tar.zst"
 `
