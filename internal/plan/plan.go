@@ -23,7 +23,9 @@ import (
 // conflicting package or file is gone before its replacement arrives), then
 // packages, then setup. Repository packages come before own builds are
 // built, so a build finds the dependencies its module lists installed.
-// Root stages run in one sudo call each.
+// Own builds that need other pending own builds alternate between Build
+// and LocalPackages, one pair per batch (see Local). Each run of a root
+// stage is one sudo call.
 type Stage int
 
 const (
@@ -31,8 +33,8 @@ const (
 	SystemTeardown                  // groups left, system units disabled, system layers off
 	AURRemove                       // AUR packages removed
 	Packages                        // pacman packages and own builds removed, pacman packages installed
-	Build                           // own builds made from their recipes (makepkg, as the user)
-	LocalPackages                   // own builds installed
+	Build                           // own builds of one batch made from their recipes (makepkg, as the user)
+	LocalPackages                   // own builds of one batch installed
 	AURInstall                      // AUR packages installed
 	SystemSetup                     // system layers on, system units enabled, groups joined
 	UserSetup                       // home layers on, user units enabled
@@ -270,15 +272,9 @@ func User(in Input, h Half) ([]Step, error) {
 }
 
 // Merge orders the steps of both halves by stage, keeping the order within
-// a stage. Every own build the system half installs is built before, as the
-// user, in the build stage.
+// a stage. Local then adds the builds of the own builds it installs.
 func Merge(system, user []Step) []Step {
 	steps := append(slices.Clone(system), user...)
-	for _, s := range system {
-		if s.Op == InstallLocal {
-			steps = append(steps, Step{Stage: Build, Op: BuildLocal, Module: s.Module, Names: s.Names, Recipe: s.Recipe})
-		}
-	}
 	slices.SortStableFunc(steps, func(a, b Step) int { return int(a.Stage) - int(b.Stage) })
 	return steps
 }
@@ -313,10 +309,23 @@ func Filter(steps []Step, stage Stage) []Step {
 // Replacement lines ("! path") are left out: they describe files that an
 // earlier stage of the same run may create, such as a package's default
 // config that a module's file replaces, and the original is kept either way.
+// So is what needs a conflicting package ("; needed by"): an own build
+// installed by an earlier batch of the same run may need it too, and the
+// names removed are hashed either way.
 func Hash(steps []Step) string {
 	hashed := make([]Step, len(steps))
 	for i, s := range steps {
-		s.Changes = slices.DeleteFunc(slices.Clone(s.Changes), func(c string) bool { return strings.HasPrefix(c, "! ") })
+		var changes []string
+		for _, c := range s.Changes {
+			if strings.HasPrefix(c, "! ") {
+				continue
+			}
+			if strings.HasPrefix(c, "x ") {
+				c, _, _ = strings.Cut(c, neededBy)
+			}
+			changes = append(changes, c)
+		}
+		s.Changes = changes
 		hashed[i] = s
 	}
 	data, _ := json.Marshal(hashed) // plain strings, ints and bools can't fail to encode
@@ -464,7 +473,7 @@ func Conflicts(in Input, h Half, steps []Step) ([]Step, error) {
 				names = append(names, q)
 				line := fmt.Sprintf("x %s: conflicts with %s", q, t)
 				if by := h.Packages[q].RequiredBy; len(by) > 0 {
-					line += fmt.Sprintf("; needed by %s", strings.Join(by, " "))
+					line += neededBy + strings.Join(by, " ")
 				}
 				changes = append(changes, line)
 				gone[q] = true
@@ -477,6 +486,185 @@ func Conflicts(in Input, h Half, steps []Step) ([]Step, error) {
 		out = append(out, s)
 	}
 	return out, nil
+}
+
+const neededBy = "; needed by "
+
+// Local replaces the own build steps of merged steps with batches: the
+// builds of a batch, then their installs with the removal of what they
+// conflict with. A build waits for an earlier batch to install what its
+// BuildDepends need from the pending own builds, so makepkg finds it
+// installed; an install shares the batch of what its Depends need, or
+// comes later, so pacman finds it installed or in the same transaction.
+// Unrelated builds share a batch.
+//
+// Batches are planned on h as the earlier stages and batches leave it.
+// h.Incoming must hold every own build to install, with BuildDepends for
+// the ones that will be built (from SrcInfo); one already built from its
+// recipe is only installed. It is an error if the builds need each other
+// in a cycle.
+func Local(in Input, h Half, steps []Step) ([]Step, error) {
+	var local []Step
+	build, after := len(steps), len(steps)
+	for i, s := range steps {
+		if s.Op == InstallLocal {
+			local = append(local, s)
+		}
+		if s.Stage >= Build && build == len(steps) {
+			build = i
+		}
+		if s.Stage > LocalPackages && after == len(steps) {
+			after = i
+		}
+	}
+	if len(local) == 0 {
+		return steps, nil
+	}
+
+	packages := map[string]system.Package{}
+	maps.Copy(packages, h.Packages)
+	h.Packages = packages
+	apply := func(steps []Step) {
+		for _, s := range steps {
+			switch s.Op {
+			case Remove, RemoveLocal, RemoveConflicting:
+				for _, n := range s.Names {
+					delete(h.Packages, n)
+				}
+			case Install, InstallLocal:
+				for _, n := range s.Names {
+					h.Packages[n] = h.Incoming[n]
+				}
+			}
+		}
+	}
+	apply(steps[:build])
+	var ordered []Step
+	for pending := local; len(pending) > 0; {
+		batch, err := nextBatch(pending, h.Incoming, h.Packages)
+		if err != nil {
+			return nil, err
+		}
+		pending = slices.DeleteFunc(pending, func(s Step) bool {
+			return slices.ContainsFunc(batch, func(b Step) bool { return b.Names[0] == s.Names[0] })
+		})
+		for _, s := range batch {
+			ordered = append(ordered, Step{Stage: Build, Op: BuildLocal, Module: s.Module, Names: s.Names, Recipe: s.Recipe})
+		}
+		installs, err := Conflicts(in, h, batch)
+		if err != nil {
+			return nil, err
+		}
+		ordered = append(ordered, installs...)
+		apply(installs)
+	}
+	kept := slices.DeleteFunc(slices.Clone(steps[:after]), func(s Step) bool { return s.Stage == LocalPackages })
+	return slices.Concat(kept, ordered, steps[after:]), nil
+}
+
+// need is a dependency on pending own builds: any one of them satisfies it.
+type need struct {
+	build bool // makepkg needs it installed before the build
+	of    []string
+}
+
+// nextBatch returns the pending own build installs that can go in the next
+// batch, in their order, with the packages installed by then: the ones
+// that need no other pending build to build, less the ones whose install
+// needs a pending build outside the batch.
+func nextBatch(pending []Step, incoming, installed map[string]system.Package) ([]Step, error) {
+	needs := localNeeds(pending, incoming, installed)
+	met := func(nd need, batch map[string]bool) bool {
+		return slices.ContainsFunc(nd.of, func(p string) bool { return batch[p] })
+	}
+	batch := map[string]bool{}
+	for _, s := range pending {
+		if !slices.ContainsFunc(needs[s.Names[0]], func(nd need) bool { return nd.build }) {
+			batch[s.Names[0]] = true
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for n := range batch {
+			if slices.ContainsFunc(needs[n], func(nd need) bool { return !met(nd, batch) }) {
+				delete(batch, n)
+				changed = true
+			}
+		}
+	}
+	if len(batch) == 0 {
+		return nil, fmt.Errorf("own builds need each other in a cycle: %s", strings.Join(cycle(pending, needs), " → "))
+	}
+	return slices.DeleteFunc(slices.Clone(pending), func(s Step) bool { return !batch[s.Names[0]] }), nil
+}
+
+// localNeeds lists what each pending own build needs from the other ones.
+// A dependency on the name of a pending own build needs that one, even
+// while an older version is installed: its recipe changed. Otherwise it
+// needs one of the pending builds that provide the name, unless an
+// installed package already does and the dependency has no version
+// constraint, which arcus doesn't compare.
+func localNeeds(steps []Step, incoming, installed map[string]system.Package) map[string][]need {
+	pending := map[string]bool{}
+	for _, s := range steps {
+		pending[s.Names[0]] = true
+	}
+	needs := map[string][]need{}
+	for _, s := range steps {
+		n := s.Names[0]
+		add := func(deps []string, build bool) {
+			for _, dep := range deps {
+				name, versioned := dep, false
+				if i := strings.IndexAny(dep, "<>="); i >= 0 {
+					name, versioned = dep[:i], true
+				}
+				var of []string
+				_, there := installed[name]
+				switch {
+				case name == n:
+				case pending[name]:
+					of = []string{name}
+				case !versioned && (there || len(providers(installed, name)) > 0):
+				default:
+					of = slices.DeleteFunc(providers(incoming, name), func(p string) bool { return !pending[p] || p == n })
+				}
+				if len(of) > 0 {
+					needs[n] = append(needs[n], need{build: build, of: of})
+				}
+			}
+		}
+		add(incoming[n].BuildDepends, true)
+		add(incoming[n].Depends, false)
+	}
+	return needs
+}
+
+// providers returns the packages of pkgs that provide name, sorted.
+func providers(pkgs map[string]system.Package, name string) []string {
+	var out []string
+	for _, n := range slices.Sorted(maps.Keys(pkgs)) {
+		if slices.ContainsFunc(pkgs[n].Provides, func(p string) bool {
+			prov, _, _ := strings.Cut(p, "=")
+			return prov == name
+		}) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// cycle returns one cycle among pending own builds none of which can go in
+// a batch: each has a need, which only other pending ones meet, so
+// following the first one from any of them comes back to one already
+// visited.
+func cycle(pending []Step, needs map[string][]need) []string {
+	var path []string
+	for n := pending[0].Names[0]; ; n = needs[n][0].of[0] {
+		if i := slices.Index(path, n); i >= 0 {
+			return append(path[i:], n)
+		}
+		path = append(path, n)
+	}
 }
 
 // conflicts reports whether p, by its conflicts, rules out the package

@@ -1610,21 +1610,28 @@ func TestDoctorReleasesTheHoldFirst(t *testing.T) {
 	}
 }
 
+// An own build that another pending own build needs to build is installed
+// first, in its own batch; unrelated builds share the first batch.
 func TestOwnBuildDependencies(t *testing.T) {
 	for _, kind := range []string{"depends", "makedepends", "checkdepends"} {
 		t.Run(kind, func(t *testing.T) {
 			e := newEnv(t)
 			t.Setenv("XDG_CACHE_HOME", "")
 			e.module("builds", "[packages]\nlocal = [\"consumer\", \"base\", \"other\"]\n", map[string]string{
-				"pkg/consumer/PKGBUILD": "pkgname=consumer\npkgver=1\npkgrel=1\n",
+				"pkg/consumer/PKGBUILD": "pkgname=consumer\npkgver=1\npkgrel=1\ncheck() { :; }\n",
 				"pkg/base/PKGBUILD":     "pkgname=base\npkgver=1\npkgrel=1\n",
 				"pkg/other/PKGBUILD":    "pkgname=other\npkgver=1\npkgrel=1\n",
 			})
 			e.sys.SetMeta("consumer " + kind + " base>=1")
 			must(t, e.run("plan", "builds"))
-			text := e.out.String()
-			if strings.Index(text, "install own build for builds: base") > strings.Index(text, "build consumer from") {
-				t.Fatal(text)
+			if want := `user  build base from builds/pkg/base
+user  build other from builds/pkg/other
+root  install own build for builds: base
+root  install own build for builds: other
+user  build consumer from builds/pkg/consumer
+root  install own build for builds: consumer
+`; !strings.Contains(e.out.String(), want) {
+				t.Fatalf("plan lacks\n%s\ngot\n%s", want, e.out.String())
 			}
 			must(t, e.run("on", "-y", "builds"))
 			log := strings.Join(e.sys.Log(), "\n")
@@ -1650,7 +1657,7 @@ func TestOwnBuildCycle(t *testing.T) {
 	})
 	e.sys.SetMeta("a depends b", "b makedepends a")
 	err := e.run("on", "-y", "cycle")
-	if err == nil || !strings.Contains(err.Error(), "dependency cycle") || !strings.Contains(err.Error(), "a, b") {
+	if err == nil || !strings.Contains(err.Error(), "own builds need each other in a cycle: a → b → a") {
 		t.Fatalf("cycle: %v", err)
 	}
 	if e.count("makepkg") != 0 || e.sudos != 0 {
@@ -1678,4 +1685,101 @@ func TestOwnBuildBatchHashRefusesChangedRecipe(t *testing.T) {
 	if e.count("pacman -U") != 0 {
 		t.Fatal("installed changed recipe")
 	}
+}
+
+// A build waits for a pending own build that provides what it needs, and
+// check dependencies only count when the PKGBUILD has a check function.
+func TestOwnBuildDependencyThroughProvides(t *testing.T) {
+	e := newEnv(t)
+	t.Setenv("XDG_CACHE_HOME", "")
+	e.module("builds", "[packages]\nlocal = [\"consumer\", \"libfoo-git\"]\n", map[string]string{
+		"pkg/consumer/PKGBUILD":   "pkgname=consumer\npkgver=1\npkgrel=1\n",
+		"pkg/libfoo-git/PKGBUILD": "pkgname=libfoo-git\npkgver=1\npkgrel=1\n",
+	})
+	e.sys.SetMeta("consumer makedepends libfoo>=1", "libfoo-git provides libfoo=1", "libfoo-git checkdepends consumer")
+	must(t, e.run("on", "-y", "builds"))
+	if e.count("pacman -U") != 2 {
+		t.Fatal(strings.Join(e.sys.Log(), "\n"))
+	}
+	contains(t, e.sys.Packages(), "consumer", "libfoo-git")
+}
+
+// A later batch removes a package that an earlier batch's build made
+// needed: the root stage still matches the plan, although pacman now lists
+// the earlier build as needing it.
+func TestOwnBuildBatchReplacesWhatAnEarlierOneNeeds(t *testing.T) {
+	e := newEnv(t)
+	t.Setenv("XDG_CACHE_HOME", "")
+	e.module("builds", "[packages]\nlocal = [\"replacement\", \"a\"]\n", map[string]string{
+		"pkg/a/PKGBUILD":           "pkgname=a\npkgver=1\npkgrel=1\n",
+		"pkg/replacement/PKGBUILD": "pkgname=replacement\npkgver=1\npkgrel=1\n",
+	})
+	e.sys.SetPackages("old")
+	e.sys.SetRequires("a old")
+	e.sys.SetMeta("replacement makedepends a", "replacement provides old", "replacement conflicts old")
+	must(t, e.run("on", "-y", "builds"))
+	if got := e.sys.Packages(); !slices.Equal(got, []string{"a", "replacement"}) {
+		t.Fatalf("packages = %v\n%s", got, strings.Join(e.sys.Log(), "\n"))
+	}
+}
+
+// When a later batch fails to build, the earlier ones stay installed and
+// recorded; running the command again builds only what is left.
+func TestOwnBuildLaterBatchFails(t *testing.T) {
+	e := newEnv(t)
+	t.Setenv("XDG_CACHE_HOME", "")
+	e.module("builds", "[packages]\nlocal = [\"consumer\", \"base\"]\n", map[string]string{
+		"pkg/consumer/PKGBUILD": "pkgname=consumer\npkgver=1\npkgrel=1\n",
+		"pkg/base/PKGBUILD":     "pkgname=base\npkgver=1\npkgrel=1\n",
+	})
+	e.sys.SetMeta("consumer makedepends base", "consumer makedepends missing")
+	if err := e.run("on", "-y", "builds"); err == nil || !strings.Contains(err.Error(), "building consumer") {
+		t.Fatalf("got %v", err)
+	}
+	if got := e.sys.Packages(); !slices.Equal(got, []string{"base"}) || e.hostModules() != nil {
+		t.Fatalf("packages = %v, host modules = %v", got, e.hostModules())
+	}
+	if st := e.state(true); !slices.Equal(st.Owned[state.Local]["builds"], []string{"base"}) || st.Built["base"] == "" {
+		t.Fatalf("base not recorded: %+v", st)
+	}
+
+	e.sys.SetMeta("consumer makedepends base")
+	must(t, e.run("on", "-y", "builds"))
+	if e.count("makepkg --syncdeps --rmdeps --force --clean --noconfirm in base") != 1 || e.count("pacman -U") != 2 {
+		t.Fatal(strings.Join(e.sys.Log(), "\n"))
+	}
+	contains(t, e.sys.Packages(), "base", "consumer")
+}
+
+// An own build is installed with, or after, the pending own build its
+// package depends on, even when that one has to wait for another batch.
+func TestOwnBuildInstalledWithWhatItNeeds(t *testing.T) {
+	e := newEnv(t)
+	t.Setenv("XDG_CACHE_HOME", "")
+	e.module("builds", "[packages]\nlocal = [\"app\", \"lib\", \"tool\"]\n", map[string]string{
+		"pkg/app/PKGBUILD":  "pkgname=app\npkgver=1\npkgrel=1\n",
+		"pkg/lib/PKGBUILD":  "pkgname=lib\npkgver=1\npkgrel=1\n",
+		"pkg/tool/PKGBUILD": "pkgname=tool\npkgver=1\npkgrel=1\n",
+	})
+	e.sys.SetMeta("app pkgdepends lib", "lib makedepends tool")
+	must(t, e.run("on", "-y", "builds"))
+	contains(t, e.sys.Packages(), "app", "lib", "tool")
+	if e.count("pacman -U") != 2 {
+		t.Fatal(strings.Join(e.sys.Log(), "\n"))
+	}
+}
+
+// A forced rebuild of packages already built still builds them in order.
+func TestOwnBuildRebuildKeepsOrder(t *testing.T) {
+	e := newEnv(t)
+	t.Setenv("XDG_CACHE_HOME", "")
+	e.module("builds", "[packages]\nlocal = [\"consumer\", \"base\"]\n", map[string]string{
+		"pkg/consumer/PKGBUILD": "pkgname=consumer\npkgver=1\npkgrel=1\n",
+		"pkg/base/PKGBUILD":     "pkgname=base\npkgver=1\npkgrel=1\n",
+	})
+	e.sys.SetMeta("consumer makedepends base")
+	must(t, e.run("on", "-y", "builds"))
+	e.sys.SetPackages("consumer")
+	must(t, e.run("rebuild", "-y", "consumer", "base"))
+	contains(t, e.sys.Packages(), "base", "consumer")
 }

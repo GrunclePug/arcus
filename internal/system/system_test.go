@@ -4,6 +4,7 @@ import (
 	"io"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -138,24 +139,99 @@ Required By     : None
 	}
 }
 
-// A split package's own section replaces what pkgbase declares.
+// A split package's own section replaces what pkgbase declares, and
+// depends has its variant for the build architecture.
 func TestParseSrcInfo(t *testing.T) {
 	info := `pkgbase = waylock-arcus
 	pkgver = 1.6.0
+	makedepends = zig>=0.13
 	provides = waylock
 	conflicts = waylock
 	depends = pam
+	depends_x86_64 = x86-only
+	depends_aarch64 = arm-only
 
 pkgname = waylock-arcus
 
 pkgname = waylock-arcus-debug
 	conflicts = waylock-debug
+	depends = waylock-arcus
 `
-	if got, want := parseSrcInfo(info, "waylock-arcus"), (Package{Depends: []string{"pam"}, Provides: []string{"waylock"}, Conflicts: []string{"waylock"}}); !reflect.DeepEqual(got, want) {
+	if got, want := parseSrcInfo(info, "waylock-arcus", "x86_64"), (Package{Provides: []string{"waylock"}, Conflicts: []string{"waylock"}, Depends: []string{"pam", "x86-only"}}); !reflect.DeepEqual(got, want) {
 		t.Errorf("waylock-arcus = %v, want %v", got, want)
 	}
-	if got, want := parseSrcInfo(info, "waylock-arcus-debug"), (Package{Depends: []string{"pam"}, Provides: []string{"waylock"}, Conflicts: []string{"waylock-debug"}}); !reflect.DeepEqual(got, want) {
+	if got, want := parseSrcInfo(info, "waylock-arcus-debug", "aarch64"), (Package{Provides: []string{"waylock"}, Conflicts: []string{"waylock-debug"}, Depends: []string{"waylock-arcus", "arm-only"}}); !reflect.DeepEqual(got, want) {
 		t.Errorf("waylock-arcus-debug = %v, want %v", got, want)
+	}
+}
+
+// SrcInfo reads what building needs as makepkg does, with the real
+// libmakepkg when it is installed: global depends and makedepends, and
+// checkdepends while a check function runs, each with its CARCH variant,
+// also from files the PKGBUILD sources from its startdir.
+func TestSrcInfoBuildDepends(t *testing.T) {
+	if _, err := os.Stat("/usr/share/makepkg/util/config.sh"); err != nil {
+		t.Skip("libmakepkg is not installed")
+	}
+	if _, err := exec.LookPath("makepkg"); err != nil {
+		t.Skip("makepkg is not installed")
+	}
+	t.Setenv("MAKEPKG_LIBRARY", "")
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+	pkgbuild := `pkgname=(demo demo-extra)
+pkgbase=demo
+pkgver=1
+pkgrel=1
+arch=(x86_64 aarch64)
+depends=(glibc 'zlib>=1')
+depends_x86_64=(x86-lib)
+depends_aarch64=(arm-lib)
+makedepends=(cmake)
+makedepends_aarch64=(arm-tool)
+checkdepends=(bats)
+source "$startdir/more.sh"
+function check { :; }
+package_demo() { depends=(only-demo); }
+package_demo-extra() { :; }
+`
+	if err := os.WriteFile(filepath.Join(dir, "PKGBUILD"), []byte(pkgbuild), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "more.sh"), []byte("makedepends+=(own-tool)\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		carch, conf string
+		want        []string
+	}{
+		{"x86_64", "", []string{"glibc", "zlib>=1", "x86-lib", "cmake", "own-tool", "bats"}},
+		{"aarch64", "", []string{"glibc", "zlib>=1", "arm-lib", "cmake", "own-tool", "arm-tool", "bats"}},
+		{"x86_64", "BUILDENV=(!check)\n", []string{"glibc", "zlib>=1", "x86-lib", "cmake", "own-tool"}},
+	} {
+		t.Setenv("CARCH", c.carch)
+		conf := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "pacman", "makepkg.conf")
+		if err := os.MkdirAll(filepath.Dir(conf), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(conf, []byte(c.conf), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		p, err := SrcInfo(dir, "demo")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(p.BuildDepends, c.want) {
+			t.Errorf("%s %q: BuildDepends = %v, want %v", c.carch, c.conf, p.BuildDepends, c.want)
+		}
+		arch := "x86-lib"
+		if c.carch == "aarch64" {
+			arch = "arm-lib"
+		}
+		if want := []string{"only-demo", arch}; !reflect.DeepEqual(p.Depends, want) {
+			t.Errorf("%s: Depends = %v, want %v", c.carch, p.Depends, want)
+		}
 	}
 }
 

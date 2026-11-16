@@ -1,7 +1,8 @@
 // Package fake puts stand-ins for pacman, yay, paru, aurlock, makepkg,
-// systemctl, id and gpasswd on PATH for tests. They keep their "system" in
-// text files in a temporary directory and log every call, so nothing real
-// is touched.
+// systemctl, id and gpasswd on PATH, and for libmakepkg in
+// MAKEPKG_LIBRARY, for tests. They keep their
+// "system" in text files in a temporary directory and log every call, so
+// nothing real is touched.
 package fake
 
 import (
@@ -21,9 +22,14 @@ type System struct {
 // The fakes share one package database, so the AUR helper sees what pacman
 // installed: $dir/pkgs lists the installed packages, $dir/deps those
 // installed as a dependency, and $dir/requires "<package> <dependency>"
-// lines, and $dir/meta "<package> provides|conflicts <name>" lines, which
-// -Qi, -Si, -Qip and makepkg --printsrcinfo report. Like pacman, -Rns refuses to remove a package that another one
-// still needs and also removes the dependencies nothing needs any more.
+// lines, and $dir/meta "<package> <field> <name>" lines, which -Qi, -Si,
+// -Qip and makepkg report: provides and conflicts, and for own builds
+// depends, makedepends and checkdepends (of the PKGBUILD, which makepkg
+// needs to build) and pkgdepends (the package's own depends, which only
+// installing it needs). Like pacman, -U refuses to install a package whose
+// depends or pkgdepends are neither installed nor installed with it, and
+// -Rns refuses to remove a package that another one still needs and also
+// removes the dependencies nothing needs any more.
 // Every call is appended to $dir/log. If $dir/slow exists, a package
 // transaction writes $dir/started, sleeps that many seconds and writes
 // $dir/done when it finishes.
@@ -45,7 +51,16 @@ meta() {
   awk -v p="$1" -v f="$2" '$1 == p && $2 == f { printf "%s  ", $3 }' "$dir/meta"
 }
 info() {
-  printf 'Name            : %s\nProvides        : %s\nConflicts With  : %s\n' "$1" "$(meta "$1" provides)" "$(meta "$1" conflicts)"
+  printf 'Name            : %s\nProvides        : %s\nConflicts With  : %s\nDepends On      : %s\n' \
+    "$1" "$(meta "$1" provides)" "$(meta "$1" conflicts)" "$(meta "$1" depends)$(meta "$1" pkgdepends)"
+}
+# satisfied <dependency> <packages>: one of the packages is or provides it.
+satisfied() {
+  for q in $2; do
+    [ "$q" = "$1" ] && return 0
+    meta "$q" provides | tr ' ' '\n' | sed 's/=.*//' | grep -qx "$1" && return 0
+  done
+  return 1
 }
 required() {
   while read -r p d; do grep -qx "$p" "$dir/pkgs" && echo "$d"; done < "$dir/requires"
@@ -70,6 +85,14 @@ case $op in
 esac
 if [ -f "$dir/fail" ] && grep -qx "$(basename "$0")" "$dir/fail"; then exit 1; fi
 if [ -f "$dir/slow" ]; then touch "$dir/started"; sleep "$(cat "$dir/slow")"; fi
+if [ "$op" = -U ]; then
+  for p in $names; do
+    for dep in $(meta "$p" depends) $(meta "$p" pkgdepends); do
+      dep=$(echo "$dep" | sed 's/[<>=].*//')
+      satisfied "$dep" "$(cat "$dir/pkgs") $names" || { echo "error: $p needs $dep" >&2; exit 1; }
+    done
+  done
+fi
 case $op in
   -S|-U)
     for p in $names; do
@@ -107,25 +130,64 @@ if [ -f "$dir/slow" ]; then touch "$dir/done"; fi
 // makepkg builds the PKGBUILD in the current directory into
 // $PKGDEST/<pkgname>-<pkgver>-<pkgrel>-x86_64.pkg.tar.zst, whose content is
 // the recipe's files, so a different recipe gives a different package.
-// --printsrcinfo reports what $dir/meta lists for the package.
+// --printsrcinfo reports what $dir/meta lists for the package: pkgdepends
+// as the depends of its own section, the rest in the pkgbase section. Like
+// makepkg --syncdeps, it fails unless the depends, makedepends and (with a
+// check function) checkdepends that $dir/meta lists are installed or
+// provided by an installed package.
 const makepkgScript = `#!/bin/sh
 dir=%DIR%
 if [ "$1" = --printsrcinfo ]; then
   . ./PKGBUILD
   echo "pkgbase = $pkgname"
   touch "$dir/meta"
-  awk -v p="$pkgname" '$1 == p { printf "\t%s = %s\n", $2, $3 }' "$dir/meta"
+  awk -v p="$pkgname" '$1 == p && $2 != "pkgdepends" { printf "\t%s = %s\n", $2, $3 }' "$dir/meta"
   echo "pkgname = $pkgname"
+  awk -v p="$pkgname" '$1 == p && $2 == "pkgdepends" { printf "\tdepends = %s\n", $3 }' "$dir/meta"
   exit 0
 fi
 echo "makepkg $* in $(basename "$PWD")" >> "$dir/log"
 if [ -f "$dir/fail" ] && grep -qx makepkg "$dir/fail"; then exit 1; fi
 . ./PKGBUILD
-for dep in $(awk -v p="$pkgname" '$1 == p && ($2 == "depends" || $2 == "makedepends" || $2 == "checkdepends") { print $3 }' "$dir/meta" | sed 's/[<>=].*//'); do
-  if ! grep -qx "$dep" "$dir/pkgs"; then echo "missing build dependency: $dep" >&2; exit 1; fi
+check=; [ -e "$dir/nocheck" ] || ! grep -q '^check()' PKGBUILD || check=checkdepends
+for dep in $(awk -v p="$pkgname" -v c="$check" '$1 == p && ($2 == "depends" || $2 == "makedepends" || $2 == c) { print $3 }' "$dir/meta" | sed 's/[<>=].*//'); do
+  for q in $(cat "$dir/pkgs"); do
+    [ "$q" = "$dep" ] && continue 2
+    awk -v p="$q" '$1 == p && $2 == "provides" { print $3 }' "$dir/meta" | sed 's/=.*//' | grep -qx "$dep" && continue 2
+  done
+  echo "missing build dependency: $dep" >&2; exit 1
 done
 mkdir -p "$PKGDEST"
 cat $(find . -type f | sort) > "$PKGDEST/$pkgname-$pkgver-$pkgrel-x86_64.pkg.tar.zst"
+`
+
+// libmakepkg's configuration loads CARCH=x86_64, with checks on unless
+// $dir/nocheck exists, and sourcing a PKGBUILD adds the depends,
+// makedepends and checkdepends (and their _<arch> variants) that $dir/meta
+// lists for it.
+const configScript = `dir=%DIR%
+load_makepkg_config() {
+  CARCH=x86_64
+  BUILDENV=(check)
+  if [[ -e $dir/nocheck ]]; then BUILDENV=('!check'); fi
+}
+source_safe() {
+  source "$1"
+  touch "$dir/meta"
+  local p k v
+  while read -r p k v; do
+    if [[ $p == "$pkgname" && $k =~ ^(depends|makedepends|checkdepends)(_[a-z0-9_]+)?$ ]]; then
+      eval "$k+=(\"\$v\")"
+    fi
+  done < "$dir/meta"
+}
+`
+
+const optionScript = `check_buildenv() {
+  local v=y
+  [[ " ${BUILDENV[*]} " == *" !$1 "* ]] && v=n
+  [[ $v == "$2" ]]
+}
 `
 
 const systemctlScript = `#!/bin/sh
@@ -164,8 +226,8 @@ case $1 in
 esac
 `
 
-// New installs the fakes in a temporary directory and puts it first on PATH
-// for the rest of the test.
+// New installs the fakes in a temporary directory and puts it first on PATH,
+// and its libmakepkg in MAKEPKG_LIBRARY, for the rest of the test.
 func New(t *testing.T) *System {
 	t.Helper()
 	s := &System{t: t, Dir: t.TempDir()}
@@ -184,6 +246,17 @@ func New(t *testing.T) *System {
 		}
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	lib := filepath.Join(s.Dir, "makepkg")
+	if err := os.MkdirAll(filepath.Join(lib, "util"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, script := range map[string]string{"config.sh": configScript, "option.sh": optionScript} {
+		script = strings.ReplaceAll(script, "%DIR%", "'"+s.Dir+"'")
+		if err := os.WriteFile(filepath.Join(lib, "util", name), []byte(script), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("MAKEPKG_LIBRARY", lib)
 	return s
 }
 
@@ -228,9 +301,12 @@ func (s *System) Deps() []string { return sorted(s.lines("deps")) }
 // SetDeps marks installed packages as installed as a dependency.
 func (s *System) SetDeps(pkgs ...string) { s.set("deps", pkgs) }
 
-// SetMeta replaces what packages provide and conflict with:
-// "<package> provides|conflicts <name>" lines.
+// SetMeta replaces what packages provide, conflict with and depend on:
+// "<package> <field> <name>" lines (see pkgScript).
 func (s *System) SetMeta(lines ...string) { s.set("meta", lines) }
+
+// SetNoCheck turns makepkg's check function off, as BUILDENV=(!check) does.
+func (s *System) SetNoCheck() { s.set("nocheck", nil) }
 
 // SetRequires replaces the dependencies: "<package> <dependency>" pairs.
 func (s *System) SetRequires(pairs ...string) { s.set("requires", pairs) }

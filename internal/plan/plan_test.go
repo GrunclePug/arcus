@@ -2,6 +2,7 @@ package plan
 
 import (
 	"context"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -232,6 +233,166 @@ func TestMergeByStageAndHash(t *testing.T) {
 	if Hash(a) == Hash(b) {
 		t.Error("hash must change with the steps")
 	}
+
+	x := []Step{{Stage: LocalPackages, Op: RemoveConflicting, Names: []string{"old"}, Changes: []string{"x old: conflicts with new"}}}
+	y := slices.Clone(x)
+	y[0].Changes = []string{"x old: conflicts with new; needed by a"}
+	if Hash(x) != Hash(y) {
+		t.Error("what needs a conflicting package must not change the hash")
+	}
+	y[0].Changes = []string{"x old: conflicts with newer"}
+	if Hash(x) == Hash(y) {
+		t.Error("hash must change with what a conflicting package conflicts with")
+	}
+}
+
+func localSteps(names ...string) []Step {
+	var steps []Step
+	for _, n := range names {
+		steps = append(steps, Step{Stage: LocalPackages, Op: InstallLocal, Module: "m", Names: []string{n}})
+	}
+	return steps
+}
+
+// localBatches plans every batch with nextBatch, installing each one.
+func localBatches(pending []Step, incoming, installed map[string]system.Package) ([][]string, error) {
+	installed = maps.Clone(installed)
+	var out [][]string
+	for len(pending) > 0 {
+		batch, err := nextBatch(pending, incoming, installed)
+		if err != nil {
+			return nil, err
+		}
+		var names []string
+		for _, s := range batch {
+			names = append(names, s.Names[0])
+			installed[s.Names[0]] = incoming[s.Names[0]]
+		}
+		pending = slices.DeleteFunc(pending, func(s Step) bool { return slices.Contains(names, s.Names[0]) })
+		out = append(out, names)
+	}
+	return out, nil
+}
+
+// Own builds wait for the pending own builds they need to build, by name
+// or through what those provide, in as few batches as that allows.
+func TestLocalBatches(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		order    []string
+		incoming map[string]system.Package
+		want     [][]string
+		err      string
+	}{
+		{"unrelated", []string{"a", "b"}, map[string]system.Package{"a": {BuildDepends: []string{"glibc"}}}, [][]string{{"a", "b"}}, ""},
+		{"chain", []string{"c", "b", "a"}, map[string]system.Package{
+			"c": {BuildDepends: []string{"b>=1"}}, "b": {BuildDepends: []string{"a"}},
+		}, [][]string{{"a"}, {"b"}, {"c"}}, ""},
+		{"diamond", []string{"top", "left", "right", "root", "other"}, map[string]system.Package{
+			"top": {BuildDepends: []string{"left", "right"}}, "left": {BuildDepends: []string{"root"}}, "right": {BuildDepends: []string{"root"}},
+		}, [][]string{{"root", "other"}, {"left", "right"}, {"top"}}, ""},
+		{"provides", []string{"consumer", "libfoo-git"}, map[string]system.Package{
+			"consumer": {BuildDepends: []string{"libfoo>=1"}}, "libfoo-git": {Provides: []string{"libfoo=1.2"}},
+		}, [][]string{{"libfoo-git"}, {"consumer"}}, ""},
+		{"own provide", []string{"a"}, map[string]system.Package{"a": {Provides: []string{"a-virtual"}, BuildDepends: []string{"a-virtual"}}}, [][]string{{"a"}}, ""},
+		{"already built", []string{"a", "b"}, map[string]system.Package{"a": {}, "b": {BuildDepends: nil}}, [][]string{{"a", "b"}}, ""},
+		{"provided already", []string{"consumer", "libfoo-git"}, map[string]system.Package{
+			"consumer": {BuildDepends: []string{"libbar"}}, "libfoo-git": {Provides: []string{"libbar"}},
+		}, [][]string{{"consumer", "libfoo-git"}}, ""},
+		{"installed older", []string{"consumer", "base"}, map[string]system.Package{"consumer": {BuildDepends: []string{"base"}}}, [][]string{{"base"}, {"consumer"}}, ""},
+		{"cycle", []string{"x", "a", "b", "c"}, map[string]system.Package{
+			"x": {BuildDepends: []string{"a"}}, "a": {BuildDepends: []string{"b"}, Provides: []string{"virt"}},
+			"b": {BuildDepends: []string{"c"}}, "c": {BuildDepends: []string{"virt"}},
+		}, nil, "own builds need each other in a cycle: a → b → c → a"},
+		{"any provider", []string{"consumer", "provider1", "provider2"}, map[string]system.Package{
+			"consumer":  {BuildDepends: []string{"virt"}},
+			"provider1": {Provides: []string{"virt"}, BuildDepends: []string{"consumer"}},
+			"provider2": {Provides: []string{"virt"}},
+		}, [][]string{{"provider2"}, {"consumer"}, {"provider1"}}, ""},
+		{"installed too old", []string{"consumer", "upgrade"}, map[string]system.Package{
+			"consumer": {BuildDepends: []string{"libbar>=3"}}, "upgrade": {Provides: []string{"libbar=3"}},
+		}, [][]string{{"upgrade"}, {"consumer"}}, ""},
+		{"install with what it needs", []string{"app", "lib", "tool"}, map[string]system.Package{
+			"app": {Depends: []string{"lib"}}, "lib": {BuildDepends: []string{"tool"}},
+		}, [][]string{{"tool"}, {"app", "lib"}}, ""},
+		{"install needs each other", []string{"a", "b"}, map[string]system.Package{
+			"a": {Depends: []string{"b"}}, "b": {Depends: []string{"a"}},
+		}, [][]string{{"a", "b"}}, ""},
+		{"install waits for a build", []string{"app", "lib", "tool"}, map[string]system.Package{
+			"app": {Depends: []string{"lib"}}, "lib": {BuildDepends: []string{"tool"}}, "tool": {BuildDepends: []string{"app"}},
+		}, nil, "own builds need each other in a cycle: app → lib → tool → app"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			installed := map[string]system.Package{"base": {}, "libbar-bin": {Provides: []string{"libbar=2"}}}
+			got, err := localBatches(localSteps(c.order...), c.incoming, installed)
+			if c.err != "" {
+				if err == nil || err.Error() != c.err {
+					t.Fatalf("err = %v, want %s", err, c.err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("batches = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// Each batch is built, then installed after the removal of what it
+// conflicts with, as the earlier stages and batches leave the system: a
+// package that the AUR removal or package stage removes or installs, or
+// that an earlier batch installs, counts as such.
+func TestLocal(t *testing.T) {
+	m := &module.Module{Name: "m"}
+	m.Packages.Local = []string{"a", "replacement"}
+	in := Input{Desired: []string{"m"}, Modules: module.Set{"m": m}}
+	h := Half{
+		Packages: map[string]system.Package{"old": {}, "gone": {Conflicts: []string{"a"}}, "old-aur": {Provides: []string{"virt"}}},
+		Incoming: map[string]system.Package{
+			"term":        {Conflicts: []string{"a"}},
+			"a":           {BuildDepends: []string{"old", "virt"}},
+			"virt-git":    {Provides: []string{"virt"}},
+			"replacement": {BuildDepends: []string{"a"}, Provides: []string{"old"}, Conflicts: []string{"old", "term"}},
+		},
+	}
+	user := Step{Stage: AURInstall, Op: Install, Module: "m", Names: []string{"aur"}}
+	aur := Step{Stage: AURRemove, Op: Remove, Names: []string{"old-aur"}}
+	remove := Step{Stage: Packages, Op: Remove, Names: []string{"gone"}}
+	install := Step{Stage: Packages, Op: Install, Module: "m", Names: []string{"term"}}
+	stale := Step{Stage: LocalPackages, Op: RemoveConflicting, Names: []string{"stale"}}
+	m.Packages.Local = append(m.Packages.Local, "virt-git")
+	local := localSteps("replacement", "a", "virt-git")
+	steps := slices.Concat([]Step{aur, remove, install, stale}, local, []Step{user})
+	got, err := Local(in, h, steps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	build := func(s Step) Step { s.Stage, s.Op = Build, BuildLocal; return s }
+	want := []Step{
+		aur, remove, install,
+		build(local[2]),
+		local[2],
+		build(local[1]),
+		{Stage: LocalPackages, Op: RemoveConflicting, Names: []string{"term"}, Changes: []string{"x term: conflicts with a"}},
+		local[1],
+		build(local[0]),
+		{Stage: LocalPackages, Op: RemoveConflicting, Names: []string{"old"}, Changes: []string{"x old: conflicts with replacement"}},
+		local[0],
+		user,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got  %+v\nwant %+v", got, want)
+	}
+	if _, ok := h.Packages["a"]; ok {
+		t.Error("Local changed the caller's packages")
+	}
+
+	if got, _ := Local(in, h, []Step{user}); !reflect.DeepEqual(got, []Step{user}) {
+		t.Fatalf("no own builds: %+v", got)
+	}
 }
 
 func TestOwnBuilds(t *testing.T) {
@@ -260,7 +421,10 @@ func TestOwnBuilds(t *testing.T) {
 	if !reflect.DeepEqual(steps, []Step{install}) {
 		t.Fatalf("missing build: %+v", steps)
 	}
-	merged := Merge(steps, nil)
+	merged, err := Local(in, Half{Incoming: map[string]system.Package{"waylock-arcus": {}}}, Merge(steps, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
 	build := Step{Stage: Build, Op: BuildLocal, Module: "wl-base", Names: []string{"waylock-arcus"}, Recipe: hash}
 	if !reflect.DeepEqual(merged, []Step{build, install}) {
 		t.Fatalf("merged: %+v", merged)
@@ -357,5 +521,34 @@ func TestConflicts(t *testing.T) {
 	m.Packages.Pacman = append(m.Packages.Pacman, "alacritty")
 	if _, err := Conflicts(in, h, []Step{install}); err == nil || err.Error() != "foot conflicts with alacritty, which module stream lists" {
 		t.Fatalf("got %v", err)
+	}
+}
+
+// A provider that an earlier batch removes for a conflict no longer
+// satisfies what a later build needs.
+func TestLocalRemovedProvider(t *testing.T) {
+	m := &module.Module{Name: "m"}
+	m.Packages.Local = []string{"consumer", "provider", "remover"}
+	in := Input{Desired: []string{"m"}, Modules: module.Set{"m": m}}
+	h := Half{
+		Packages: map[string]system.Package{"old": {Provides: []string{"virt"}}},
+		Incoming: map[string]system.Package{
+			"consumer": {BuildDepends: []string{"remover", "virt"}},
+			"provider": {BuildDepends: []string{"remover"}, Provides: []string{"virt"}},
+			"remover":  {Conflicts: []string{"old"}},
+		},
+	}
+	got, err := Local(in, h, localSteps("consumer", "provider", "remover"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var installs []string
+	for _, s := range got {
+		if s.Op == InstallLocal {
+			installs = append(installs, s.Names[0])
+		}
+	}
+	if want := []string{"remover", "provider", "consumer"}; !reflect.DeepEqual(installs, want) {
+		t.Fatalf("installs = %v, want %v", installs, want)
 	}
 }

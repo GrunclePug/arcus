@@ -441,8 +441,10 @@ func (a *app) adoptInfo(in plan.Input, s *plan.Half) error {
 }
 
 // systemPlan plans the system half, including the removal of installed
-// packages that the packages it installs conflict with.
-func (a *app) systemPlan(in plan.Input, h *half, batch ...[]string) (plan.Half, []plan.Step, error) {
+// packages that the packages it installs conflict with. When batch isn't
+// nil, it installs only the own builds it names: the root stage of one
+// batch (see plan.Local).
+func (a *app) systemPlan(in plan.Input, h *half, batch []string) (plan.Half, []plan.Step, error) {
 	sit, err := a.situation(in, h)
 	if err != nil {
 		return sit, nil, err
@@ -451,9 +453,9 @@ func (a *app) systemPlan(in plan.Input, h *half, batch ...[]string) (plan.Half, 
 	if err != nil {
 		return sit, nil, err
 	}
-	if len(batch) > 0 {
+	if batch != nil {
 		steps = slices.DeleteFunc(steps, func(s plan.Step) bool {
-			return s.Op == plan.InstallLocal && !slices.Contains(batch[0], s.Names[0])
+			return s.Op == plan.InstallLocal && !slices.Contains(batch, s.Names[0])
 		})
 	}
 	var repo []string
@@ -492,13 +494,16 @@ func (a *app) systemPlan(in plan.Input, h *half, batch ...[]string) (plan.Half, 
 	return sit, steps, err
 }
 
-// localInfo returns what an own build will provide and conflict with: from
-// its package when it is already built from this recipe, otherwise from
-// its PKGBUILD. The root process doesn't run a PKGBUILD, so before the
-// build it reports nothing; only the stage after the build installs it.
+// localInfo returns what an own build will provide, conflict with and
+// need: from its package when it is already built from this recipe and
+// won't be rebuilt, otherwise from its PKGBUILD, with what building it
+// needs. The root process doesn't run a PKGBUILD, so before the build it
+// reports nothing; only the stage after the build installs it, from the
+// package.
 func (a *app) localInfo(s plan.Step) (system.Package, bool, error) {
 	pkg := s.Names[0]
-	if file, err := a.packageFile(pkg, s.Recipe); err == nil {
+	rebuilt := a.euid != 0 && slices.Contains(a.rebuild, pkg)
+	if file, err := a.packageFile(pkg, s.Recipe); err == nil && !rebuilt {
 		info, err := system.Info("-Qip", file)
 		if err != nil {
 			return system.Package{}, false, err
@@ -527,7 +532,7 @@ func (a *app) plan(in plan.Input) ([]plan.Step, error) {
 	}
 	defer lock.Release()
 
-	sit, sys, err := a.systemPlan(in, sh)
+	sit, sys, err := a.systemPlan(in, sh, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -539,69 +544,7 @@ func (a *app) plan(in plan.Input) ([]plan.Step, error) {
 	if err != nil {
 		return nil, err
 	}
-	steps := plan.Merge(sys, usr)
-	var local []plan.Step
-	for _, s := range steps {
-		if s.Op == plan.InstallLocal {
-			local = append(local, s)
-		}
-	}
-	batches, err := a.localBatches(local)
-	if err != nil {
-		return nil, err
-	}
-	// Account for the package stage that runs before any local build.
-	for _, s := range sys {
-		if s.Stage != plan.Packages {
-			continue
-		}
-		if s.Op == plan.RemoveConflicting || s.Op == plan.Remove || s.Op == plan.RemoveLocal {
-			for _, n := range s.Names {
-				delete(sit.Packages, n)
-			}
-		}
-		if s.Op == plan.Install {
-			for _, n := range s.Names {
-				sit.Packages[n] = sit.Incoming[n]
-			}
-		}
-	}
-	var ordered []plan.Step
-	for _, batch := range batches {
-		for _, s := range batch {
-			b := s
-			b.Stage, b.Op = plan.Build, plan.BuildLocal
-			ordered = append(ordered, b)
-		}
-		installs, err := plan.Conflicts(in, sit, batch)
-		if err != nil {
-			return nil, err
-		}
-		ordered = append(ordered, installs...)
-		for _, s := range batch {
-			sit.Packages[s.Names[0]] = sit.Incoming[s.Names[0]]
-		}
-		for _, s := range installs {
-			if s.Op == plan.RemoveConflicting {
-				for _, n := range s.Names {
-					delete(sit.Packages, n)
-				}
-			}
-		}
-	}
-	var out []plan.Step
-	inserted := false
-	for _, s := range steps {
-		if s.Stage == plan.Build || s.Stage == plan.LocalPackages {
-			if !inserted {
-				out = append(out, ordered...)
-				inserted = true
-			}
-			continue
-		}
-		out = append(out, s)
-	}
-	return out, nil
+	return plan.Local(in, sit, plan.Merge(sys, usr))
 }
 
 func (a *app) printPlan(steps []plan.Step) {

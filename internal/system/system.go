@@ -239,11 +239,14 @@ func Unrequired() (map[string]bool, error) {
 }
 
 // Package is what pacman reports about a package, as far as arcus needs
-// it. Provides and Conflicts keep their version constraints ("foo=1.2",
-// "bar<2").
+// it. Provides, Conflicts, Depends and BuildDepends keep their version
+// constraints ("foo=1.2", "bar<2").
 type Package struct {
-	Depends, MakeDepends, CheckDepends []string
-	Provides, Conflicts, RequiredBy    []string
+	Provides, Conflicts, RequiredBy []string
+	Depends                         []string // what it needs installed
+	// BuildDepends, only from a PKGBUILD, is what makepkg --syncdeps
+	// needs installed to build it: see SrcInfo.
+	BuildDepends []string
 }
 
 // Info returns what pacman reports about packages, by name: installed ones
@@ -307,6 +310,8 @@ func parseInfo(info string) map[string]Package {
 				p.Provides = append(p.Provides, f)
 			case "Conflicts With":
 				p.Conflicts = append(p.Conflicts, f)
+			case "Depends On":
+				p.Depends = append(p.Depends, f)
 			case "Required By":
 				p.RequiredBy = append(p.RequiredBy, f)
 			}
@@ -317,70 +322,88 @@ func parseInfo(info string) map[string]Package {
 }
 
 // SrcInfo returns what the PKGBUILD in dir declares for pkg, from makepkg
-// --printsrcinfo. It runs the PKGBUILD, so only as the user.
+// --printsrcinfo, and what makepkg needs installed to build it. It runs the
+// PKGBUILD, so only as the user.
 func SrcInfo(dir, pkg string) (Package, error) {
+	info, err := outputIn(dir, "makepkg", "--printsrcinfo")
+	if err != nil {
+		return Package{}, err
+	}
+	build, err := outputIn(dir, "bash", "-c", buildDependsScript)
+	if err != nil {
+		return Package{}, err
+	}
+	arch, deps, _ := strings.Cut(build, "\n")
+	p := parseSrcInfo(info, pkg, arch)
+	p.BuildDepends = strings.Fields(deps)
+	return p, nil
+}
+
+// buildDependsScript prints CARCH, then the dependencies makepkg
+// --syncdeps resolves before building: depends and makedepends, and
+// checkdepends when the PKGBUILD has a check function that BUILDENV
+// doesn't turn off, each with its CARCH variant. It reads makepkg's
+// configuration and the PKGBUILD through libmakepkg, with the startdir
+// makepkg sets, as makepkg does.
+const buildDependsScript = `set -e
+lib=${MAKEPKG_LIBRARY:-/usr/share/makepkg}
+source "$lib/util/config.sh"
+source "$lib/util/option.sh"
+load_makepkg_config
+declare -r startdir="$(pwd -P)"
+source_safe "$startdir/PKGBUILD" >&2
+declare -n arch_depends=depends_$CARCH arch_makedepends=makedepends_$CARCH arch_checkdepends=checkdepends_$CARCH
+deps=("${depends[@]}" "${arch_depends[@]}" "${makedepends[@]}" "${arch_makedepends[@]}")
+if declare -F check >/dev/null && ! check_buildenv check n; then
+	deps+=("${checkdepends[@]}" "${arch_checkdepends[@]}")
+fi
+printf '%s\n' "$CARCH" "${deps[@]}"
+`
+
+// outputIn runs a command in dir and returns its output.
+func outputIn(dir, name string, args ...string) (string, error) {
 	var stdout, stderr bytes.Buffer
-	cmd := exec.Command("makepkg", "--printsrcinfo")
+	cmd := exec.Command(name, args...)
 	cmd.Dir = dir
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
-		return Package{}, fmt.Errorf("makepkg --printsrcinfo in %s: %w: %s", dir, err, strings.TrimSpace(stderr.String()))
+		return "", fmt.Errorf("%s in %s: %w: %s", name, dir, err, strings.TrimSpace(stderr.String()))
 	}
-	return parseSrcInfo(stdout.String(), pkg), nil
+	return stdout.String(), nil
 }
 
-// parseSrcInfo reads the provides and conflicts of pkg from .SRCINFO text.
-// A field set in pkg's own section replaces the one of the pkgbase section.
-func parseSrcInfo(info, pkg string) Package {
-	var base, own Package
-	ownSet := map[string]bool{}
+// parseSrcInfo reads what .SRCINFO text declares for pkg: Provides,
+// Conflicts and Depends, the latter with its variant for arch
+// (depends_x86_64). A field set in pkg's own section replaces the one of
+// the pkgbase section.
+func parseSrcInfo(info, pkg, arch string) Package {
+	base, own := map[string][]string{}, map[string][]string{}
 	section := "pkgbase"
 	for line := range strings.Lines(info) {
 		k, v, ok := strings.Cut(strings.TrimSpace(line), " = ")
 		if !ok {
 			continue
 		}
-		if k == "pkgname" {
-			section = v
-			continue
-		}
-		var p *Package
-		switch section {
-		case "pkgbase":
-			p = &base
-		case pkg:
-			p = &own
-		default:
-			continue
-		}
 		switch {
-		case k == "depends" || strings.HasPrefix(k, "depends_"):
-			p.Depends = append(p.Depends, v)
-		case k == "makedepends" || strings.HasPrefix(k, "makedepends_"):
-			p.MakeDepends = append(p.MakeDepends, v)
-		case k == "checkdepends" || strings.HasPrefix(k, "checkdepends_"):
-			p.CheckDepends = append(p.CheckDepends, v)
-		case k == "provides":
-			p.Provides = append(p.Provides, v)
-		case k == "conflicts":
-			p.Conflicts = append(p.Conflicts, v)
-		default:
-			continue
-		}
-		if section == pkg {
-			ownSet[k] = true
+		case k == "pkgname":
+			section = v
+		case section == "pkgbase":
+			base[k] = append(base[k], v)
+		case section == pkg:
+			own[k] = append(own[k], v)
 		}
 	}
-	if !ownSet["provides"] {
-		own.Provides = base.Provides
+	field := func(k string) []string {
+		if v, ok := own[k]; ok {
+			return v
+		}
+		return base[k]
 	}
-	if !ownSet["conflicts"] {
-		own.Conflicts = base.Conflicts
+	return Package{
+		Provides:  field("provides"),
+		Conflicts: field("conflicts"),
+		Depends:   slices.Concat(field("depends"), field("depends_"+arch)),
 	}
-	own.Depends = append(base.Depends, own.Depends...)
-	own.MakeDepends = append(base.MakeDepends, own.MakeDepends...)
-	own.CheckDepends = append(base.CheckDepends, own.CheckDepends...)
-	return own
 }
 
 // listEnabled is the systemctl call that lists the enabled system or user
