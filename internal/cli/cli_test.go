@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1112,6 +1113,41 @@ func TestStackFollowsDesiredOrder(t *testing.T) {
 	order()
 	if got := e.read("home/u/.rc"); got != "<missing>" {
 		t.Errorf("with nothing on, .rc = %q", got)
+	}
+}
+
+// A restack leaves the directories its layers created in place, so programs
+// watching them keep working.
+func TestRestackKeepsDirectories(t *testing.T) {
+	e := newEnv(t)
+	e.module("a", "", map[string]string{"home/.config/shell/plugins/eq/plugin.json": "{}"})
+	e.module("b", "", map[string]string{"home/.rc": "b"})
+	must(t, os.WriteFile(e.hostPath(), []byte("modules = [\"a\", \"b\"]\n"), 0o644))
+	must(t, e.run("apply", "-y"))
+	plugins := filepath.Join(e.home, ".config", "shell", "plugins")
+	ino := func() uint64 {
+		t.Helper()
+		info, err := os.Stat(plugins)
+		must(t, err)
+		return info.Sys().(*syscall.Stat_t).Ino
+	}
+	before := ino()
+
+	e.module("a", "", map[string]string{"home/.config/shell/plugins/eq/widget.qml": "Item {}"})
+	must(t, e.run("plan"))
+	if !strings.Contains(e.out.String(), "redeploy the home files from a up") {
+		t.Fatalf("plan is not a restack:\n%s", e.out.String())
+	}
+	must(t, e.run("apply", "-y"))
+	if got := ino(); got != before {
+		t.Errorf("restack replaced %s", plugins)
+	}
+	if got := e.read("home/u/.config/shell/plugins/eq/widget.qml"); got != "Item {}" {
+		t.Errorf("widget.qml = %q", got)
+	}
+	must(t, e.run("doctor"))
+	if strings.Contains(e.out.String(), "restack") {
+		t.Errorf("doctor after apply:\n%s", e.out.String())
 	}
 }
 

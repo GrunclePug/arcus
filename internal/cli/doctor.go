@@ -357,6 +357,15 @@ func (a *app) doctorHalf(h *half, st *state.State, fix bool, r *report) {
 			continue
 		}
 		switch on := slices.Contains(st.Modules, name); {
+		case name == layer.HoldLedger:
+			r.problem("a restack of the %s layers was interrupted and kept the directories they created", h.name)
+			if fix {
+				if err := h.layer.Release(); err != nil {
+					r.failed(err)
+				} else {
+					r.repaired("gave them to the layers using them and removed the empty ones")
+				}
+			}
 		case !on:
 			r.problem("%s has a %s ledger but no layer in the state (interrupted turn-on or orphan)", name, l.Status)
 			if fix {

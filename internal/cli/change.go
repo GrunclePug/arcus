@@ -717,15 +717,27 @@ func (a *app) runSteps(h *half, st *state.State, steps []plan.Step, in plan.Inpu
 				return fmt.Errorf("module %q has no %s layer to redeploy", s.Module, h.name)
 			}
 			upper := slices.Clone(st.Modules[pos:])
-			for k := len(upper) - 1; k >= 0; k-- {
-				if err := off(upper[k]); err != nil {
-					return err
-				}
+			if err := h.layer.Hold(); err != nil {
+				return err
 			}
-			for _, name := range s.Names {
-				if err := on(name); err != nil {
-					return err
+			err := func() error {
+				for k := len(upper) - 1; k >= 0; k-- {
+					if err := off(upper[k]); err != nil {
+						return err
+					}
 				}
+				for _, name := range s.Names {
+					if err := on(name); err != nil {
+						return err
+					}
+				}
+				return nil
+			}()
+			// Released on failure too, so the directories of the layers that
+			// stayed off go as they would have without the hold. Those of an
+			// activation whose rollback was incomplete pass to its ledger.
+			if err := errors.Join(err, h.layer.Release()); err != nil {
+				return err
 			}
 		case plan.BuildLocal:
 			if err := a.build(s, r); err != nil {
