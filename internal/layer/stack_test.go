@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -998,4 +999,199 @@ func TestVerifyWritePrivilegeAcceptsMissingParents(t *testing.T) {
 	if err := VerifyWritePrivilege(filepath.Join(dir, "plain", "child")); err == nil {
 		t.Fatal("expected error when an ancestor is a regular file")
 	}
+}
+
+func inode(t *testing.T, path string) uint64 {
+	t.Helper()
+	info, err := os.Stat(path)
+	must(t, err)
+	return info.Sys().(*syscall.Stat_t).Ino
+}
+
+// A restack turns layers off and on again. Directories that programs watch
+// (a shell's plugin folder, an app's preset folder) must survive it rather
+// than be replaced by new ones the watchers never see.
+func TestRestackKeepsCreatedDirs(t *testing.T) {
+	for _, h := range halves {
+		t.Run(h.name, func(t *testing.T) {
+			sb := newSandbox(t, h)
+			sb.moduleFile("a", "plugins/eq/plugin.json", "{}")
+			sb.moduleFile("b", "other/b.conf", "b")
+			must(t, sb.activate("a"))
+			must(t, sb.activate("b"))
+			plugins, eq := filepath.Join(sb.host, "plugins"), filepath.Join(sb.host, "plugins/eq")
+			before := []uint64{inode(t, plugins), inode(t, eq)}
+
+			// b dropped its file; its directory has no reason to stay.
+			must(t, os.Remove(filepath.Join(sb.profDir, "b", sb.s.Subdir, "etc/other/b.conf")))
+			must(t, sb.s.Hold())
+			must(t, sb.deactivate("b", false))
+			must(t, sb.deactivate("a", false))
+			must(t, sb.activate("a"))
+			must(t, sb.activate("b"))
+			must(t, sb.s.Release())
+
+			if got := []uint64{inode(t, plugins), inode(t, eq)}; !slices.Equal(got, before) {
+				t.Errorf("plugin directories were replaced: inodes %v, then %v", before, got)
+			}
+			if exists(filepath.Join(sb.host, "other")) {
+				t.Error("a directory no layer needs any more was kept")
+			}
+			if l, err := sb.s.LoadLedger(HoldLedger); err != nil || l != nil {
+				t.Errorf("hold ledger left behind: %v, %v", l, err)
+			}
+
+			// The directories are a's again: turning it off removes them.
+			must(t, sb.deactivate("b", false))
+			must(t, sb.deactivate("a", false))
+			if exists(plugins) {
+				t.Error("a's directories outlived its layer")
+			}
+		})
+	}
+}
+
+// A restack interrupted while its layers are off leaves the hold behind;
+// releasing it removes the directories nothing uses, as the deactivation
+// would have.
+func TestReleaseAfterInterruptedRestack(t *testing.T) {
+	for _, h := range halves {
+		t.Run(h.name, func(t *testing.T) {
+			sb := newSandbox(t, h)
+			sb.moduleFile("a", "plugins/eq/plugin.json", "{}")
+			must(t, sb.activate("a"))
+			must(t, sb.s.Hold())
+			must(t, sb.deactivate("a", false))
+			if !exists(filepath.Join(sb.host, "plugins/eq")) {
+				t.Fatal("held directory removed")
+			}
+			must(t, sb.s.Release())
+			if exists(filepath.Join(sb.host, "plugins")) {
+				t.Error("unused held directory kept after release")
+			}
+		})
+	}
+}
+
+// doctor repairs the layers the way `arcus doctor -fix` does, in its order,
+// in a new process (no hold in effect).
+func (sb *sandbox) doctor() {
+	sb.t.Helper()
+	sb.s.holding = false
+	names, err := sb.s.ListLedgers()
+	must(sb.t, err)
+	for _, name := range names {
+		l, err := sb.s.LoadLedger(name)
+		must(sb.t, err)
+		switch {
+		case l == nil:
+		case name == HoldLedger:
+			must(sb.t, sb.s.Release())
+		case !slices.Contains(sb.stack, name):
+			must(sb.t, sb.s.Rollback(name))
+		case l.Status == StatusDeactivating:
+			must(sb.t, sb.deactivate(name, false))
+		case l.Status != StatusActive:
+			must(sb.t, sb.s.Rollback(name))
+			sb.stack = slices.DeleteFunc(sb.stack, func(s string) bool { return s == name })
+		}
+	}
+}
+
+// A crash anywhere in a restack leaves every change described by a ledger,
+// and doctor's repairs leave nothing behind once the layers are off. Module
+// names sort on both sides of the hold ledger, which doctor handles in name
+// order, and the upper layer sorts first in one case.
+func TestRestackCrashAtAnyPointConverges(t *testing.T) {
+	for _, h := range halves {
+		for _, names := range [][2]string{{"a", "b"}, {"0a", "0b"}, {"z", "b"}} {
+			t.Run(h.name+"/"+names[0], func(t *testing.T) {
+				a, b := names[0], names[1]
+				for n := 1; ; n++ {
+					sb := newSandbox(t, h)
+					sb.hostFile("keep", "host only")
+					sb.moduleFile(a, "plugins/eq/x", "a")
+					sb.moduleFile(b, "plugins/eq/y", "b")
+					sb.moduleFile(b, "other/deep/b", "b")
+					original := sb.snapshot()
+					must(t, sb.activate(a))
+					must(t, sb.activate(b))
+					sb.moduleFile(a, "plugins/eq/z", "new in a")
+					before := sb.snapshot()
+
+					crashed, err := runUntilCrash(sb, n, func() error {
+						must(t, sb.s.Hold())
+						must(t, sb.deactivate(b, false))
+						must(t, sb.deactivate(a, false))
+						must(t, sb.activate(a))
+						must(t, sb.activate(b))
+						return sb.s.Release()
+					})
+					must(t, err)
+					if !crashed {
+						if got := sb.read("plugins/eq/z"); got != "new in a" {
+							t.Errorf("after the restack, z = %q", got)
+						}
+						t.Logf("crashed at each of %d points", n-1)
+						break
+					}
+					sb.assertLedgerCovers(before, original)
+
+					sb.doctor()
+					for i := len(sb.stack) - 1; i >= 0; i-- {
+						must(t, sb.deactivate(sb.stack[i], false))
+					}
+					assertSame(t, original, sb.snapshot())
+					sb.assertNoLedgers()
+				}
+			})
+		}
+	}
+}
+
+// A module that turned a directory it created into a file restacks: the
+// held directory, empty, makes way for the file.
+func TestRestackFileReplacesHeldDir(t *testing.T) {
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		bar := sb.moduleFile("a", "foo/bar", "bar")
+		must(t, sb.activate("a"))
+		must(t, os.RemoveAll(filepath.Dir(bar)))
+		sb.moduleFile("a", "foo", "now a file")
+
+		must(t, sb.s.Hold())
+		must(t, sb.deactivate("a", false))
+		must(t, sb.activate("a"))
+		must(t, sb.s.Release())
+		if got := sb.read("foo"); got != "now a file" {
+			t.Errorf("foo = %q", got)
+		}
+		must(t, sb.deactivate("a", false))
+		if exists(filepath.Join(sb.host, "foo")) {
+			t.Error("foo outlived its layer")
+		}
+		sb.assertNoLedgers()
+	})
+}
+
+// A hold an interrupted restack left applies to no turn-off but a restack's.
+func TestStaleHoldOnlyAppliesToRestacks(t *testing.T) {
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		sb.moduleFile("a", "a-dir/x", "a")
+		sb.moduleFile("b", "b-dir/y", "b")
+		must(t, sb.activate("a"))
+		must(t, sb.activate("b"))
+		must(t, sb.s.Hold())
+		must(t, sb.deactivate("b", false))
+		sb.s.holding = false // the process died here
+
+		must(t, sb.deactivate("a", false))
+		if exists(filepath.Join(sb.host, "a-dir")) {
+			t.Error("a plain turn-off kept its directory for a stale hold")
+		}
+		must(t, sb.s.Release())
+		if exists(filepath.Join(sb.host, "b-dir")) {
+			t.Error("releasing the stale hold kept b's empty directory")
+		}
+		sb.assertNoLedgers()
+	})
 }

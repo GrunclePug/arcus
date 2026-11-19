@@ -47,6 +47,10 @@ type Stacker struct {
 	// Warn receives non-fatal diagnostics. Defaults to slog.
 	Warn func(format string, args ...any)
 
+	// holding is set between Hold and Release. A hold an interrupted
+	// restack left on disk applies to the next restack only.
+	holding bool
+
 	// crashHook, when set, runs between the individual changes of an
 	// operation. Tests panic from it to simulate a crash at that point.
 	crashHook func()
@@ -148,6 +152,9 @@ func (s *Stacker) Activate(ctx context.Context, module string, activeStack []str
 
 	below, err := s.loadStack(activeStack)
 	if err != nil {
+		return err
+	}
+	if err := s.yieldHeldDirs(module); err != nil {
 		return err
 	}
 
@@ -483,7 +490,9 @@ func (s *Stacker) Deactivate(ctx context.Context, module string, activeStack []s
 		}
 	}
 
-	s.removeCreatedDirs(l, stack)
+	if err := s.dropCreatedDirs(l, stack); err != nil {
+		return err
+	}
 	s.crashPoint()
 	return s.removeLedger(module)
 }
@@ -527,30 +536,136 @@ func (s *Stacker) teardownEntry(l *Ledger, idx int, above []*Ledger) error {
 	return nil
 }
 
+// HoldLedger is the ledger that keeps the directories of the layers a
+// restack turns off until the layers are on again. Module names start with a
+// letter or digit, so no module can have it. Doctor releases a hold that an
+// interrupted restack left.
+const HoldLedger = "_restack"
+
+// Hold makes the deactivations that follow keep the directories their layers
+// created, for Release to sort out once the layers are on again. A restack
+// would otherwise replace every directory its layers created with a new one,
+// and programs watching the old one (a shell's plugin folder, an app's
+// preset folder) lose track of it or crash. A hold an interrupted restack
+// left is taken over.
+func (s *Stacker) Hold() error {
+	l, err := s.LoadLedger(HoldLedger)
+	if err != nil {
+		return err
+	}
+	if l == nil {
+		if err := s.saveLedger(&Ledger{Module: HoldLedger, Status: StatusActive}); err != nil {
+			return err
+		}
+	}
+	s.holding = true
+	return nil
+}
+
+// Release ends a hold. Each held directory that still holds files passes to
+// a ledger with files in it, whether that layer is on or was interrupted, and
+// the empty ones are removed, as the deactivations would have done.
+func (s *Stacker) Release() error {
+	s.holding = false
+	hold, err := s.LoadLedger(HoldLedger)
+	if err != nil || hold == nil {
+		return err
+	}
+	names, err := s.ListLedgers()
+	if err != nil {
+		return err
+	}
+	others, err := s.loadStack(slices.DeleteFunc(names, func(n string) bool { return n == HoldLedger }))
+	if err != nil {
+		return err
+	}
+	s.removeCreatedDirs(hold, others)
+	s.crashPoint()
+	return s.removeLedger(HoldLedger)
+}
+
+// dropCreatedDirs gives up the directories a layer being turned off created:
+// to the hold during a restack, otherwise by removing them.
+func (s *Stacker) dropCreatedDirs(l *Ledger, stack []*Ledger) error {
+	if !s.holding {
+		s.removeCreatedDirs(l, stack)
+		return nil
+	}
+	hold, err := s.LoadLedger(HoldLedger)
+	if err != nil {
+		return err
+	}
+	if hold == nil {
+		return fmt.Errorf("the %s ledger is gone during a restack", HoldLedger)
+	}
+	for _, dir := range l.CreatedDirs {
+		if !slices.Contains(hold.CreatedDirs, dir) {
+			hold.CreatedDirs = append(hold.CreatedDirs, dir)
+		}
+	}
+	return s.saveLedger(hold)
+}
+
+// yieldHeldDirs removes the empty held directories where the module now
+// deploys a file, so a module that turned a directory into a file restacks
+// as it would without the hold.
+func (s *Stacker) yieldHeldDirs(module string) error {
+	if !s.holding {
+		return nil
+	}
+	hold, err := s.LoadLedger(HoldLedger)
+	if err != nil || hold == nil || len(hold.CreatedDirs) == 0 {
+		return err
+	}
+	tree := s.tree(module)
+	if tree == "" || !exists(tree) {
+		return nil
+	}
+	var yielded []string
+	err = filepath.WalkDir(tree, func(src string, d iofs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		host, err := s.hostPathFor(tree, src)
+		if err != nil {
+			return err
+		}
+		dirs := slices.DeleteFunc(slices.Clone(hold.CreatedDirs), func(dir string) bool { return !isWithin(dir, host) })
+		slices.SortFunc(dirs, func(a, b string) int { return len(b) - len(a) })
+		for _, dir := range dirs {
+			if os.Remove(dir) == nil {
+				yielded = append(yielded, dir)
+			}
+		}
+		return nil
+	})
+	if err != nil || len(yielded) == 0 {
+		return err
+	}
+	hold.CreatedDirs = slices.DeleteFunc(hold.CreatedDirs, func(dir string) bool { return slices.Contains(yielded, dir) })
+	return s.saveLedger(hold)
+}
+
 // removeCreatedDirs deletes directories this layer created, deepest first,
-// if they are empty. A directory still holding another active layer's files
-// is handed to that layer's ledger so it is cleaned up when that layer goes.
+// if they are empty. A directory still holding other layers' files is handed
+// to each of their ledgers, so it is cleaned up when the last of them goes;
+// handing it to one alone would lose it if that one were rolled back.
 func (s *Stacker) removeCreatedDirs(l *Ledger, stack []*Ledger) {
 	dirs := slices.Clone(l.CreatedDirs)
 	slices.SortFunc(dirs, func(a, b string) int { return len(b) - len(a) })
 
-next:
 	for _, dir := range dirs {
 		if os.Remove(dir) == nil || !exists(dir) {
 			continue
 		}
 		for _, other := range stack {
-			if other == nil || other == l {
+			if other == nil || other == l || slices.Contains(other.CreatedDirs, dir) ||
+				!slices.ContainsFunc(other.Entries, func(e Entry) bool { return isWithin(e.Host, dir) }) {
 				continue
 			}
-			for _, e := range other.Entries {
-				if isWithin(e.Host, dir) {
-					other.CreatedDirs = append(other.CreatedDirs, dir)
-					if err := s.saveLedger(other); err != nil {
-						s.Warn("could not transfer ownership of %s: %v", dir, err)
-					}
-					continue next
-				}
+			other.CreatedDirs = append(other.CreatedDirs, dir)
+			if err := s.saveLedger(other); err != nil {
+				s.Warn("could not transfer ownership of %s: %v", dir, err)
 			}
 		}
 	}
