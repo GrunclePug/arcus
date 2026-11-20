@@ -755,23 +755,228 @@ func TestPythonBytecodeCachesAreNotDeployed(t *testing.T) {
 	})
 }
 
+// pycBytes is content laid out like a CPython bytecode cache: magic number,
+// flags, source stamp, then a marshalled code object.
+func pycBytes(s string) string {
+	return "\x2b\x0e\r\n" + "\x00\x00\x00\x00" + "\x00\x00\x00\x00\x00\x00\x00\x00" + "\xe3" + s
+}
+
+// deployOldCache adds bin/__pycache__/<name> to module p's ledger and host
+// the way a version before 0.8.2 deployed it, after p was turned on with
+// bin/tool. With backup, the file already at the host path is moved aside
+// first. It returns the host and source paths.
+func (sb *sandbox) deployOldCache(name string, backup bool) (host, src string) {
+	t := sb.t
+	src = sb.moduleFile("p", "bin/__pycache__/"+name, pycBytes("module cache"))
+	host = filepath.Join(sb.host, "bin/__pycache__", name)
+	l, err := sb.s.LoadLedger("p")
+	must(t, err)
+	e := l.Entries[0]
+	e.Host, e.Src, e.Backup = host, src, ""
+	if e.Kind == KindCopy {
+		e.SHA256, err = hashFile(src)
+		must(t, err)
+	}
+	if dir := filepath.Dir(host); !exists(dir) {
+		must(t, os.MkdirAll(dir, 0o755))
+		l.CreatedDirs = append(l.CreatedDirs, dir)
+	}
+	if backup {
+		e.Backup = host + ".orig"
+		must(t, os.Rename(host, e.Backup))
+	}
+	must(t, deploy(e))
+	l.Entries = append(l.Entries, e)
+	must(t, sb.s.saveLedger(l))
+	return host, src
+}
+
+// pythonRewrite replaces path the way Python writes a cache: a new file
+// renamed over it, so a deployed link becomes a regular file.
+func pythonRewrite(t *testing.T, path, content string) {
+	t.Helper()
+	tmp := path + ".tmp"
+	must(t, os.WriteFile(tmp, []byte(content), 0o644))
+	must(t, os.Rename(tmp, path))
+}
+
 func TestCachesDeployedBeforeTheSkipAreStale(t *testing.T) {
 	eachHalf(t, func(t *testing.T, sb *sandbox) {
 		sb.moduleFile("p", "bin/tool", "tool")
-		cache := sb.moduleFile("p", "bin/__pycache__/tool.cpython-314.pyc", "cache")
 		must(t, sb.activate("p"))
-		// Simulate a ledger written by a version that deployed caches.
-		l, err := sb.s.LoadLedger("p")
-		must(t, err)
-		host := filepath.Join(sb.host, "bin/__pycache__/tool.cpython-314.pyc")
-		l.Entries = append(l.Entries, Entry{Host: host, Src: cache, Kind: l.Entries[0].Kind})
-		must(t, sb.s.saveLedger(l))
+		host, src := sb.deployOldCache("tool.cpython-314.pyc", false)
 		changes, err := sb.s.Stale("p")
 		must(t, err)
-		if len(changes) != 1 || changes[0].Op != '-' || changes[0].Src != cache {
+		if len(changes) != 1 || changes[0].Op != '-' || changes[0].Host != host || changes[0].Src != src {
 			t.Fatalf("changes = %v", changes)
 		}
+
+		// What the restack apply plans for a stale layer runs.
+		must(t, sb.deactivate("p", false))
+		must(t, sb.activate("p"))
+		if exists(filepath.Dir(host)) {
+			t.Fatal("cache directory still deployed")
+		}
+		if sb.read("bin/tool") != "tool" {
+			t.Fatal("module file not redeployed")
+		}
+		changes, err = sb.s.Stale("p")
+		must(t, err)
+		if len(changes) != 0 {
+			t.Fatalf("stale after the restack: %v", changes)
+		}
 	})
+}
+
+func TestRewrittenCacheIsRemoved(t *testing.T) {
+	sb := newSandbox(t, halves[0])
+	pristine := sb.snapshot()
+	sb.moduleFile("p", "bin/tool", "tool")
+	must(t, sb.activate("p"))
+	host, _ := sb.deployOldCache("tool.cpython-314.pyc", false)
+	pythonRewrite(t, host, pycBytes("rewritten"))
+
+	findings, err := sb.s.Audit("p", sb.stack)
+	must(t, err)
+	if len(findings) != 0 {
+		t.Fatalf("findings = %v", findings)
+	}
+	must(t, sb.deactivate("p", false))
+	assertSame(t, pristine, sb.snapshot())
+}
+
+func TestRewrittenCacheRestoresBackup(t *testing.T) {
+	const rel = "bin/__pycache__/tool.cpython-314.pyc"
+	for n := 1; ; n++ {
+		sb := newSandbox(t, halves[0])
+		// A valid cache, so a teardown that misjudged the restored original
+		// as Python's rewrite would delete it.
+		sb.hostFile(rel, pycBytes("original"))
+		sb.moduleFile("p", "bin/tool", "tool")
+		must(t, sb.activate("p"))
+		host, _ := sb.deployOldCache("tool.cpython-314.pyc", true)
+		pythonRewrite(t, host, pycBytes("rewritten"))
+
+		crashed, err := runUntilCrash(sb, n, func() error { return sb.s.Deactivate(context.Background(), "p", sb.stack, false) })
+		if crashed {
+			err = sb.s.Deactivate(context.Background(), "p", sb.stack, false)
+		}
+		must(t, err)
+		if got := sb.read(rel); got != pycBytes("original") {
+			t.Fatalf("crash %d: original = %q", n, got)
+		}
+		sb.assertNoLedgers()
+		if !crashed {
+			if n == 1 {
+				t.Fatal("no crash points were hit")
+			}
+			break
+		}
+	}
+}
+
+func TestOnlyRewrittenCachesAreRemoved(t *testing.T) {
+	const name = "tool.cpython-314.pyc"
+	// Each case fails exactly one of the checks; Deactivate must refuse.
+	cases := []struct {
+		name  string
+		half  half
+		file  string
+		after func(t *testing.T, sb *sandbox, host string)
+	}{
+		{"system copy", halves[1], name, func(t *testing.T, sb *sandbox, host string) {
+			pythonRewrite(t, host, pycBytes("rewritten"))
+		}},
+		{"not bytecode", halves[0], name, func(t *testing.T, sb *sandbox, host string) {
+			// Long enough for a header, with \r\n where the magic number ends.
+			pythonRewrite(t, host, "OK\r\nplain text, not bytecode")
+		}},
+		{"not a cache name", halves[0], "tool.pyc", func(t *testing.T, sb *sandbox, host string) {
+			pythonRewrite(t, host, pycBytes("rewritten"))
+		}},
+		{"symlink elsewhere", halves[0], name, func(t *testing.T, sb *sandbox, host string) {
+			other := filepath.Join(sb.root, "other.pyc")
+			must(t, os.WriteFile(other, []byte(pycBytes("other")), 0o644))
+			must(t, os.Remove(host))
+			must(t, os.Symlink(other, host))
+		}},
+		{"symlinked parent", halves[0], name, func(t *testing.T, sb *sandbox, host string) {
+			other := filepath.Join(sb.root, "other", "__pycache__")
+			must(t, os.MkdirAll(other, 0o755))
+			must(t, os.WriteFile(filepath.Join(other, name), []byte(pycBytes("other")), 0o644))
+			must(t, os.RemoveAll(filepath.Dir(host)))
+			must(t, os.Symlink(other, filepath.Dir(host)))
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			sb := newSandbox(t, c.half)
+			sb.moduleFile("p", "bin/tool", "tool")
+			must(t, sb.activate("p"))
+			host, _ := sb.deployOldCache(c.file, false)
+			c.after(t, sb, host)
+			before := sb.snapshot()
+			if err := sb.deactivate("p", false); !errors.Is(err, ErrForeign) {
+				t.Fatalf("deactivate = %v, want ErrForeign", err)
+			}
+			assertSame(t, before, sb.snapshot())
+			if c.name == "symlinked parent" {
+				data, err := os.ReadFile(filepath.Join(sb.root, "other", "__pycache__", name))
+				if err != nil || string(data) != pycBytes("other") {
+					t.Fatalf("file behind the symlink: %q, %v", data, err)
+				}
+			}
+		})
+	}
+
+	t.Run("rollback removes a rewritten cache", func(t *testing.T) {
+		sb := newSandbox(t, halves[0])
+		pristine := sb.snapshot()
+		sb.moduleFile("p", "bin/tool", "tool")
+		must(t, sb.activate("p"))
+		host, _ := sb.deployOldCache(name, false)
+		pythonRewrite(t, host, pycBytes("rewritten"))
+		must(t, sb.s.Rollback("p"))
+		assertSame(t, pristine, sb.snapshot())
+		sb.assertNoLedgers()
+	})
+}
+
+func TestCacheNamesOutsideACacheDirectory(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(sb *sandbox)
+	}{
+		{"module directory under __pycache__", func(sb *sandbox) {
+			sb.profDir = filepath.Join(sb.root, "__pycache__", "modules")
+		}},
+		{"target under __pycache__", func(sb *sandbox) {
+			s := *sb.s
+			s.Target = filepath.Join(sb.root, "__pycache__", "target")
+			sb.s, sb.host = &s, filepath.Join(s.Target, "etc")
+			must(sb.t, os.MkdirAll(sb.host, 0o755))
+		}},
+		{"file named __pycache__", func(sb *sandbox) {
+			sb.moduleFile("p", "lib/__pycache__", "not a directory")
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			eachHalf(t, func(t *testing.T, sb *sandbox) {
+				c.setup(sb)
+				sb.moduleFile("p", "bin/tool", "tool")
+				must(t, sb.activate("p"))
+				if sb.read("bin/tool") != "tool" {
+					t.Fatal("module file not deployed")
+				}
+				changes, err := sb.s.Stale("p")
+				must(t, err)
+				if len(changes) != 0 {
+					t.Fatalf("stale right after activation: %v", changes)
+				}
+			})
+		})
+	}
 }
 
 func TestVerifyWritePrivilegeAcceptsMissingParents(t *testing.T) {

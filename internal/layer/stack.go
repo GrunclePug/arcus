@@ -290,12 +290,12 @@ func (s *Stacker) planActivation(module string, below []*Ledger, checkAccess boo
 
 	var plan []Entry
 	var problems []string
-	err := filepath.WalkDir(tree, func(src string, d iofs.DirEntry, err error) error {
+	err := walkTree(tree, func(src string, d iofs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
-			return skipCache(d)
+			return nil
 		}
 		host, err := s.hostPathFor(tree, src)
 		if err != nil {
@@ -378,12 +378,13 @@ type step struct {
 	loc      string // where this entry's deployment currently lives ("" = nowhere)
 	remove   bool   // loc holds our deployment and must be removed
 	foreign  bool   // loc holds something we did not put there
+	cache    bool   // loc holds a home-half bytecode cache Python rewrote; teardown removes it
 	finished bool   // a previous interrupted run already completed this step
 }
 
 // planStep classifies one entry. It is written so that re-running teardown
 // after a crash at any point converges instead of misreporting state.
-func planStep(l *Ledger, idx int, above []*Ledger) step {
+func (s *Stacker) planStep(l *Ledger, idx int, above []*Ledger) step {
 	e := l.Entries[idx]
 	st := step{idx: idx}
 	for _, a := range above {
@@ -419,6 +420,11 @@ func planStep(l *Ledger, idx int, above []*Ledger) step {
 		st.remove = true
 	case st.next == nil && e.Backup != "" && !exists(e.Backup):
 		st.finished = true // original already restored by an interrupted run
+	case st.next == nil && cacheEntry(e) && s.symlinkedParent(st.loc) == "" && isPyc(st.loc):
+		// Ledgers written before 0.8.2 hold cache links, and Python replaces a
+		// cache by renaming a new file over it. This comes after finished, so
+		// an original a re-run already put back is kept.
+		st.cache = true
 	default:
 		st.foreign = true
 	}
@@ -428,7 +434,8 @@ func planStep(l *Ledger, idx int, above []*Ledger) step {
 // Deactivate removes module's layer. activeStack is the full current stack
 // (containing module). In force mode, files that were modified after
 // activation are moved aside to <path>.arcus-foreign[.N] instead of blocking;
-// arcus never deletes data it did not create.
+// arcus never deletes data it did not create, except a home-half bytecode
+// cache Python rewrote over one arcus deployed.
 func (s *Stacker) Deactivate(ctx context.Context, module string, activeStack []string, force bool) error {
 	pos := slices.Index(activeStack, module)
 	if pos < 0 {
@@ -447,7 +454,7 @@ func (s *Stacker) Deactivate(ctx context.Context, module string, activeStack []s
 	// Pre-flight: refuse before mutating anything if unforced and foreign.
 	var foreign []string
 	for i := range l.Entries {
-		if st := planStep(l, i, above); st.foreign {
+		if st := s.planStep(l, i, above); st.foreign {
 			foreign = append(foreign, st.loc)
 		}
 	}
@@ -483,13 +490,13 @@ func (s *Stacker) Deactivate(ctx context.Context, module string, activeStack []s
 
 func (s *Stacker) teardownEntry(l *Ledger, idx int, above []*Ledger) error {
 	e := l.Entries[idx]
-	st := planStep(l, idx, above)
+	st := s.planStep(l, idx, above)
 	if st.finished {
 		return nil
 	}
 
 	switch {
-	case st.remove:
+	case st.remove || st.cache:
 		if err := removeDurable(st.loc); err != nil {
 			return fmt.Errorf("removing %q: %w", st.loc, err)
 		}
@@ -560,7 +567,7 @@ func (s *Stacker) Rollback(module string) error {
 
 	var problems []string
 	for i := len(l.Entries) - 1; i >= 0; i-- {
-		st := planStep(l, i, nil)
+		st := s.planStep(l, i, nil)
 		if st.foreign {
 			problems = append(problems, fmt.Sprintf("%s was modified; left in place", st.loc))
 			continue
@@ -600,7 +607,7 @@ func (s *Stacker) Rename(oldName, newName, oldDir, newDir string, activeStack []
 	for i := range l.Entries {
 		e := &l.Entries[i]
 		newSrc := newRoot + strings.TrimPrefix(e.Src, oldRoot)
-		st := planStep(l, i, above)
+		st := s.planStep(l, i, above)
 		if e.Kind == KindLink && st.loc != "" && st.remove {
 			if err := symlinkReplace(newSrc, st.loc); err != nil {
 				return fmt.Errorf("relinking %q: %w", st.loc, err)

@@ -2,6 +2,7 @@ package layer
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -23,20 +24,57 @@ const (
 	accessX = 0x1
 )
 
-// skipCache skips a Python bytecode cache in a module tree. Python writes
-// __pycache__ next to a module's scripts whenever they run from the tree (a
-// test, a hook importing a sibling); deployed, it would churn on every run
-// and its stale links break removals once the source moves.
-func skipCache(d iofs.DirEntry) error {
-	if d.Name() == "__pycache__" {
-		return filepath.SkipDir
-	}
-	return nil
+// walkTree walks a module tree like filepath.WalkDir but never enters a
+// Python bytecode cache. Python writes __pycache__ next to a module's scripts
+// whenever they run from the tree (a test, a hook importing a sibling);
+// deployed, it would churn on every run and its stale links break removals
+// once the source moves.
+func walkTree(tree string, fn iofs.WalkDirFunc) error {
+	return filepath.WalkDir(tree, func(path string, d iofs.DirEntry, err error) error {
+		if err == nil && d.IsDir() && d.Name() == "__pycache__" {
+			return filepath.SkipDir
+		}
+		return fn(path, d, err)
+	})
 }
 
-// inCache reports whether path lies inside a Python bytecode cache.
-func inCache(path string) bool {
-	return slices.Contains(strings.Split(filepath.ToSlash(path), "/"), "__pycache__")
+// inCache reports whether e lies inside a Python bytecode cache: a directory
+// walkTree skips. The host path relative to the target is the path within the
+// module tree.
+func (s *Stacker) inCache(e Entry) bool {
+	rel, _ := filepath.Rel(s.Target, e.Host)
+	return slices.Contains(strings.Split(filepath.ToSlash(filepath.Dir(rel)), "/"), "__pycache__")
+}
+
+// cacheEntry reports whether e is a home-half link to a Python bytecode cache
+// file, which ledgers written before 0.8.2 can hold. It agrees with inCache for
+// every reachable layout, because Python never nests cache directories: e.Src's
+// parent lies inside the module tree or is the tree itself (home or system).
+func cacheEntry(e Entry) bool {
+	name := filepath.Base(e.Src)
+	return e.Kind == KindLink && filepath.Base(filepath.Dir(e.Src)) == "__pycache__" &&
+		strings.HasSuffix(name, ".pyc") && strings.Count(name, ".") >= 2
+}
+
+// isPyc reports whether path is a regular file laid out like a CPython
+// bytecode cache: a magic number ending in \r\n, a flags word importlib
+// accepts (at most 3), 8 bytes of source stamp, then a marshalled code object
+// ('c', with or without the ref flag).
+func isPyc(path string) bool {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	var h [17]byte
+	if _, err := io.ReadFull(f, h[:]); err != nil {
+		return false
+	}
+	return h[2] == '\r' && h[3] == '\n' && binary.LittleEndian.Uint32(h[4:8]) <= 3 && h[16]&^0x80 == 'c'
 }
 
 func exists(path string) bool {

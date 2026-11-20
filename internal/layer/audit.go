@@ -33,10 +33,12 @@ func (s *Stacker) Audit(module string, activeStack []string) ([]string, error) {
 	deployed := make(map[string]bool, len(l.Entries))
 	for i, e := range l.Entries {
 		deployed[e.Src] = true
-		st := planStep(l, i, above)
+		st := s.planStep(l, i, above)
 		switch {
 		case st.foreign:
 			findings = append(findings, fmt.Sprintf("%s was modified after activation (teardown will require -f)", st.loc))
+		case st.cache:
+			// A cache Python rewrote; the next restack removes it.
 		case !st.remove && !st.finished:
 			findings = append(findings, fmt.Sprintf("%s: deployment is missing", e.Host))
 		case st.remove && e.Kind == KindCopy:
@@ -58,11 +60,8 @@ func (s *Stacker) Audit(module string, activeStack []string) ([]string, error) {
 
 	var added int
 	if tree := s.tree(module); tree != "" {
-		_ = filepath.WalkDir(tree, func(src string, d iofs.DirEntry, err error) error {
-			if err == nil && d.IsDir() {
-				return skipCache(d)
-			}
-			if err == nil && !deployed[src] {
+		_ = walkTree(tree, func(src string, d iofs.DirEntry, err error) error {
+			if err == nil && !d.IsDir() && !deployed[src] {
 				added++
 			}
 			return nil
@@ -126,12 +125,9 @@ func (s *Stacker) DanglingBackups() ([]string, error) {
 	var dangling []string
 	for _, p := range modules {
 		tree := s.tree(p)
-		err := filepath.WalkDir(tree, func(src string, d iofs.DirEntry, err error) error {
-			if err != nil {
+		err := walkTree(tree, func(src string, d iofs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
 				return err
-			}
-			if d.IsDir() {
-				return skipCache(d)
 			}
 			host, err := s.hostPathFor(tree, src)
 			if err != nil || seen[host] {
@@ -192,7 +188,7 @@ func (s *Stacker) Stale(module string) ([]Change, error) {
 		recorded[e.Src] = true
 		info, err := os.Lstat(e.Src)
 		switch {
-		case err != nil, inCache(e.Src):
+		case err != nil, s.inCache(e):
 			// A cache deployed before caches were skipped goes with the next redeploy.
 			changes = append(changes, Change{'-', e.Host, e.Src})
 		case e.Kind == KindCopy:
@@ -207,15 +203,9 @@ func (s *Stacker) Stale(module string) ([]Change, error) {
 	if tree == "" {
 		return changes, nil
 	}
-	err = filepath.WalkDir(tree, func(src string, d iofs.DirEntry, err error) error {
-		if err != nil {
+	err = walkTree(tree, func(src string, d iofs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || recorded[src] {
 			return err
-		}
-		if d.IsDir() {
-			return skipCache(d)
-		}
-		if recorded[src] {
-			return nil
 		}
 		host, err := s.hostPathFor(tree, src)
 		if err != nil {

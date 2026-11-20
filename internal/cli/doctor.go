@@ -48,7 +48,8 @@ func (r *report) err() error {
 // cmdDoctor audits both halves and the host file. With -fix it applies only
 // repairs that are provably safe: rolling back interrupted activations,
 // finishing interrupted teardowns and forgetting resources removed outside
-// arcus. It never deletes a file arcus did not create.
+// arcus. It never deletes a file arcus did not create, except a home-half
+// bytecode cache Python rewrote over one arcus deployed.
 func (a *app) cmdDoctor(args []string) error {
 	var o opts
 	fs := a.flags("doctor", &o, false, false)
