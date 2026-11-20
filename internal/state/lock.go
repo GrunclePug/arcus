@@ -50,6 +50,10 @@ func AcquireLock(path string, exclusive bool) (*Lock, error) {
 	return &Lock{f: f}, nil
 }
 
+// File returns the open lock file, or nil for a no-op lock. A child that
+// inherits it keeps the lock held while it runs.
+func (l *Lock) File() *os.File { return l.f }
+
 // Release drops the lock.
 func (l *Lock) Release() error {
 	if l.f == nil {

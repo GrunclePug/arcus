@@ -48,6 +48,12 @@ func Load(path string) (*File, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading host file: %w", err)
 	}
+	return Parse(path, src)
+}
+
+// Parse reads host file content that came from somewhere else, such as an
+// entry of the history. Save writes the result to path.
+func Parse(path string, src []byte) (*File, error) {
 	l, err := parse(src)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)

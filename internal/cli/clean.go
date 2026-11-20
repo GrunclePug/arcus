@@ -13,7 +13,7 @@ import (
 // other packages that something needs are marked as dependencies, and the
 // rest is removed. It runs only when the system matches the host file, so
 // it never races apply over packages arcus installed.
-func (a *app) cmdClean(args []string) error {
+func (a *app) cmdClean(args []string) (err error) {
 	var o opts
 	fs := a.flags("clean", &o, true, false)
 	if err := fs.Parse(args); err != nil {
@@ -25,11 +25,12 @@ func (a *app) cmdClean(args []string) error {
 	if err := a.load(&o); err != nil {
 		return err
 	}
-	lock, err := a.userHalf().lock(!o.dry)
+	lock, err := a.lockUser(!o.dry)
 	if err != nil {
 		return err
 	}
 	defer lock.Release()
+	defer func() { a.record(err != nil) }()
 
 	in, err := a.hostSelection(&o)
 	if err != nil {
@@ -53,6 +54,7 @@ func (a *app) cmdClean(args []string) error {
 	if !o.yes && !a.confirm("Proceed?") {
 		return errors.New("cancelled, nothing was changed")
 	}
+	a.begin()
 	args = append([]string{"-clean", "-hash", plan.Hash(steps), "-home", a.paths.Home, "-config", a.paths.Config, "--"}, in.Desired...)
 	if err := a.sudo(args); err != nil {
 		return fmt.Errorf("clean failed: %w", err)

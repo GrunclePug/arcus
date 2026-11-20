@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/grunclepug/arcus/internal/config"
+	"github.com/grunclepug/arcus/internal/history"
 	"github.com/grunclepug/arcus/internal/layer"
 	"github.com/grunclepug/arcus/internal/module"
 	"github.com/grunclepug/arcus/internal/profile"
@@ -36,6 +37,8 @@ const usage = `usage: arcus <command> [flags] [arguments]
   clean                    remove packages no module lists; mark the rest's install reasons
   machine                  write this machine's module (kernel, bootloader, filesystems, swap)
   update                   replace arcus with the latest release from GitHub
+  history [count]          list the latest entries of the state history
+  rollback [-f] <entry>    put the host file's lists back as of an entry and apply them
   -version                 print the version
 
 Flags (before the arguments):
@@ -55,6 +58,8 @@ type app struct {
 	stdout, stderr io.Writer
 	root           string // root prefix, "/" outside tests
 	euid           int
+	uid            int  // the real uid: the owner the history must have
+	history        bool // git is on PATH: the state history is on
 	getenv         func(string) string
 	hostname       func() (string, error)
 	// sudo runs "arcus exec-system <args>" as root.
@@ -70,6 +75,12 @@ type app struct {
 	modules  module.Set
 	profiles profile.Set
 	rebuild  []string // own builds to build again even if unchanged
+
+	subject      string      // the history entry's subject: the command line
+	userLock     *state.Lock // the exclusive user lock, which git children inherit
+	rec          recorder
+	confirmHost  bool // rollback: a host file change alone is confirmed too
+	recreateHost bool // rollback: the host file is missing and is saved anyway
 }
 
 // Run runs one arcus command; version is the running arcus's.
@@ -79,6 +90,8 @@ func Run(ctx context.Context, version string, args []string) error {
 		stdin: os.Stdin, stdout: os.Stdout, stderr: os.Stderr,
 		root:     "/",
 		euid:     os.Geteuid(),
+		uid:      os.Getuid(),
+		history:  history.Available(),
 		getenv:   os.Getenv,
 		hostname: os.Hostname,
 		exe:      os.Executable,
@@ -95,6 +108,7 @@ func (a *app) run(args []string) error {
 		return errors.New("no command given")
 	}
 	cmd, args := args[0], args[1:]
+	a.subject = subjectOf(append([]string{cmd}, args...))
 
 	if cmd == "exec-system" {
 		return a.execSystem(args)
@@ -135,6 +149,10 @@ func (a *app) run(args []string) error {
 		return a.cmdMachine(args)
 	case "update":
 		return a.cmdUpdate(args)
+	case "history":
+		return a.cmdHistory(args)
+	case "rollback":
+		return a.cmdRollback(args)
 	case "help", "-h", "-help", "--help":
 		fmt.Fprint(a.stdout, usage)
 		return nil

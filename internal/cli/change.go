@@ -166,19 +166,21 @@ func (a *app) cmdPlan(args []string) error {
 	})
 }
 
-// change is the shared flow of on, off, apply and plan: edit the desired
-// set, plan, show, confirm, run, and record the host file on success. A
-// missing host file is created only when create is set (on); for apply it
-// would mean turning everything off.
-func (a *app) change(o *opts, create bool, edit func(*host.File) error) error {
+// change is the shared flow of on, off, apply, plan, rebuild and rollback:
+// edit the desired set, plan, show, confirm, run, and record the host file
+// on success. A missing host file is created only when create is set (on,
+// rollback); for apply it would mean turning everything off. Past the
+// confirmation, the command gets an entry in the state history.
+func (a *app) change(o *opts, create bool, edit func(*host.File) error) (err error) {
 	if err := a.load(o); err != nil {
 		return err
 	}
-	lock, err := a.userHalf().lock(!o.dry)
+	lock, err := a.lockUser(!o.dry)
 	if err != nil {
 		return err
 	}
 	defer lock.Release()
+	defer func() { a.record(err != nil) }()
 
 	path, err := a.hostPath()
 	if err != nil {
@@ -221,18 +223,22 @@ func (a *app) change(o *opts, create bool, edit func(*host.File) error) error {
 		return nil
 	}
 
-	if len(steps) > 0 {
+	hostChanged := !slices.Equal(beforeProfiles, f.Profiles) || !slices.Equal(beforeModules, f.Modules) || a.recreateHost
+	if len(steps) > 0 || a.confirmHost && hostChanged {
 		if !o.yes && !a.confirm("Proceed?") {
 			return errors.New("cancelled, nothing was changed")
 		}
+	}
+	if len(steps) > 0 || hostChanged {
+		a.begin()
+	}
+	if len(steps) > 0 {
 		if err := a.execute(steps, in, o); err != nil {
 			return err
 		}
-	}
-	if len(steps) > 0 {
 		fmt.Fprintln(a.stdout, "Done.")
 	}
-	if !slices.Equal(beforeProfiles, f.Profiles) || !slices.Equal(beforeModules, f.Modules) {
+	if hostChanged {
 		if err := f.Save(); err != nil {
 			return err
 		}

@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/grunclepug/arcus/internal/history"
 	"github.com/grunclepug/arcus/internal/layer"
 	"github.com/grunclepug/arcus/internal/machine"
 	"github.com/grunclepug/arcus/internal/plan"
@@ -20,13 +21,32 @@ import (
 
 // report collects doctor findings.
 type report struct {
-	w             io.Writer
-	issues, fixed int
+	w io.Writer
+	// issues are the findings, repairable those -fix has a repair for;
+	// fixed and failures count the repairs done and failed.
+	issues, repairable, fixed, failures int
+	// beforeRepair runs once, before the first repair: the history's
+	// point of no return.
+	beforeRepair func()
 }
 
 func (r *report) problem(format string, args ...any) {
 	r.issues++
 	fmt.Fprintf(r.w, "  ✗ "+format+"\n", args...)
+}
+
+// fixable is a problem -fix has a repair for.
+func (r *report) fixable(format string, args ...any) {
+	r.repairable++
+	r.problem(format, args...)
+}
+
+// repairing comes right before a repair changes anything.
+func (r *report) repairing() {
+	if r.beforeRepair != nil {
+		r.beforeRepair()
+		r.beforeRepair = nil
+	}
 }
 
 func (r *report) repaired(format string, args ...any) {
@@ -35,22 +55,27 @@ func (r *report) repaired(format string, args ...any) {
 }
 
 func (r *report) failed(err error) {
+	r.failures++
 	fmt.Fprintf(r.w, "    → fix failed: %v\n", err)
 }
 
+// err fails a repair run in which a repair failed; findings no repair
+// covers are not a failure of the run.
 func (r *report) err() error {
-	if r.issues > r.fixed {
-		return fmt.Errorf("%d problem(s) need attention", r.issues-r.fixed)
+	if r.failures > 0 {
+		return fmt.Errorf("%d repair(s) failed", r.failures)
 	}
 	return nil
 }
 
-// cmdDoctor audits both halves and the host file. With -fix it applies only
-// repairs that are provably safe: releasing what an interrupted restack
-// held, rolling back interrupted activations, finishing interrupted
-// teardowns and forgetting resources removed outside arcus. It never deletes
-// a file arcus did not create, except a home-half bytecode cache Python
-// rewrote over one arcus deployed.
+// cmdDoctor audits both halves, the host file, the machine and the state
+// history. With -fix it applies only repairs that are provably safe:
+// releasing what an interrupted restack held, rolling back interrupted
+// activations, finishing interrupted teardowns, forgetting resources
+// removed outside arcus and removing the history's stale locks. It never
+// deletes a file arcus did not create, except a home-half bytecode cache
+// Python rewrote over one arcus deployed. What is left afterwards comes
+// from a second, read-only audit, and decides the exit status.
 func (a *app) cmdDoctor(args []string) error {
 	var o opts
 	fs := a.flags("doctor", &o, false, false)
@@ -62,67 +87,136 @@ func (a *app) cmdDoctor(args []string) error {
 		return err
 	}
 	uh := a.userHalf()
-	lock, err := uh.lock(o.fix)
+	lock, err := a.lockUser(o.fix)
 	if err != nil {
 		return err
 	}
 	defer lock.Release()
+	failed := false
+	defer func() { a.record(failed) }()
 
-	r := &report{w: a.stdout}
+	// Before any repair, so the history can record it.
+	var unlocked []string
+	if o.fix {
+		unlocked = a.fixHistory()
+	}
+
+	ur := &report{w: a.stdout, beforeRepair: a.begin}
 	fmt.Fprintln(a.stdout, "User half:")
 	if st, err := uh.loadState(); err != nil {
-		r.problem("%v", err)
+		ur.problem("%v", err)
 	} else {
-		a.doctorHalf(uh, st, o.fix, r)
+		a.doctorHalf(uh, st, o.fix, ur)
+	}
+	userLeft := ur.issues
+	if o.fix && ur.repairable > 0 {
+		userLeft = a.auditHalf(uh, io.Discard, false).issues // under the lock held
 	}
 
 	// The system half is checked read-only first; sudo is only asked for
 	// when there is something to repair.
 	var buf bytes.Buffer
-	sr := &report{w: &buf}
-	fmt.Fprintln(&buf, "System half:")
-	sh := a.systemHalf()
-	func() {
-		lock, err := sh.lock(false)
-		if err != nil {
-			sr.problem("%v", err)
-			return
-		}
-		defer lock.Release()
-		if st, err := sh.loadState(); err != nil {
-			sr.problem("%v", err)
-		} else {
-			a.doctorHalf(sh, st, false, sr)
-		}
-	}()
-	r.issues += sr.issues
-	if o.fix && sr.issues > 0 {
-		err := a.sudo([]string{"-doctor", "-home", a.paths.Home, "-config", a.paths.Config})
-		if err == nil {
-			r.fixed += sr.issues
-		} else {
+	sr := a.auditHalf(a.systemHalf(), &buf, true)
+	systemLeft, systemFixed, sudoFailed := sr.issues, 0, false
+	if o.fix && sr.repairable > 0 {
+		a.begin()
+		if err := a.sudo([]string{"-doctor", "-home", a.paths.Home, "-config", a.paths.Config}); err != nil {
+			sudoFailed = true
 			fmt.Fprintf(a.stdout, "    → system repairs incomplete: %v\n", err)
 		}
+		systemLeft = a.auditHalf(a.systemHalf(), io.Discard, true).issues
+		systemFixed = max(0, sr.issues-systemLeft)
 	} else {
 		a.stdout.Write(buf.Bytes())
 	}
+	failed = ur.failures > 0 || sudoFailed
 
+	r := &report{w: a.stdout}
 	fmt.Fprintln(a.stdout, "Host file:")
 	a.doctorHost(&o, r)
 	fmt.Fprintln(a.stdout, "Machine:")
 	a.doctorMachine(&o, r)
 	a.doctorVersion(r)
+	fmt.Fprintln(a.stdout, "History:")
+	a.doctorHistory(r, unlocked)
 
+	issues := ur.issues + sr.issues + r.issues
+	left := userLeft + systemLeft + r.issues
 	switch {
-	case r.issues == 0:
+	case issues == 0:
 		fmt.Fprintln(a.stdout, "\nNo problems found.")
 		return nil
 	case o.fix:
-		fmt.Fprintf(a.stdout, "\n%d problem(s), %d fixed.\n", r.issues, r.fixed)
-		return r.err()
+		fmt.Fprintf(a.stdout, "\n%d problem(s), %d fixed.\n", issues, ur.fixed+systemFixed)
+		if left > 0 {
+			return fmt.Errorf("%d problem(s) need attention", left)
+		}
+		return nil
 	default:
-		fmt.Fprintf(a.stdout, "\n%d problem(s). 'arcus doctor -fix' applies the safe repairs.\n", r.issues)
-		return fmt.Errorf("doctor found %d problem(s)", r.issues)
+		fmt.Fprintf(a.stdout, "\n%d problem(s). 'arcus doctor -fix' applies the safe repairs.\n", issues)
+		return fmt.Errorf("doctor found %d problem(s)", issues)
+	}
+}
+
+// auditHalf checks a half read-only into w, under its shared lock when
+// lock is set.
+func (a *app) auditHalf(h *half, w io.Writer, lock bool) *report {
+	r := &report{w: w}
+	fmt.Fprintf(w, "%s half:\n", strings.ToUpper(h.name[:1])+h.name[1:])
+	if lock {
+		l, err := h.lock(false)
+		if err != nil {
+			r.problem("%v", err)
+			return r
+		}
+		defer l.Release()
+	}
+	if st, err := h.loadState(); err != nil {
+		r.problem("%v", err)
+	} else {
+		a.doctorHalf(h, st, false, r)
+	}
+	return r
+}
+
+// fixHistory removes the stale locks a killed arcus left in the history
+// and sets its mode back, under the exclusive user lock (a git child of a
+// killed arcus would still hold it). It returns the locks it removed.
+func (a *app) fixHistory() []string {
+	if !a.history {
+		return nil
+	}
+	repo := a.repo()
+	if _, err := repo.Check(true); err != nil {
+		return nil // doctorHistory reports it
+	}
+	removed, _ := repo.RemoveStaleLocks()
+	return removed
+}
+
+// doctorHistory reports a history arcus can't write to.
+func (a *app) doctorHistory(r *report, unlocked []string) {
+	if !a.history {
+		fmt.Fprintf(r.w, "  · %v\n", history.ErrNoGit)
+		return
+	}
+	for _, path := range unlocked {
+		fmt.Fprintf(r.w, "  · removed the stale lock %s\n", path)
+	}
+	repo := a.repo()
+	wrongMode, err := repo.Check(false)
+	if err != nil {
+		r.problem("%v", err)
+		return
+	}
+	if wrongMode {
+		r.problem("%s should be readable by you only (mode 0700); the next command that records, or 'arcus doctor -fix', sets it", repo.Dir)
+	}
+	for _, path := range repo.StaleLocks() {
+		r.problem("stale lock %s, left by a killed arcus: 'arcus doctor -fix' removes it", path)
+	}
+	if _, err := repo.Status(); err != nil {
+		r.problem("%v", err)
 	}
 }
 
@@ -336,14 +430,17 @@ var notes = map[string]string{
 
 // doctorHalf checks one half's ledgers, deployed files and ownership records.
 func (a *app) doctorHalf(h *half, st *state.State, fix bool, r *report) {
-	save := func() {
+	// A repair counts as done only once the state recording it is saved.
+	save := func() bool {
 		if err := st.Save(h.statePath()); err != nil {
 			r.failed(err)
+			return false
 		}
+		return true
 	}
-	dropLayer := func(name string) {
+	dropLayer := func(name string) bool {
 		st.Modules = slices.DeleteFunc(st.Modules, func(p string) bool { return p == name })
-		save()
+		return save()
 	}
 
 	ledgers, err := h.layer.ListLedgers()
@@ -354,8 +451,9 @@ func (a *app) doctorHalf(h *half, st *state.State, fix bool, r *report) {
 	// The hold goes first: a turn-off finished before it would find a held
 	// subdirectory keeping its own directory non-empty and lose track of it.
 	if slices.Contains(ledgers, layer.HoldLedger) {
-		r.problem("a restack of the %s layers was interrupted and kept the directories they created", h.name)
+		r.fixable("a restack of the %s layers was interrupted and kept the directories they created", h.name)
 		if fix {
+			r.repairing()
 			if err := h.layer.Release(); err != nil {
 				r.failed(fmt.Errorf("%w (removing %s by hand gives the held directories up)", err, h.layer.HoldPath()))
 				return
@@ -374,8 +472,9 @@ func (a *app) doctorHalf(h *half, st *state.State, fix bool, r *report) {
 		}
 		switch on := slices.Contains(st.Modules, name); {
 		case !on:
-			r.problem("%s has a %s ledger but no layer in the state (interrupted turn-on or orphan)", name, l.Status)
+			r.fixable("%s has a %s ledger but no layer in the state (interrupted turn-on or orphan)", name, l.Status)
 			if fix {
+				r.repairing()
 				if err := h.layer.Rollback(name); err != nil {
 					r.failed(err)
 				} else {
@@ -383,22 +482,22 @@ func (a *app) doctorHalf(h *half, st *state.State, fix bool, r *report) {
 				}
 			}
 		case l.Status == layer.StatusDeactivating:
-			r.problem("removing the %s files of %s was interrupted", h.layer.Subdir, name)
+			r.fixable("removing the %s files of %s was interrupted", h.layer.Subdir, name)
 			if fix {
+				r.repairing()
 				if err := h.layer.Deactivate(a.ctx, name, st.Modules, false); err != nil {
 					r.failed(err)
-				} else {
-					dropLayer(name)
+				} else if dropLayer(name) {
 					r.repaired("finished removing them")
 				}
 			}
 		case l.Status != layer.StatusActive:
-			r.problem("%s is in the %s stack but its ledger says %q", name, h.name, l.Status)
+			r.fixable("%s is in the %s stack but its ledger says %q", name, h.name, l.Status)
 			if fix {
+				r.repairing()
 				if err := h.layer.Rollback(name); err != nil {
 					r.failed(err)
-				} else {
-					dropLayer(name)
+				} else if dropLayer(name) {
 					r.repaired("rolled back the %s files of %s", h.layer.Subdir, name)
 				}
 			}
@@ -411,10 +510,12 @@ func (a *app) doctorHalf(h *half, st *state.State, fix bool, r *report) {
 			continue
 		}
 		if l == nil {
-			r.problem("%s is in the %s stack but has no ledger", name, h.name)
+			r.fixable("%s is in the %s stack but has no ledger", name, h.name)
 			if fix {
-				dropLayer(name)
-				r.repaired("removed it from the stack (nothing was recorded to undo)")
+				r.repairing()
+				if dropLayer(name) {
+					r.repaired("removed it from the stack (nothing was recorded to undo)")
+				}
 			}
 			continue
 		}
@@ -449,11 +550,13 @@ func (a *app) doctorHalf(h *half, st *state.State, fix bool, r *report) {
 			continue
 		}
 		if gone := st.Clone().Prune(kind, present); len(gone) > 0 {
-			r.problem("%s recorded as added by arcus are gone (removed outside arcus): %s", kind, strings.Join(gone, " "))
+			r.fixable("%s recorded as added by arcus are gone (removed outside arcus): %s", kind, strings.Join(gone, " "))
 			if fix {
+				r.repairing()
 				st.Prune(kind, present)
-				save()
-				r.repaired("forgot them")
+				if save() {
+					r.repaired("forgot them")
+				}
 			}
 		}
 	}

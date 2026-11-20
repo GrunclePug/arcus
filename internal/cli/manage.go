@@ -192,7 +192,7 @@ func (a *app) cmdRm(args []string) error {
 
 // cmdMv renames a user module, including its deployed layers, ownership
 // records and its entry in the host file.
-func (a *app) cmdMv(args []string) error {
+func (a *app) cmdMv(args []string) (err error) {
 	var o opts
 	fs := a.flags("mv", &o, false, false)
 	if err := fs.Parse(args); err != nil {
@@ -209,11 +209,12 @@ func (a *app) cmdMv(args []string) error {
 		return err
 	}
 	uh := a.userHalf()
-	lock, err := uh.lock(true)
+	lock, err := a.lockUser(true)
 	if err != nil {
 		return err
 	}
 	defer lock.Release()
+	defer func() { a.record(err != nil) }()
 
 	m, err := a.module(oldName)
 	if err != nil {
@@ -247,6 +248,19 @@ func (a *app) cmdMv(args []string) error {
 	if err != nil {
 		return err
 	}
+	ust, err := uh.loadState()
+	if err != nil {
+		return err
+	}
+	inUser, err := hasRecords(uh, ust, oldName)
+	if err != nil {
+		return err
+	}
+	// Renaming a module nothing selects or records changes no state: like
+	// new and rm, it isn't recorded.
+	if inUser || inSystem || f != nil && slices.Contains(f.Modules, oldName) {
+		a.begin()
+	}
 
 	if err := os.Rename(oldDir, newDir); err != nil {
 		return fmt.Errorf("renaming the module directory: %w", err)
@@ -255,8 +269,10 @@ func (a *app) cmdMv(args []string) error {
 	m.Name, m.Dir = newName, newDir
 	a.modules[newName] = m
 
-	if err := a.renameHalf(a.userHalf(), oldName, newName, oldDir, newDir); err != nil {
-		return err
+	if inUser {
+		if err := a.renameHalf(a.userHalf(), oldName, newName, oldDir, newDir); err != nil {
+			return err
+		}
 	}
 	if inSystem {
 		args := []string{"-mv", "-home", a.paths.Home, "-config", a.paths.Config, "--", oldName, newName, oldDir, newDir}

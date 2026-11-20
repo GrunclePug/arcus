@@ -19,7 +19,7 @@ import (
 // cmdMachine writes the machine module from the running system: what it
 // needs to boot and swap the way it is set up. Like plan and apply, it shows
 // the changes first.
-func (a *app) cmdMachine(args []string) error {
+func (a *app) cmdMachine(args []string) (err error) {
 	var o opts
 	fs := a.flags("machine", &o, true, false)
 	if err := fs.Parse(args); err != nil {
@@ -51,9 +51,17 @@ func (a *app) cmdMachine(args []string) error {
 	if o.dry {
 		return nil
 	}
+	// The user lock, for the history entry this command makes.
+	lock, err := a.lockUser(true)
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+	defer func() { a.record(err != nil) }()
 	if !o.yes && !a.confirm("Proceed?") {
 		return errors.New("cancelled, nothing was changed")
 	}
+	a.begin()
 	if err := a.sudo([]string{"-machine", "-hash", facts.Hash(), "-home", a.paths.Home, "-config", a.paths.Config}); err != nil {
 		return fmt.Errorf("writing the machine module: %w", err)
 	}

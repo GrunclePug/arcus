@@ -20,6 +20,7 @@ The project is in early development: until 1.0, commands and file formats may st
 * **Updates**: from a clone with `make install`, or `arcus update` for the latest release, checksum-verified.
 * **Plan, then act**: every change is shown before it runs, including diffs of changed system files.
 * **Least privilege**: arcus runs as you and asks sudo only for root steps; the root side refuses unless it recomputes exactly the steps you confirmed.
+* **State history**: every command that changes the machine is recorded in a private git repository, and `arcus rollback` puts the host file back as of any entry and applies it.
 * **Crash-safe**: a write-ahead ledger is fsynced before every file change, Ctrl-C rolls back cleanly, and `arcus doctor -fix` repairs what a power loss leaves behind.
 * **Plain files**: modules, profiles and the host file are TOML with comments; state is readable JSON.
 * **Config apart from state**: modules and profiles can live in a dotfiles repository; what a machine has on stays on the machine.
@@ -31,6 +32,7 @@ The project is in early development: until 1.0, commands and file formats may st
 
 * Arch Linux with sudo, and yay, paru or aurlock for AUR packages
 * `base-devel` for own builds
+* git for the state history (without it, arcus works and records nothing)
 * To build from source: Go 1.27.3 or newer and Make
 
 ### Download
@@ -71,6 +73,8 @@ arcus clean                # remove packages no module lists (shows its plan, as
 arcus rebuild dwm-arcus    # rebuild an own build whose recipe didn't change
 arcus machine              # write this machine's module: kernel, bootloader, filesystems, swap
 arcus update               # replace arcus with the latest release
+arcus history              # the latest entries of the state history
+arcus rollback 3f2a91c     # put the host file back as of an entry and apply it
 ```
 
 When a module that's on changes, `apply` redeploys it and the modules above it, and keeps the directories their files live in, so programs watching them keep working. If a redeploy is cut short in a way that leaves its bookkeeping behind (a crash or power loss), `plan` and `apply` stop until you run `arcus doctor -fix`, then `arcus apply`.
@@ -130,6 +134,16 @@ modules  = ["aurora"]
 | `aur_helper` in `config.toml` | | `yay` | AUR helper: `yay`, `paru` or `aurlock`. The installer builds yay or paru from the AUR; aurlock has to come from a module's own build. |
 | `protected` in `config.toml` | | base, base-devel, linux, linux-firmware, sudo, pacman, systemd, the AUR helper | Extra packages arcus never removes |
 | `module_dirs` in `config.toml` | | none | Extra directories of user modules |
+
+## State and history
+
+arcus records the machine's state in a bare git repository at `~/.local/state/arcus/history`, readable only by you: the host file, both halves' state and ledgers, and the machine module's `module.toml`, as arcus read them. It records what arcus decided and did, never the contents of the files modules deploy. The system half is recorded as it was when the entry was made.
+
+Each command that changes the machine (`on`, `off`, `apply`, `rebuild`, `rollback`, `clean`, `machine`, `mv` of a module something selects or records, and `doctor -fix` when it repairs something) adds an entry once it is past its confirmation, named after the command line, with ` (failed)` when it failed. Plans, dry runs and declined confirmations add nothing. A change made in between, such as a hand edit of the host file or a run without git, becomes an entry of its own, `unrecorded changes`, before the next command's; the first entry on a machine with state is `history starts`.
+
+When `~/.config/arcus` is in a git repository, as with a dotfiles repository, each entry also notes that repository's commit, and whether the config directory had uncommitted changes. Only that repository is noted, not other `module_dirs`. Recording and rollback never check out a revision of it or edit it; git may run the helpers you configured for it, as your own `git status` would.
+
+`arcus history [count]` lists the latest entries, with the dotfiles commit and a `*` when it had changes. `arcus rollback <entry>` puts the host file's profiles and modules back as they were after that entry, keeping the rest of the file, and then does what `apply` does, with the same plan, confirmation and flags; to undo the latest command, roll back to the entry before it. It doesn't change the modules: when their repository has moved on since the entry, it says so. If a killed arcus left a lock in the history, the next commands warn and `arcus doctor -fix` removes it. To drop the history, remove its directory: `rm -rf ~/.local/state/arcus/history`.
 
 ## Development
 

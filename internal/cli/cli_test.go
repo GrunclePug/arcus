@@ -39,6 +39,9 @@ type env struct {
 	exe      string
 	version  string
 	releases string
+	// history turns the state history on: real git, so only the tests of
+	// it do.
+	history bool
 }
 
 func newEnv(t *testing.T) *env {
@@ -64,7 +67,7 @@ func must(t *testing.T, err error) {
 func (e *env) app(stdin string) *app {
 	a := &app{
 		ctx: e.ctx, stdin: strings.NewReader(stdin), stdout: &e.out, stderr: &e.out,
-		root: e.root, euid: 1000, getenv: os.Getenv,
+		root: e.root, euid: 1000, uid: os.Getuid(), history: e.history, getenv: os.Getenv,
 		hostname: func() (string, error) { return "testhost", nil },
 		exe:      func() (string, error) { return e.exe, nil },
 		version:  e.version, releases: e.releases,
