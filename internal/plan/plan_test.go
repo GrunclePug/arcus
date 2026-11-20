@@ -245,6 +245,11 @@ func TestMergeByStageAndHash(t *testing.T) {
 	if Hash(x) == Hash(y) {
 		t.Error("hash must change with what a conflicting package conflicts with")
 	}
+	x[0].Stage, y[0].Stage = Packages, Packages
+	y[0].Changes = []string{"x old: conflicts with new; needed by a"}
+	if Hash(x) == Hash(y) {
+		t.Error("what needs a repository package being removed must change the hash")
+	}
 }
 
 func localSteps(names ...string) []Step {
@@ -658,6 +663,14 @@ func TestLocalKeepsWhatABatchNeeds(t *testing.T) {
 			world{},
 			world{"e": pkg("p:virt", "d:virt"), "b": pkg("p:virt", "b:e")},
 			"e|b", nil},
+		{"own provides is still a build need",
+			world{},
+			world{"e": pkg("p:virt", "b:virt"), "p": pkg("p:virt")},
+			"p|e", nil},
+		{"a build has what its own install will remove",
+			world{"x": pkg("p:virt")},
+			world{"c": pkg("b:virt", "c:x"), "p": pkg("p:virt", "b:c")},
+			"c|p", nil},
 		{"versioned own provides waits",
 			world{},
 			world{"e": pkg("p:virt", "d:virt>=2"), "b": pkg("p:virt=2", "b:z"), "z": {}},
@@ -756,7 +769,7 @@ func TestCheckBatch(t *testing.T) {
 			append([]Step{removes("x")}, install("c", "r")...), []string{"c"}, "add it to depends in the PKGBUILD"},
 		{"a soname dependency counts by name",
 			world{"lib": pkg("p:libfoo.so=1-64")}, world{"c": pkg("d:libfoo.so=1-64"), "r": pkg("c:lib")},
-			append([]Step{removes("lib")}, install("c", "r")...), nil, "c needs libfoo.so=1-64"},
+			append([]Step{removes("lib")}, install("c", "r")...), nil, "c needs libfoo.so=1-64, which this batch would remove and nothing pending provides; this batch was not installed: install a provider of libfoo.so first"},
 		{"a same-name upgrade stops providing what another install needs",
 			world{"x": pkg("p:virt"), "y": pkg("p:virt")}, world{"x": {}, "c": pkg("d:virt"), "r": pkg("c:y")},
 			append([]Step{removes("y")}, install("x", "c", "r")...), nil, "c needs virt"},

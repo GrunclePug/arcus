@@ -320,7 +320,7 @@ func Hash(steps []Step) string {
 			if strings.HasPrefix(c, "! ") {
 				continue
 			}
-			if strings.HasPrefix(c, "x ") {
+			if s.Stage == LocalPackages && strings.HasPrefix(c, "x ") {
 				c, _, _ = strings.Cut(c, neededBy)
 			}
 			changes = append(changes, c)
@@ -647,8 +647,9 @@ func nextBatch(pending []Step, incoming, installed map[string]system.Package) ([
 }
 
 // localNeeds lists what each pending own build needs from the other ones.
-// A name the build provides itself is no need, unless the dependency has a
-// version, which arcus doesn't compare. A dependency on the name of a
+// A name the build provides itself is no install need, unless the
+// dependency has a version, which arcus doesn't compare; to build, it needs
+// the name installed like any other. A dependency on the name of a
 // pending own build needs that one, even while an older version is
 // installed: its recipe changed. Otherwise an installed satisfier (see
 // satisfiers) meets a build need, and an install need too unless every
@@ -678,7 +679,7 @@ func localNeeds(steps []Step, incoming, installed map[string]system.Package) map
 				if i := strings.IndexAny(dep, "<>="); i >= 0 {
 					name, versioned = dep[:i], true
 				}
-				if name == n || !versioned && provides(self, name) {
+				if name == n || !build && !versioned && provides(self, name) {
 					continue
 				}
 				if pending[name] {
@@ -686,7 +687,12 @@ func localNeeds(steps []Step, incoming, installed map[string]system.Package) map
 					continue
 				}
 				of := slices.DeleteFunc(providers(incoming, name), func(p string) bool { return !pending[p] || p == n })
-				sat := satisfiers(installed, name, n, self)
+				// The build runs before the consumer's own install removes
+				// anything, so only an install need loses those satisfiers.
+				sat := satisfiers(installed, name, "", system.Package{})
+				if !build {
+					sat = satisfiers(installed, name, n, self)
+				}
 				switch {
 				case versioned || len(sat) == 0:
 					if len(of) > 0 {
@@ -799,7 +805,9 @@ func cycle(pending []Step, needs map[string][]need) []string {
 // for is let through, as Conflicts lets "needed by" removals through.
 //
 // The refusal heals on the next run, which plans from the built package,
-// unless the build is rebuilt: then the recipe has to list the dependency.
+// unless the build is rebuilt (then the recipe has to list the dependency)
+// or the dependency has a version and nothing pending provides it (then
+// the next run plans the same batch, so a provider has to come first).
 // With nothing pending providing it, the next run delays the build behind
 // the removal, where pacman decides.
 func CheckBatch(h Half, steps []Step, rebuild []string) error {
@@ -847,8 +855,13 @@ func CheckBatch(h Half, steps []Step, rebuild []string) error {
 			if _, ok := after[name]; ok || len(providers(after, name)) > 0 {
 				continue
 			}
-			if slices.Contains(rebuild, t) {
+			switch {
+			case slices.Contains(rebuild, t):
 				return fmt.Errorf("%s needs %s, which this batch would remove, and its recipe doesn't list it: add it to depends in the PKGBUILD; this batch was not installed", t, dep)
+			case name != dep:
+				// A versioned need waits only for a pending provider, so with
+				// none the next run plans the same batch.
+				return fmt.Errorf("%s needs %s, which this batch would remove and nothing pending provides; this batch was not installed: install a provider of %s first", t, dep, name)
 			}
 			return fmt.Errorf("%s needs %s, which this batch would remove; this batch was not installed, run the command again", t, dep)
 		}
