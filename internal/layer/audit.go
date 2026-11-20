@@ -192,7 +192,8 @@ func (s *Stacker) Stale(module string) ([]Change, error) {
 		recorded[e.Src] = true
 		info, err := os.Lstat(e.Src)
 		switch {
-		case err != nil:
+		case err != nil, inCache(e.Src):
+			// A cache deployed before caches were skipped goes with the next redeploy.
 			changes = append(changes, Change{'-', e.Host, e.Src})
 		case e.Kind == KindCopy:
 			sum, err := hashFile(e.Src)

@@ -9,6 +9,7 @@ import (
 	iofs "io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -31,6 +32,11 @@ func skipCache(d iofs.DirEntry) error {
 		return filepath.SkipDir
 	}
 	return nil
+}
+
+// inCache reports whether path lies inside a Python bytecode cache.
+func inCache(path string) bool {
+	return slices.Contains(strings.Split(filepath.ToSlash(path), "/"), "__pycache__")
 }
 
 func exists(path string) bool {

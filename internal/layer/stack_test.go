@@ -755,6 +755,25 @@ func TestPythonBytecodeCachesAreNotDeployed(t *testing.T) {
 	})
 }
 
+func TestCachesDeployedBeforeTheSkipAreStale(t *testing.T) {
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		sb.moduleFile("p", "bin/tool", "tool")
+		cache := sb.moduleFile("p", "bin/__pycache__/tool.cpython-314.pyc", "cache")
+		must(t, sb.activate("p"))
+		// Simulate a ledger written by a version that deployed caches.
+		l, err := sb.s.LoadLedger("p")
+		must(t, err)
+		host := filepath.Join(sb.host, "bin/__pycache__/tool.cpython-314.pyc")
+		l.Entries = append(l.Entries, Entry{Host: host, Src: cache, Kind: l.Entries[0].Kind})
+		must(t, sb.s.saveLedger(l))
+		changes, err := sb.s.Stale("p")
+		must(t, err)
+		if len(changes) != 1 || changes[0].Op != '-' || changes[0].Src != cache {
+			t.Fatalf("changes = %v", changes)
+		}
+	})
+}
+
 func TestVerifyWritePrivilegeAcceptsMissingParents(t *testing.T) {
 	dir := t.TempDir()
 	if err := VerifyWritePrivilege(filepath.Join(dir, "a", "b", "c", "file")); err != nil {
