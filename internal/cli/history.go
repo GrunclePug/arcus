@@ -56,7 +56,17 @@ func (a *app) warnHistory(err error) {
 // own first; only when that worked is the command's own entry armed, which
 // record makes when the command returns. So a change is never put in the
 // wrong entry: when the first step fails, the next command's records it.
-func (a *app) begin() {
+// It returns an error when the command was cancelled meanwhile, so nothing
+// changes after a Ctrl-C there.
+func (a *app) begin() error {
+	a.beginHistory()
+	if err := a.ctx.Err(); err != nil {
+		return errors.New("cancelled, nothing was changed")
+	}
+	return nil
+}
+
+func (a *app) beginHistory() {
 	if !a.history || a.rec.begun {
 		return
 	}
@@ -116,6 +126,10 @@ func (a *app) record(failed bool) {
 	}
 	msg += "Arcus: " + a.version + "\n"
 	repo := a.repo()
+	if _, err := repo.Check(true); err != nil {
+		a.warnHistory(err)
+		return
+	}
 	if _, err := repo.Commit(files, msg, true); err != nil {
 		a.warnHistory(err)
 		return

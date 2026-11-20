@@ -205,6 +205,9 @@ func TestBrokenRepositories(t *testing.T) {
 		{"corrupt branch", func(t *testing.T, r *Repo) {
 			must(t, os.WriteFile(filepath.Join(r.Dir, "refs", "heads", "arcus"), []byte("garbage\n"), 0o644))
 		}},
+		{"malformed HEAD", func(t *testing.T, r *Repo) {
+			must(t, os.WriteFile(filepath.Join(r.Dir, "HEAD"), []byte("garbage\n"), 0o644))
+		}},
 		{"detached HEAD", func(t *testing.T, r *Repo) {
 			c := git(t, r.Dir, "rev-parse", Branch)
 			must(t, os.WriteFile(filepath.Join(r.Dir, "HEAD"), []byte(c+"\n"), 0o644))

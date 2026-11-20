@@ -101,7 +101,8 @@ func (a *app) cmdDoctor(args []string) error {
 		unlocked = a.fixHistory()
 	}
 
-	ur := &report{w: a.stdout, beforeRepair: a.begin}
+	// A repair already checks for a cancelled run itself.
+	ur := &report{w: a.stdout, beforeRepair: a.beginHistory}
 	fmt.Fprintln(a.stdout, "User half:")
 	if st, err := uh.loadState(); err != nil {
 		ur.problem("%v", err)
@@ -119,12 +120,19 @@ func (a *app) cmdDoctor(args []string) error {
 	sr := a.auditHalf(a.systemHalf(), &buf, true)
 	systemLeft, systemFixed, sudoFailed := sr.issues, 0, false
 	if o.fix && sr.repairable > 0 {
-		a.begin()
-		if err := a.sudo([]string{"-doctor", "-home", a.paths.Home, "-config", a.paths.Config}); err != nil {
+		err := a.begin()
+		if err == nil {
+			err = a.sudo([]string{"-doctor", "-home", a.paths.Home, "-config", a.paths.Config})
+		}
+		if err != nil {
 			sudoFailed = true
 			fmt.Fprintf(a.stdout, "    → system repairs incomplete: %v\n", err)
 		}
-		systemLeft = a.auditHalf(a.systemHalf(), io.Discard, true).issues
+		var after bytes.Buffer
+		systemLeft = a.auditHalf(a.systemHalf(), &after, true).issues
+		if sudoFailed && systemLeft > 0 {
+			fmt.Fprint(a.stdout, strings.Replace(after.String(), "System half:", "System half, what is left:", 1))
+		}
 		systemFixed = max(0, sr.issues-systemLeft)
 	} else {
 		a.stdout.Write(buf.Bytes())

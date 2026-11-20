@@ -259,7 +259,9 @@ func (a *app) cmdMv(args []string) (err error) {
 	// Renaming a module nothing selects or records changes no state: like
 	// new and rm, it isn't recorded.
 	if inUser || inSystem || f != nil && slices.Contains(f.Modules, oldName) {
-		a.begin()
+		if err := a.begin(); err != nil {
+			return err
+		}
 	}
 
 	if err := os.Rename(oldDir, newDir); err != nil {

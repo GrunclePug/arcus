@@ -107,7 +107,14 @@ func (r *Repo) Status() (Status, error) {
 		if exitCode(err) < 0 {
 			return 0, err
 		}
-		return Unborn, nil // an init cut short: nothing to lose
+		// An init cut short has nothing to lose: init never writes the
+		// branch. With the branch there, the repository is damaged.
+		for _, ref := range []string{filepath.Join("refs", "heads", "arcus"), "packed-refs"} {
+			if _, err := os.Lstat(filepath.Join(r.Dir, ref)); err == nil {
+				return 0, &BrokenError{r.Dir, "git doesn't recognise it as a repository"}
+			}
+		}
+		return Unborn, nil
 	}
 	head, err := r.out("symbolic-ref", "-q", "--no-recurse", "HEAD")
 	if exitCode(err) < 0 && err != nil {
@@ -340,9 +347,11 @@ func (r *Repo) RemoveStaleLocks() ([]string, error) {
 // SweepIndexes removes the private indexes a killed arcus left, under the
 // user lock.
 func (r *Repo) SweepIndexes() {
-	left, _ := filepath.Glob(filepath.Join(r.Dir, "arcus-index-*"))
-	for _, dir := range left {
-		os.RemoveAll(dir)
+	entries, _ := os.ReadDir(r.Dir)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "arcus-index-") {
+			os.RemoveAll(filepath.Join(r.Dir, e.Name()))
+		}
 	}
 }
 

@@ -621,3 +621,57 @@ func TestReadOnlyCommandsRunNoGit(t *testing.T) {
 		t.Errorf("git ran:\n%s", data)
 	}
 }
+
+// A Ctrl-C while begin records stops the command before it changes
+// anything.
+func TestCancelDuringBeginChangesNothing(t *testing.T) {
+	e := histEnv(t)
+	e.sys.SetPackages("base", "orphan")
+	e.module("m", "[packages]\npacman = [\"base\"]\n", nil)
+	e.module("a", "", map[string]string{"home/.a": "a"})
+	e.module("b", "requires = [\"a\"]\n", nil)
+	must(t, e.run("on", "-y", "m"))
+	must(t, e.run("on", "-y", "b"))
+	hostBefore, err := os.ReadFile(e.hostPath())
+	must(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	e.ctx = ctx
+	e.sudos = 0
+	if err := e.run("clean", "-y"); err == nil || !strings.Contains(err.Error(), "cancelled") {
+		t.Errorf("clean = %v", err)
+	}
+	if err := e.run("on", "-y", "a"); err == nil || !strings.Contains(err.Error(), "cancelled") {
+		t.Errorf("on = %v", err)
+	}
+	if e.sudos != 0 || !slices.Contains(e.sys.Packages(), "orphan") {
+		t.Errorf("clean ran: %d sudo calls, packages %v", e.sudos, e.sys.Packages())
+	}
+	if now, _ := os.ReadFile(e.hostPath()); !bytes.Equal(now, hostBefore) {
+		t.Error("a cancelled on changed the host file")
+	}
+}
+
+// When the entry of what changed in between can't be made, the command
+// makes none either: the next command's entry would otherwise claim it.
+func TestFailedPreCommitMakesNoEntry(t *testing.T) {
+	e := histEnv(t)
+	e.module("a", "", map[string]string{"home/.a": "a"})
+	e.module("b", "", map[string]string{"home/.b": "b"})
+	e.module("c", "", map[string]string{"home/.c": "c"})
+	must(t, e.run("on", "-y", "a"))
+	must(t, os.WriteFile(e.hostPath(), []byte("# edited\nmodules = [\"a\"]\n"), 0o644))
+
+	real, err := exec.LookPath("git")
+	must(t, err)
+	bin, flag := t.TempDir(), filepath.Join(t.TempDir(), "failed")
+	script := "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = update-ref ] && [ ! -e " + flag + " ]; then touch " + flag + "; exit 1; fi\ndone\nexec " + real + " \"$@\"\n"
+	must(t, os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755))
+	path := os.Getenv("PATH")
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+path)
+	must(t, e.run("on", "-y", "b"))
+	t.Setenv("PATH", path)
+	e.wantSubjects("on -y a")
+	must(t, e.run("on", "-y", "c"))
+	e.wantSubjects("on -y c", "unrecorded changes", "on -y a")
+}

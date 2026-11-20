@@ -230,7 +230,9 @@ func (a *app) change(o *opts, create bool, edit func(*host.File) error) (err err
 		}
 	}
 	if len(steps) > 0 || hostChanged {
-		a.begin()
+		if err := a.begin(); err != nil {
+			return err
+		}
 	}
 	if len(steps) > 0 {
 		if err := a.execute(steps, in, o); err != nil {
