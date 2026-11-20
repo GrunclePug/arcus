@@ -665,8 +665,10 @@ func TestFailedPreCommitMakesNoEntry(t *testing.T) {
 	real, err := exec.LookPath("git")
 	must(t, err)
 	bin, flag := t.TempDir(), filepath.Join(t.TempDir(), "failed")
-	script := "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = update-ref ] && [ ! -e " + flag + " ]; then touch " + flag + "; exit 1; fi\ndone\nexec " + real + " \"$@\"\n"
+	script := "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = update-ref ] && [ ! -e \"$FAIL_FLAG\" ]; then touch \"$FAIL_FLAG\"; exit 1; fi\ndone\nexec \"$REAL_GIT\" \"$@\"\n"
 	must(t, os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755))
+	t.Setenv("FAIL_FLAG", flag)
+	t.Setenv("REAL_GIT", real)
 	path := os.Getenv("PATH")
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+path)
 	must(t, e.run("on", "-y", "b"))
@@ -674,4 +676,23 @@ func TestFailedPreCommitMakesNoEntry(t *testing.T) {
 	e.wantSubjects("on -y a")
 	must(t, e.run("on", "-y", "c"))
 	e.wantSubjects("on -y c", "unrecorded changes", "on -y a")
+}
+
+// A cancelled doctor -fix starts no repair.
+func TestCancelledDoctorFixRepairsNothing(t *testing.T) {
+	e := histEnv(t)
+	e.module("a", "", map[string]string{"home/.a": "a"})
+	must(t, e.run("on", "-y", "a"))
+	e.module("orphan", "", map[string]string{"home/.orphan": "x"})
+	dirs := map[string]string{"orphan": filepath.Join(e.home, ".config", "arcus", "modules", "orphan")}
+	must(t, layer.NewHome(e.home, filepath.Join(e.home, ".local", "state", "arcus"), dirs).Activate(context.Background(), "orphan", nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	e.ctx = ctx
+	if err := e.run("doctor", "-fix"); err == nil {
+		t.Error("a cancelled doctor -fix succeeded")
+	}
+	if e.read("home/u/.orphan") == "<missing>" {
+		t.Error("a cancelled doctor -fix rolled the orphan back")
+	}
 }

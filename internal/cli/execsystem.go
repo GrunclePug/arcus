@@ -96,7 +96,7 @@ func (a *app) execSystem(args []string) error {
 		if err != nil {
 			return err
 		}
-		r := &report{w: a.stdout}
+		r := &report{w: a.stdout, ctx: a.ctx}
 		fmt.Fprintln(a.stdout, "System half:")
 		a.doctorHalf(h, st, true, r)
 		return r.err()

@@ -110,7 +110,7 @@ func (r *Repo) Status() (Status, error) {
 		// An init cut short has nothing to lose: init never writes the
 		// branch. With the branch there, the repository is damaged.
 		for _, ref := range []string{filepath.Join("refs", "heads", "arcus"), "packed-refs"} {
-			if _, err := os.Lstat(filepath.Join(r.Dir, ref)); err == nil {
+			if _, err := os.Lstat(filepath.Join(r.Dir, ref)); !errors.Is(err, iofs.ErrNotExist) {
 				return 0, &BrokenError{r.Dir, "git doesn't recognise it as a repository"}
 			}
 		}

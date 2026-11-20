@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -28,6 +29,8 @@ type report struct {
 	// beforeRepair runs once, before the first repair: the history's
 	// point of no return.
 	beforeRepair func()
+	// ctx stops the repairs not yet started when it is cancelled.
+	ctx context.Context
 }
 
 func (r *report) problem(format string, args ...any) {
@@ -41,12 +44,18 @@ func (r *report) fixable(format string, args ...any) {
 	r.problem(format, args...)
 }
 
-// repairing comes right before a repair changes anything.
-func (r *report) repairing() {
+// repairing comes right before a repair changes anything; it reports
+// whether to go ahead, which a cancelled run doesn't.
+func (r *report) repairing() bool {
 	if r.beforeRepair != nil {
 		r.beforeRepair()
 		r.beforeRepair = nil
 	}
+	if r.ctx != nil && r.ctx.Err() != nil {
+		r.failed(errors.New("cancelled"))
+		return false
+	}
+	return true
 }
 
 func (r *report) repaired(format string, args ...any) {
@@ -101,8 +110,7 @@ func (a *app) cmdDoctor(args []string) error {
 		unlocked = a.fixHistory()
 	}
 
-	// A repair already checks for a cancelled run itself.
-	ur := &report{w: a.stdout, beforeRepair: a.beginHistory}
+	ur := &report{w: a.stdout, beforeRepair: a.beginHistory, ctx: a.ctx}
 	fmt.Fprintln(a.stdout, "User half:")
 	if st, err := uh.loadState(); err != nil {
 		ur.problem("%v", err)
@@ -130,7 +138,7 @@ func (a *app) cmdDoctor(args []string) error {
 		}
 		var after bytes.Buffer
 		systemLeft = a.auditHalf(a.systemHalf(), &after, true).issues
-		if sudoFailed && systemLeft > 0 {
+		if systemLeft > 0 {
 			fmt.Fprint(a.stdout, strings.Replace(after.String(), "System half:", "System half, what is left:", 1))
 		}
 		systemFixed = max(0, sr.issues-systemLeft)
@@ -460,8 +468,7 @@ func (a *app) doctorHalf(h *half, st *state.State, fix bool, r *report) {
 	// subdirectory keeping its own directory non-empty and lose track of it.
 	if slices.Contains(ledgers, layer.HoldLedger) {
 		r.fixable("a restack of the %s layers was interrupted and kept the directories they created", h.name)
-		if fix {
-			r.repairing()
+		if fix && r.repairing() {
 			if err := h.layer.Release(); err != nil {
 				r.failed(fmt.Errorf("%w (removing %s by hand gives the held directories up)", err, h.layer.HoldPath()))
 				return
@@ -481,8 +488,7 @@ func (a *app) doctorHalf(h *half, st *state.State, fix bool, r *report) {
 		switch on := slices.Contains(st.Modules, name); {
 		case !on:
 			r.fixable("%s has a %s ledger but no layer in the state (interrupted turn-on or orphan)", name, l.Status)
-			if fix {
-				r.repairing()
+			if fix && r.repairing() {
 				if err := h.layer.Rollback(name); err != nil {
 					r.failed(err)
 				} else {
@@ -491,8 +497,7 @@ func (a *app) doctorHalf(h *half, st *state.State, fix bool, r *report) {
 			}
 		case l.Status == layer.StatusDeactivating:
 			r.fixable("removing the %s files of %s was interrupted", h.layer.Subdir, name)
-			if fix {
-				r.repairing()
+			if fix && r.repairing() {
 				if err := h.layer.Deactivate(a.ctx, name, st.Modules, false); err != nil {
 					r.failed(err)
 				} else if dropLayer(name) {
@@ -501,8 +506,7 @@ func (a *app) doctorHalf(h *half, st *state.State, fix bool, r *report) {
 			}
 		case l.Status != layer.StatusActive:
 			r.fixable("%s is in the %s stack but its ledger says %q", name, h.name, l.Status)
-			if fix {
-				r.repairing()
+			if fix && r.repairing() {
 				if err := h.layer.Rollback(name); err != nil {
 					r.failed(err)
 				} else if dropLayer(name) {
@@ -519,8 +523,7 @@ func (a *app) doctorHalf(h *half, st *state.State, fix bool, r *report) {
 		}
 		if l == nil {
 			r.fixable("%s is in the %s stack but has no ledger", name, h.name)
-			if fix {
-				r.repairing()
+			if fix && r.repairing() {
 				if dropLayer(name) {
 					r.repaired("removed it from the stack (nothing was recorded to undo)")
 				}
@@ -559,8 +562,7 @@ func (a *app) doctorHalf(h *half, st *state.State, fix bool, r *report) {
 		}
 		if gone := st.Clone().Prune(kind, present); len(gone) > 0 {
 			r.fixable("%s recorded as added by arcus are gone (removed outside arcus): %s", kind, strings.Join(gone, " "))
-			if fix {
-				r.repairing()
+			if fix && r.repairing() {
 				st.Prune(kind, present)
 				if save() {
 					r.repaired("forgot them")

@@ -208,6 +208,12 @@ func TestBrokenRepositories(t *testing.T) {
 		{"malformed HEAD", func(t *testing.T, r *Repo) {
 			must(t, os.WriteFile(filepath.Join(r.Dir, "HEAD"), []byte("garbage\n"), 0o644))
 		}},
+		{"malformed HEAD, unreadable refs", func(t *testing.T, r *Repo) {
+			must(t, os.WriteFile(filepath.Join(r.Dir, "HEAD"), []byte("garbage\n"), 0o644))
+			heads := filepath.Join(r.Dir, "refs", "heads")
+			must(t, os.Chmod(heads, 0))
+			t.Cleanup(func() { os.Chmod(heads, 0o755) })
+		}},
 		{"detached HEAD", func(t *testing.T, r *Repo) {
 			c := git(t, r.Dir, "rev-parse", Branch)
 			must(t, os.WriteFile(filepath.Join(r.Dir, "HEAD"), []byte(c+"\n"), 0o644))
