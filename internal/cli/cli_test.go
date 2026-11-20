@@ -1493,3 +1493,119 @@ func TestUserNameRegex(t *testing.T) {
 		}
 	}
 }
+
+// loadedHalf returns one half of a loaded app, for a test to act on the
+// layers directly as an interrupted run would have left them.
+func (e *env) loadedHalf(system bool) *half {
+	e.t.Helper()
+	a := e.app("")
+	must(e.t, a.load(&opts{}))
+	if system {
+		return a.systemHalf()
+	}
+	return a.userHalf()
+}
+
+// A restack interrupted in either half stops plan and apply until doctor
+// releases it; after that the layers converge and turn off cleanly.
+func TestInterruptedRestackNeedsDoctor(t *testing.T) {
+	for _, system := range []bool{false, true} {
+		for _, at := range []string{"after an off", "after the last on"} {
+			t.Run(fmt.Sprintf("system=%v/%s", system, at), func(t *testing.T) {
+				e := newEnv(t)
+				e.module("a", "", map[string]string{"home/.config/a/x": "a", "system/etc/a/x": "a"})
+				e.module("b", "", map[string]string{"home/.config/b/y": "b", "system/etc/b/y": "b"})
+				pristine := e.snapshot()
+				must(t, os.WriteFile(e.hostPath(), []byte("modules = [\"a\", \"b\"]\n"), 0o644))
+				must(t, e.run("apply", "-y"))
+
+				h := e.loadedHalf(system)
+				st, err := h.loadState()
+				must(t, err)
+				must(t, h.layer.Hold())
+				must(t, h.layer.Deactivate(e.ctx, "b", st.Modules, false))
+				st.Modules = slices.DeleteFunc(st.Modules, func(m string) bool { return m == "b" })
+				if at == "after the last on" {
+					must(t, h.layer.Activate(e.ctx, "b", st.Modules))
+					st.Modules = append(st.Modules, "b")
+				}
+				must(t, st.Save(h.statePath()))
+
+				stuck := e.snapshot()
+				for _, args := range [][]string{{"plan"}, {"apply", "-y"}} {
+					if err := e.run(args...); err == nil || !strings.Contains(err.Error(), "doctor -fix") {
+						t.Fatalf("%v = %v, want the doctor hint", args, err)
+					}
+				}
+				assertSame(t, stuck, e.snapshot())
+
+				_ = e.run("doctor", "-fix") // non-zero while the host file still needs apply
+				if _, err := os.Stat(h.layer.HoldPath()); !errors.Is(err, iofs.ErrNotExist) {
+					t.Fatalf("hold after doctor -fix: %v\n%s", err, e.out.String())
+				}
+				must(t, e.run("apply", "-y"))
+				must(t, e.run("off", "-y", "a"))
+				must(t, e.run("off", "-y", "b"))
+				assertSame(t, pristine, e.snapshot())
+			})
+		}
+	}
+}
+
+// A system hold that appears after apply checked for one, left by another
+// run with its own user state, stops the root stage before it plans.
+func TestRootStageRechecksTheHold(t *testing.T) {
+	e := newEnv(t)
+	e.module("a", "", map[string]string{"system/etc/a/x": "a"})
+	must(t, os.WriteFile(e.hostPath(), []byte("modules = [\"a\"]\n"), 0o644))
+	hold := e.loadedHalf(true).layer.HoldPath()
+
+	a := e.app("")
+	sudo := a.sudo
+	a.sudo = func(args []string) error {
+		must(t, os.MkdirAll(filepath.Dir(hold), 0o755))
+		must(t, os.WriteFile(hold, []byte(`{"version":1,"module":"_restack","status":"active"}`), 0o644))
+		return sudo(args)
+	}
+	if err := a.run([]string{"apply", "-y"}); err == nil || !strings.Contains(err.Error(), "doctor -fix") {
+		t.Fatalf("apply = %v, want the doctor hint from the root stage", err)
+	}
+	if got := e.read("etc/a/x"); got != "<missing>" {
+		t.Errorf("etc/a/x = %q, deployed despite the hold", got)
+	}
+}
+
+// doctor releases a hold before it finishes an interrupted turn-off, so a
+// directory the turn-off created around a held one isn't stranded, whatever
+// the module's name sorts like.
+func TestDoctorReleasesTheHoldFirst(t *testing.T) {
+	for _, x := range []string{"a", "0a"} {
+		t.Run(x, func(t *testing.T) {
+			e := newEnv(t)
+			e.module("base", "", map[string]string{"home/.config/app/base": "base"})
+			e.module(x, "", map[string]string{"home/.config/app/eq/x": "x"})
+			e.module("zb", "", map[string]string{"home/.config/app/eq/deep/y": "y"})
+			pristine := e.snapshot()
+			must(t, os.WriteFile(e.hostPath(), []byte(fmt.Sprintf("modules = [\"base\", %q, \"zb\"]\n", x)), 0o644))
+			must(t, e.run("apply", "-y"))
+
+			// A restack from x died while turning x off.
+			h := e.loadedHalf(false)
+			st, err := h.loadState()
+			must(t, err)
+			must(t, h.layer.Hold())
+			must(t, h.layer.Deactivate(e.ctx, "zb", st.Modules, false))
+			st.Modules = slices.DeleteFunc(st.Modules, func(m string) bool { return m == "zb" })
+			must(t, st.Save(h.statePath()))
+			ledger := filepath.Join(h.layer.StateDir, "ledger", x+".json")
+			data, err := os.ReadFile(ledger)
+			must(t, err)
+			must(t, os.WriteFile(ledger, bytes.Replace(data, []byte(`"status": "active"`), []byte(`"status": "deactivating"`), 1), 0o644))
+
+			_ = e.run("doctor", "-fix")
+			must(t, os.WriteFile(e.hostPath(), []byte("modules = []\n"), 0o644))
+			must(t, e.run("apply", "-y"))
+			assertSame(t, pristine, e.snapshot())
+		})
+	}
+}

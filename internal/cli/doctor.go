@@ -46,10 +46,11 @@ func (r *report) err() error {
 }
 
 // cmdDoctor audits both halves and the host file. With -fix it applies only
-// repairs that are provably safe: rolling back interrupted activations,
-// finishing interrupted teardowns and forgetting resources removed outside
-// arcus. It never deletes a file arcus did not create, except a home-half
-// bytecode cache Python rewrote over one arcus deployed.
+// repairs that are provably safe: releasing what an interrupted restack
+// held, rolling back interrupted activations, finishing interrupted
+// teardowns and forgetting resources removed outside arcus. It never deletes
+// a file arcus did not create, except a home-half bytecode cache Python
+// rewrote over one arcus deployed.
 func (a *app) cmdDoctor(args []string) error {
 	var o opts
 	fs := a.flags("doctor", &o, false, false)
@@ -350,22 +351,28 @@ func (a *app) doctorHalf(h *half, st *state.State, fix bool, r *report) {
 		r.problem("%v", err)
 		return
 	}
+	// The hold goes first: a turn-off finished before it would find a held
+	// subdirectory keeping its own directory non-empty and lose track of it.
+	if slices.Contains(ledgers, layer.HoldLedger) {
+		r.problem("a restack of the %s layers was interrupted and kept the directories they created", h.name)
+		if fix {
+			if err := h.layer.Release(); err != nil {
+				r.failed(fmt.Errorf("%w (removing %s by hand gives the held directories up)", err, h.layer.HoldPath()))
+				return
+			}
+			r.repaired("gave them to the layers using them and removed the empty ones")
+		}
+	}
 	for _, name := range ledgers {
+		if name == layer.HoldLedger {
+			continue
+		}
 		l, err := h.layer.LoadLedger(name)
 		if err != nil {
 			r.problem("%v", err)
 			continue
 		}
 		switch on := slices.Contains(st.Modules, name); {
-		case name == layer.HoldLedger:
-			r.problem("a restack of the %s layers was interrupted and kept the directories they created", h.name)
-			if fix {
-				if err := h.layer.Release(); err != nil {
-					r.failed(err)
-				} else {
-					r.repaired("gave them to the layers using them and removed the empty ones")
-				}
-			}
 		case !on:
 			r.problem("%s has a %s ledger but no layer in the state (interrupted turn-on or orphan)", name, l.Status)
 			if fix {

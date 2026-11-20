@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 
 	"github.com/grunclepug/arcus/internal/atomicfile"
 )
@@ -48,12 +49,15 @@ type Stacker struct {
 	Warn func(format string, args ...any)
 
 	// holding is set between Hold and Release. A hold an interrupted
-	// restack left on disk applies to the next restack only.
+	// restack left on disk is released by doctor, never by a turn-off.
 	holding bool
 
 	// crashHook, when set, runs between the individual changes of an
 	// operation. Tests panic from it to simulate a crash at that point.
 	crashHook func()
+	// saveHook, when set, runs before a ledger is saved. Tests fail a save
+	// through it.
+	saveHook func(module string) error
 }
 
 // NewHome returns the stacker for the user half: home/ trees are symlinked
@@ -547,24 +551,40 @@ const HoldLedger = "_restack"
 // would otherwise replace every directory its layers created with a new one,
 // and programs watching the old one (a shell's plugin folder, an app's
 // preset folder) lose track of it or crash. A hold an interrupted restack
-// left is taken over.
+// left must be released by doctor first.
 func (s *Stacker) Hold() error {
-	l, err := s.LoadLedger(HoldLedger)
-	if err != nil {
+	if err := s.CheckHold(); err != nil {
 		return err
 	}
-	if l == nil {
-		if err := s.saveLedger(&Ledger{Module: HoldLedger, Status: StatusActive}); err != nil {
-			return err
-		}
+	if err := s.saveLedger(&Ledger{Module: HoldLedger, Status: StatusActive}); err != nil {
+		return err
 	}
 	s.holding = true
 	return nil
 }
 
+// HoldPath is the hold ledger's file, for a message that tells the user how
+// to give a hold up by hand.
+func (s *Stacker) HoldPath() string { return s.ledgerPath(HoldLedger) }
+
+// CheckHold reports a hold an interrupted restack left. Turning layers on or
+// off before doctor releases it would lose track of the held directories.
+func (s *Stacker) CheckHold() error {
+	l, err := s.LoadLedger(HoldLedger)
+	if err != nil {
+		return err
+	}
+	if l != nil {
+		return fmt.Errorf("a restack of the %s files was interrupted; run 'arcus doctor -fix' first", s.Subdir)
+	}
+	return nil
+}
+
 // Release ends a hold. Each held directory that still holds files passes to
-// a ledger with files in it, whether that layer is on or was interrupted, and
-// the empty ones are removed, as the deactivations would have done.
+// a ledger with files or directories in it, whether that layer is on or was
+// interrupted, and the empty ones are removed, as the deactivations would
+// have done. If a directory can be neither handed over nor removed, the hold
+// stays for the next 'arcus doctor -fix'.
 func (s *Stacker) Release() error {
 	s.holding = false
 	hold, err := s.LoadLedger(HoldLedger)
@@ -579,7 +599,9 @@ func (s *Stacker) Release() error {
 	if err != nil {
 		return err
 	}
-	s.removeCreatedDirs(hold, others)
+	if err := s.removeCreatedDirs(hold, others); err != nil {
+		return err
+	}
 	s.crashPoint()
 	return s.removeLedger(HoldLedger)
 }
@@ -588,7 +610,9 @@ func (s *Stacker) Release() error {
 // to the hold during a restack, otherwise by removing them.
 func (s *Stacker) dropCreatedDirs(l *Ledger, stack []*Ledger) error {
 	if !s.holding {
-		s.removeCreatedDirs(l, stack)
+		if err := s.removeCreatedDirs(l, stack); err != nil {
+			s.Warn("%v", err)
+		}
 		return nil
 	}
 	hold, err := s.LoadLedger(HoldLedger)
@@ -608,7 +632,9 @@ func (s *Stacker) dropCreatedDirs(l *Ledger, stack []*Ledger) error {
 
 // yieldHeldDirs removes the empty held directories where the module now
 // deploys a file, so a module that turned a directory into a file restacks
-// as it would without the hold.
+// as it would without the hold. It runs before Activate's pre-flight, which
+// is safe only because it removes nothing but empty directories (rmdir) and
+// never below a symlinked parent.
 func (s *Stacker) yieldHeldDirs(module string) error {
 	if !s.holding {
 		return nil
@@ -622,7 +648,7 @@ func (s *Stacker) yieldHeldDirs(module string) error {
 		return nil
 	}
 	var yielded []string
-	err = filepath.WalkDir(tree, func(src string, d iofs.DirEntry, err error) error {
+	err = walkTree(tree, func(src string, d iofs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
 		}
@@ -633,7 +659,7 @@ func (s *Stacker) yieldHeldDirs(module string) error {
 		dirs := slices.DeleteFunc(slices.Clone(hold.CreatedDirs), func(dir string) bool { return !isWithin(dir, host) })
 		slices.SortFunc(dirs, func(a, b string) int { return len(b) - len(a) })
 		for _, dir := range dirs {
-			if os.Remove(dir) == nil {
+			if s.symlinkedParent(dir) == "" && syscall.Rmdir(dir) == nil {
 				yielded = append(yielded, dir)
 			}
 		}
@@ -647,28 +673,57 @@ func (s *Stacker) yieldHeldDirs(module string) error {
 }
 
 // removeCreatedDirs deletes directories this layer created, deepest first,
-// if they are empty. A directory still holding other layers' files is handed
-// to each of their ledgers, so it is cleaned up when the last of them goes;
-// handing it to one alone would lose it if that one were rolled back.
-func (s *Stacker) removeCreatedDirs(l *Ledger, stack []*Ledger) {
+// if they are empty. It removes only directories (rmdir), so a file or a
+// symlink that took a directory's place stays, and nothing below a symlinked
+// parent. A directory still holding other layers' files or directories is
+// handed to each of their ledgers, so it is cleaned up when the last of them
+// goes; handing it to one alone would lose it if that one were rolled back.
+// The error lists the hand-overs that failed to save and the empty
+// directories no ledger took that could not be removed; a non-empty
+// directory no ledger took (other programs' files) is left, as before.
+func (s *Stacker) removeCreatedDirs(l *Ledger, stack []*Ledger) error {
 	dirs := slices.Clone(l.CreatedDirs)
 	slices.SortFunc(dirs, func(a, b string) int { return len(b) - len(a) })
 
+	var errs []error
 	for _, dir := range dirs {
-		if os.Remove(dir) == nil || !exists(dir) {
+		if s.symlinkedParent(dir) != "" {
 			continue
 		}
+		err := syscall.Rmdir(dir)
+		if err == nil || errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ENOTDIR) {
+			continue
+		}
+		taken := false
 		for _, other := range stack {
-			if other == nil || other == l || slices.Contains(other.CreatedDirs, dir) ||
-				!slices.ContainsFunc(other.Entries, func(e Entry) bool { return isWithin(e.Host, dir) }) {
+			if other == nil || other == l {
+				continue
+			}
+			if slices.Contains(other.CreatedDirs, dir) {
+				taken = true
+				continue
+			}
+			if !slices.ContainsFunc(other.Entries, func(e Entry) bool { return isWithin(e.Host, dir) }) &&
+				!slices.ContainsFunc(other.CreatedDirs, func(d string) bool { return isWithin(d, dir) }) {
 				continue
 			}
 			other.CreatedDirs = append(other.CreatedDirs, dir)
-			if err := s.saveLedger(other); err != nil {
-				s.Warn("could not transfer ownership of %s: %v", dir, err)
+			if serr := s.saveLedger(other); serr != nil {
+				errs = append(errs, fmt.Errorf("could not transfer ownership of %s: %w", dir, serr))
+				continue
 			}
+			taken = true
 		}
+		if taken || errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST) {
+			continue
+		}
+		if entries, rerr := os.ReadDir(dir); rerr == nil && len(entries) > 0 {
+			s.Warn("leaving %s: %v", dir, err)
+			continue
+		}
+		errs = append(errs, fmt.Errorf("removing %s: %w", dir, err))
 	}
+	return errors.Join(errs...)
 }
 
 // Rollback undoes a module's layer as if it were the top of the stack. It is
@@ -700,7 +755,9 @@ func (s *Stacker) Rollback(module string) error {
 		return errors.New(strings.Join(problems, "; "))
 	}
 
-	s.removeCreatedDirs(l, nil)
+	if err := s.removeCreatedDirs(l, nil); err != nil {
+		s.Warn("%v", err)
+	}
 	return s.removeLedger(module)
 }
 

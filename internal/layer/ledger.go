@@ -97,6 +97,11 @@ func (s *Stacker) LoadLedger(module string) (*Ledger, error) {
 }
 
 func (s *Stacker) saveLedger(l *Ledger) error {
+	if s.saveHook != nil {
+		if err := s.saveHook(l.Module); err != nil {
+			return fmt.Errorf("saving ledger for %q: %w", l.Module, err)
+		}
+	}
 	l.Version = LedgerVersion
 	data, err := json.MarshalIndent(l, "", "  ")
 	if err != nil {

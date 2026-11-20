@@ -131,6 +131,11 @@ func (a *app) execSystem(args []string) error {
 	if !s.Root() {
 		return fmt.Errorf("exec-system: %d is not a root stage", *stage)
 	}
+	// Checked again under the exclusive lock: another run, with its own user
+	// lock, may have left a hold since this one planned.
+	if err := h.layer.CheckHold(); err != nil {
+		return err
+	}
 	sit, steps, err := a.systemPlan(in, h)
 	if err != nil {
 		return err

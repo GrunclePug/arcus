@@ -194,6 +194,14 @@ func (a *app) change(o *opts, create bool, edit func(*host.File) error) error {
 		return err
 	}
 
+	// A restack interrupted in either half must be released by doctor before
+	// any layer changes; checked before planning, so plan and -n say so too.
+	for _, h := range []*half{a.systemHalf(), a.userHalf()} {
+		if err := h.layer.CheckHold(); err != nil {
+			return err
+		}
+	}
+
 	beforeProfiles, beforeModules := slices.Clone(f.Profiles), slices.Clone(f.Modules)
 	if edit != nil {
 		if err := edit(f); err != nil {

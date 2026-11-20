@@ -1073,20 +1073,24 @@ func TestReleaseAfterInterruptedRestack(t *testing.T) {
 	}
 }
 
-// doctor repairs the layers the way `arcus doctor -fix` does, in its order,
-// in a new process (no hold in effect).
+// doctor repairs the layers the way `arcus doctor -fix` does, in its order
+// (the hold first), in a new process (no hold in effect).
 func (sb *sandbox) doctor() {
 	sb.t.Helper()
 	sb.s.holding = false
 	names, err := sb.s.ListLedgers()
 	must(sb.t, err)
+	if slices.Contains(names, HoldLedger) {
+		must(sb.t, sb.s.Release())
+	}
 	for _, name := range names {
+		if name == HoldLedger {
+			continue
+		}
 		l, err := sb.s.LoadLedger(name)
 		must(sb.t, err)
 		switch {
 		case l == nil:
-		case name == HoldLedger:
-			must(sb.t, sb.s.Release())
 		case !slices.Contains(sb.stack, name):
 			must(sb.t, sb.s.Rollback(name))
 		case l.Status == StatusDeactivating:
@@ -1100,52 +1104,61 @@ func (sb *sandbox) doctor() {
 
 // A crash anywhere in a restack leaves every change described by a ledger,
 // and doctor's repairs leave nothing behind once the layers are off. Module
-// names sort on both sides of the hold ledger, which doctor handles in name
-// order, and the upper layer sorts first in one case.
+// names sort on both sides of the hold ledger, the upper layer sorts first in
+// one case, and in the nested layout the upper layer creates a directory
+// inside one the lower layer created.
 func TestRestackCrashAtAnyPointConverges(t *testing.T) {
 	for _, h := range halves {
-		for _, names := range [][2]string{{"a", "b"}, {"0a", "0b"}, {"z", "b"}} {
-			t.Run(h.name+"/"+names[0], func(t *testing.T) {
-				a, b := names[0], names[1]
-				for n := 1; ; n++ {
-					sb := newSandbox(t, h)
-					sb.hostFile("keep", "host only")
-					sb.moduleFile(a, "plugins/eq/x", "a")
-					sb.moduleFile(b, "plugins/eq/y", "b")
-					sb.moduleFile(b, "other/deep/b", "b")
-					original := sb.snapshot()
-					must(t, sb.activate(a))
-					must(t, sb.activate(b))
-					sb.moduleFile(a, "plugins/eq/z", "new in a")
-					before := sb.snapshot()
-
-					crashed, err := runUntilCrash(sb, n, func() error {
-						must(t, sb.s.Hold())
-						must(t, sb.deactivate(b, false))
-						must(t, sb.deactivate(a, false))
-						must(t, sb.activate(a))
-						must(t, sb.activate(b))
-						return sb.s.Release()
-					})
-					must(t, err)
-					if !crashed {
-						if got := sb.read("plugins/eq/z"); got != "new in a" {
-							t.Errorf("after the restack, z = %q", got)
-						}
-						t.Logf("crashed at each of %d points", n-1)
-						break
-					}
-					sb.assertLedgerCovers(before, original)
-
-					sb.doctor()
-					for i := len(sb.stack) - 1; i >= 0; i-- {
-						must(t, sb.deactivate(sb.stack[i], false))
-					}
-					assertSame(t, original, sb.snapshot())
-					sb.assertNoLedgers()
-				}
-			})
+		for _, nested := range []bool{false, true} {
+			for _, names := range [][2]string{{"a", "b"}, {"0a", "0b"}, {"z", "b"}} {
+				t.Run(fmt.Sprintf("%s/%s/nested=%v", h.name, names[0], nested), func(t *testing.T) {
+					restackCrashes(t, h, names[0], names[1], nested)
+				})
+			}
 		}
+	}
+}
+
+func restackCrashes(t *testing.T, h half, a, b string, nested bool) {
+	for n := 1; ; n++ {
+		sb := newSandbox(t, h)
+		sb.hostFile("keep", "host only")
+		sb.moduleFile(a, "plugins/eq/x", "a")
+		sb.moduleFile(b, "plugins/eq/y", "b")
+		sb.moduleFile(b, "other/deep/b", "b")
+		if nested {
+			sb.moduleFile(b, "plugins/eq/deep/y", "b")
+		}
+		original := sb.snapshot()
+		must(t, sb.activate(a))
+		must(t, sb.activate(b))
+		sb.moduleFile(a, "plugins/eq/z", "new in a")
+		before := sb.snapshot()
+
+		crashed, err := runUntilCrash(sb, n, func() error {
+			must(t, sb.s.Hold())
+			must(t, sb.deactivate(b, false))
+			must(t, sb.deactivate(a, false))
+			must(t, sb.activate(a))
+			must(t, sb.activate(b))
+			return sb.s.Release()
+		})
+		must(t, err)
+		if !crashed {
+			if got := sb.read("plugins/eq/z"); got != "new in a" {
+				t.Errorf("after the restack, z = %q", got)
+			}
+			t.Logf("crashed at each of %d points", n-1)
+			return
+		}
+		sb.assertLedgerCovers(before, original)
+
+		sb.doctor()
+		for i := len(sb.stack) - 1; i >= 0; i-- {
+			must(t, sb.deactivate(sb.stack[i], false))
+		}
+		assertSame(t, original, sb.snapshot())
+		sb.assertNoLedgers()
 	}
 }
 
@@ -1193,5 +1206,223 @@ func TestStaleHoldOnlyAppliesToRestacks(t *testing.T) {
 			t.Error("releasing the stale hold kept b's empty directory")
 		}
 		sb.assertNoLedgers()
+	})
+}
+
+// A hold an interrupted restack left must be released by doctor before the
+// next restack can hold.
+func TestHoldRefusesALeftoverHold(t *testing.T) {
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		must(t, sb.s.Hold())
+		sb.s.holding = false // the process died here
+		if err := sb.s.Hold(); err == nil || !strings.Contains(err.Error(), "doctor -fix") {
+			t.Fatalf("Hold over a leftover hold = %v", err)
+		}
+		must(t, sb.s.Release())
+		must(t, sb.s.Hold())
+		must(t, sb.s.Release())
+	})
+}
+
+// A crash in the rollback of an interrupted activation, after its last file
+// entry went and before it removed the directory it created inside a held
+// one, leaves the held directory to that ledger rather than stranding it.
+func TestReleaseHandsHeldDirsToNestedCreatedDirs(t *testing.T) {
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		original := sb.snapshot()
+		sb.moduleFile("a", "app/x", "a")
+		must(t, sb.activate("a"))
+		must(t, sb.s.Hold())
+		must(t, sb.deactivate("a", false))
+		app := filepath.Join(sb.host, "app")
+		deep := filepath.Join(app, "deep")
+		must(t, os.Mkdir(deep, 0o755))
+		must(t, sb.s.saveLedger(&Ledger{Module: "b", Status: StatusActivating, CreatedDirs: []string{deep}}))
+
+		sb.doctor()
+		assertSame(t, original, sb.snapshot())
+		sb.assertNoLedgers()
+	})
+}
+
+// Removing a directory arcus recorded never removes a file or a symlink that
+// took its place, nor anything below a parent replaced by a symlink.
+func TestRemovingDirsLeavesOtherThingsAlone(t *testing.T) {
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		replace := func(dir, content string) {
+			must(t, os.RemoveAll(dir))
+			must(t, os.WriteFile(dir, []byte(content), 0o644))
+		}
+
+		// A held directory replaced by a file.
+		sb.moduleFile("a", "held/x", "a")
+		must(t, sb.activate("a"))
+		must(t, sb.s.Hold())
+		must(t, sb.deactivate("a", false))
+		replace(filepath.Join(sb.host, "held"), "user data")
+		must(t, sb.s.Release())
+		if got := sb.read("held"); got != "user data" {
+			t.Errorf("held = %q after Release", got)
+		}
+
+		// A created directory replaced by a file, without a hold.
+		sb.moduleFile("b", "made/y", "b")
+		must(t, sb.activate("b"))
+		replace(filepath.Join(sb.host, "made"), "user data")
+		must(t, sb.deactivate("b", false))
+		if got := sb.read("made"); got != "user data" {
+			t.Errorf("made = %q after turn-off", got)
+		}
+
+		// A held directory replaced by a file where the module now ships one:
+		// the file is backed up, not deleted, and comes back on turn-off.
+		bar := sb.moduleFile("c", "foo/bar", "bar")
+		must(t, sb.activate("c"))
+		must(t, sb.s.Hold())
+		must(t, sb.deactivate("c", false))
+		replace(filepath.Join(sb.host, "foo"), "user data")
+		must(t, os.RemoveAll(filepath.Dir(bar)))
+		sb.moduleFile("c", "foo", "from c")
+		must(t, sb.activate("c"))
+		must(t, sb.s.Release())
+		if got, orig := sb.read("foo"), sb.read("foo.orig"); got != "from c" || orig != "user data" {
+			t.Errorf("foo = %q, foo.orig = %q", got, orig)
+		}
+		must(t, sb.deactivate("c", false))
+		if got := sb.read("foo"); got != "user data" {
+			t.Errorf("foo = %q after turn-off", got)
+		}
+
+		// A held directory whose parent became a symlink to another tree.
+		sb.moduleFile("d", "p/q/x", "d")
+		must(t, sb.activate("d"))
+		must(t, sb.s.Hold())
+		must(t, sb.deactivate("d", false))
+		other := filepath.Join(sb.root, "other")
+		must(t, os.MkdirAll(filepath.Join(other, "q"), 0o755))
+		must(t, os.RemoveAll(filepath.Join(sb.host, "p")))
+		must(t, os.Symlink(other, filepath.Join(sb.host, "p")))
+		must(t, sb.s.Release())
+		if !exists(filepath.Join(other, "q")) {
+			t.Error("Release removed a directory below a symlinked parent")
+		}
+		sb.assertNoLedgers()
+	})
+}
+
+// A hand-over that fails to save keeps the hold, so doctor can retry it.
+func TestReleaseKeepsTheHoldWhenAHandOverFails(t *testing.T) {
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		sb.moduleFile("b", "d/y", "b")
+		sb.moduleFile("a", "d/x", "a")
+		must(t, sb.activate("b"))
+		must(t, sb.activate("a"))
+		must(t, sb.s.Hold())
+		must(t, sb.deactivate("b", false))
+
+		injected := errors.New("disk full")
+		sb.s.saveHook = func(module string) error {
+			if module == "a" {
+				return injected
+			}
+			return nil
+		}
+		if err := sb.s.Release(); !errors.Is(err, injected) {
+			t.Fatalf("Release = %v, want the failed save", err)
+		}
+		if !exists(sb.s.HoldPath()) {
+			t.Fatal("the hold was dropped after a failed hand-over")
+		}
+		sb.s.saveHook = nil
+		must(t, sb.s.Release())
+		must(t, sb.deactivate("a", false))
+		if exists(filepath.Join(sb.host, "d")) {
+			t.Error("d outlived the layers that used it")
+		}
+		sb.assertNoLedgers()
+	})
+}
+
+// Under a parent that can't be written, an empty held directory keeps the
+// hold; one with a layer's files goes to that layer; one with only other
+// files is left, as a plain turn-off leaves it. A retry counts a directory
+// already handed over as taken.
+func TestReleaseUnderAReadOnlyParent(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		readOnly := func(dir string) {
+			must(t, os.Chmod(dir, 0o555))
+			t.Cleanup(func() { os.Chmod(dir, 0o755) })
+		}
+
+		// p/used holds a's files; q/empty is empty: both under read-only parents.
+		sb.moduleFile("a", "p/used/x", "a")
+		sb.moduleFile("c", "p/used/z", "c")
+		sb.moduleFile("c", "q/empty/w", "c")
+		must(t, sb.activate("c"))
+		must(t, sb.activate("a"))
+		must(t, sb.s.Hold())
+		must(t, sb.deactivate("c", false))
+		readOnly(filepath.Join(sb.host, "p"))
+		readOnly(filepath.Join(sb.host, "q"))
+
+		if err := sb.s.Release(); !errors.Is(err, syscall.EACCES) {
+			t.Fatalf("Release = %v, want EACCES for the empty directory", err)
+		}
+		if !exists(sb.s.HoldPath()) {
+			t.Fatal("the hold was dropped while an empty directory stayed")
+		}
+		l, err := sb.s.LoadLedger("a")
+		must(t, err)
+		if !slices.Contains(l.CreatedDirs, filepath.Join(sb.host, "p/used")) {
+			t.Errorf("a's created dirs = %v, want p/used", l.CreatedDirs)
+		}
+
+		must(t, os.Chmod(filepath.Join(sb.host, "q"), 0o755))
+		sb.warns = nil
+		must(t, sb.s.Release())
+		if len(sb.warns) != 0 {
+			t.Errorf("retry warned: %v", sb.warns)
+		}
+		if exists(filepath.Join(sb.host, "q/empty")) {
+			t.Error("q/empty survived the retry")
+		}
+
+		// Only another program's file in a held directory: left, with a warning.
+		sb.moduleFile("e", "r/state/x", "e")
+		must(t, sb.activate("e"))
+		must(t, sb.s.Hold())
+		must(t, sb.deactivate("e", false))
+		sb.hostFile("r/state/app.json", "{}")
+		readOnly(filepath.Join(sb.host, "r"))
+		sb.warns = nil
+		must(t, sb.s.Release())
+		if sb.read("r/state/app.json") != "{}" || len(sb.warns) != 1 {
+			t.Errorf("app.json = %q, warnings %v", sb.read("r/state/app.json"), sb.warns)
+		}
+		if exists(sb.s.HoldPath()) {
+			t.Error("the hold stayed for a directory with only other files")
+		}
+	})
+}
+
+// A restack of a module with an unreadable bytecode cache doesn't fail: the
+// walk that frees held directories skips caches like every other walk.
+func TestRestackSkipsAnUnreadableCache(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads any directory")
+	}
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		sb.moduleFile("a", "d/x", "a")
+		cache := filepath.Dir(sb.moduleFile("a", "d/__pycache__/x.cpython-314.pyc", "cache"))
+		must(t, os.Chmod(cache, 0))
+		t.Cleanup(func() { os.Chmod(cache, 0o755) })
+		must(t, sb.activate("a"))
+		must(t, sb.s.Hold())
+		must(t, sb.deactivate("a", false))
+		must(t, sb.activate("a"))
+		must(t, sb.s.Release())
 	})
 }
