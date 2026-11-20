@@ -572,7 +572,7 @@ func (s *Stacker) HoldPath() string { return s.ledgerPath(HoldLedger) }
 func (s *Stacker) CheckHold() error {
 	l, err := s.LoadLedger(HoldLedger)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w; run 'arcus doctor -fix'", err)
 	}
 	if l != nil {
 		return fmt.Errorf("a restack of the %s files was interrupted; run 'arcus doctor -fix' first", s.Subdir)
