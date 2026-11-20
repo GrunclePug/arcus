@@ -894,6 +894,9 @@ func TestOnlyRewrittenCachesAreRemoved(t *testing.T) {
 		{"not a cache name", halves[0], "tool.pyc", func(t *testing.T, sb *sandbox, host string) {
 			pythonRewrite(t, host, pycBytes("rewritten"))
 		}},
+		{"empty tag", halves[0], "tool..pyc", func(t *testing.T, sb *sandbox, host string) {
+			pythonRewrite(t, host, pycBytes("rewritten"))
+		}},
 		{"symlink elsewhere", halves[0], name, func(t *testing.T, sb *sandbox, host string) {
 			other := filepath.Join(sb.root, "other.pyc")
 			must(t, os.WriteFile(other, []byte(pycBytes("other")), 0o644))
@@ -968,6 +971,9 @@ func TestCacheNamesOutsideACacheDirectory(t *testing.T) {
 				must(t, sb.activate("p"))
 				if sb.read("bin/tool") != "tool" {
 					t.Fatal("module file not deployed")
+				}
+				if c.name == "file named __pycache__" && sb.read("lib/__pycache__") != "not a directory" {
+					t.Fatal("file named __pycache__ not deployed")
 				}
 				changes, err := sb.s.Stale("p")
 				must(t, err)

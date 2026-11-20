@@ -47,13 +47,15 @@ func (s *Stacker) inCache(e Entry) bool {
 }
 
 // cacheEntry reports whether e is a home-half link to a Python bytecode cache
-// file, which ledgers written before 0.8.2 can hold. It agrees with inCache for
-// every reachable layout, because Python never nests cache directories: e.Src's
-// parent lies inside the module tree or is the tree itself (home or system).
+// file (<module>.<tag>[.opt-N].pyc), which ledgers written before 0.8.2 can
+// hold. It agrees with inCache for every reachable layout, because Python never
+// nests cache directories: e.Src's parent lies inside the module tree or is the
+// tree itself (home or system).
 func cacheEntry(e Entry) bool {
-	name := filepath.Base(e.Src)
+	stem, ok := strings.CutSuffix(filepath.Base(e.Src), ".pyc")
+	parts := strings.Split(stem, ".")
 	return e.Kind == KindLink && filepath.Base(filepath.Dir(e.Src)) == "__pycache__" &&
-		strings.HasSuffix(name, ".pyc") && strings.Count(name, ".") >= 2
+		ok && len(parts) >= 2 && !slices.Contains(parts, "")
 }
 
 // isPyc reports whether path is a regular file laid out like a CPython

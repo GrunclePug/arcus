@@ -77,7 +77,7 @@ arcus update               # replace arcus with the latest release
 
 On the Arch ISO, `arcus-install` opens a TUI that writes an install plan and runs it, or saves it to `/root/plan.toml`. `arcus-install detect` shows the hardware modules a machine needs, `arcus-install check plan.toml` validates a plan against the machine without changing anything, and `arcus-install run plan.toml` installs it.
 
-A module is a directory with a `module.toml`, a `home/` tree that is linked into `$HOME`, a `system/` tree that is copied into `/etc` and `/usr/local` as root, and a `pkg/<name>/PKGBUILD` recipe for each own build. Python bytecode caches (`__pycache__/`) in `home/` and `system/` are never deployed; the next `apply` removes any an earlier version deployed, in `home/` even after Python has rewritten them:
+A module is a directory with a `module.toml`, a `home/` tree that is linked into `$HOME`, a `system/` tree that is copied into `/etc` and `/usr/local` as root, and a `pkg/<name>/PKGBUILD` recipe for each own build. Python bytecode caches (`__pycache__/`) in `home/` and `system/` are never deployed. The next `apply` removes those an earlier version deployed, and in `home/` also ones Python has rewritten since:
 
 ```toml
 description = "Shared Wayland session pieces"

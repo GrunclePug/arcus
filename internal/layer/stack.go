@@ -420,7 +420,7 @@ func (s *Stacker) planStep(l *Ledger, idx int, above []*Ledger) step {
 		st.remove = true
 	case st.next == nil && e.Backup != "" && !exists(e.Backup):
 		st.finished = true // original already restored by an interrupted run
-	case st.next == nil && cacheEntry(e) && s.symlinkedParent(st.loc) == "" && isPyc(st.loc):
+	case st.next == nil && cacheEntry(e) && isWithin(st.loc, s.Target) && s.symlinkedParent(st.loc) == "" && isPyc(st.loc):
 		// Ledgers written before 0.8.2 hold cache links, and Python replaces a
 		// cache by renaming a new file over it. This comes after finished, so
 		// an original a re-run already put back is kept.
