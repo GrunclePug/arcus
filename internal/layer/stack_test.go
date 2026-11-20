@@ -729,6 +729,32 @@ func TestDanglingBackupsAndAudit(t *testing.T) {
 	})
 }
 
+func TestPythonBytecodeCachesAreNotDeployed(t *testing.T) {
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		sb.moduleFile("p", "bin/tool", "tool")
+		sb.moduleFile("p", "bin/__pycache__/tool.cpython-314.pyc", "cache")
+		must(t, sb.activate("p"))
+		if _, err := os.Lstat(filepath.Join(sb.host, "bin/__pycache__")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("cache directory deployed: %v", err)
+		}
+		if sb.read("bin/tool") != "tool" {
+			t.Fatal("module file not deployed")
+		}
+		// Running the module's scripts writes new caches; they are not drift.
+		sb.moduleFile("p", "lib/__pycache__/mod.cpython-314.pyc", "cache")
+		findings, err := sb.s.Audit("p", sb.stack)
+		must(t, err)
+		if len(findings) != 0 {
+			t.Fatalf("cache reported as drift: %v", findings)
+		}
+		changes, err := sb.s.Stale("p")
+		must(t, err)
+		if len(changes) != 0 {
+			t.Fatalf("cache reported as stale: %v", changes)
+		}
+	})
+}
+
 func TestVerifyWritePrivilegeAcceptsMissingParents(t *testing.T) {
 	dir := t.TempDir()
 	if err := VerifyWritePrivilege(filepath.Join(dir, "a", "b", "c", "file")); err != nil {

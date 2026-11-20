@@ -295,7 +295,7 @@ func (s *Stacker) planActivation(module string, below []*Ledger, checkAccess boo
 			return err
 		}
 		if d.IsDir() {
-			return nil
+			return skipCache(d)
 		}
 		host, err := s.hostPathFor(tree, src)
 		if err != nil {

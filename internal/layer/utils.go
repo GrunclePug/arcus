@@ -22,6 +22,17 @@ const (
 	accessX = 0x1
 )
 
+// skipCache skips a Python bytecode cache in a module tree. Python writes
+// __pycache__ next to a module's scripts whenever they run from the tree (a
+// test, a hook importing a sibling); deployed, it would churn on every run
+// and its stale links break removals once the source moves.
+func skipCache(d iofs.DirEntry) error {
+	if d.Name() == "__pycache__" {
+		return filepath.SkipDir
+	}
+	return nil
+}
+
 func exists(path string) bool {
 	_, err := os.Lstat(path)
 	return err == nil
