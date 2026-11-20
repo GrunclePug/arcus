@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/grunclepug/arcus/internal/layer"
@@ -550,5 +551,234 @@ func TestLocalRemovedProvider(t *testing.T) {
 	}
 	if want := []string{"remover", "provider", "consumer"}; !reflect.DeepEqual(installs, want) {
 		t.Fatalf("installs = %v, want %v", installs, want)
+	}
+}
+
+// pkg is a test package: "p:virt" provides virt, "c:x" conflicts with x,
+// "d:virt" depends on it, "b:base" needs it to build.
+func pkg(fields ...string) system.Package {
+	var p system.Package
+	for _, f := range fields {
+		k, v, _ := strings.Cut(f, ":")
+		switch k {
+		case "p":
+			p.Provides = append(p.Provides, v)
+		case "c":
+			p.Conflicts = append(p.Conflicts, v)
+		case "d":
+			p.Depends = append(p.Depends, v)
+		case "b":
+			p.BuildDepends = append(p.BuildDepends, v)
+		}
+	}
+	return p
+}
+
+// batchesOf plans own builds with Local, conflict removals included, and
+// returns the installs of each batch, sorted within a batch.
+func batchesOf(installed, incoming map[string]system.Package, order []string) ([][]string, error) {
+	m := &module.Module{Name: "m"}
+	m.Packages.Local = order
+	in := Input{Desired: []string{"m"}, Modules: module.Set{"m": m}}
+	steps, err := Local(in, Half{Packages: installed, Incoming: incoming}, localSteps(order...))
+	if err != nil {
+		return nil, err
+	}
+	var out [][]string
+	building := true
+	for _, s := range steps {
+		switch s.Op {
+		case BuildLocal:
+			if !building {
+				building = true
+			}
+		case InstallLocal:
+			if building {
+				out = append(out, nil)
+				building = false
+			}
+			out[len(out)-1] = append(out[len(out)-1], s.Names[0])
+		}
+	}
+	for _, b := range out {
+		slices.Sort(b)
+	}
+	return out, nil
+}
+
+// permutations returns every order of names.
+func permutations(names []string) [][]string {
+	if len(names) <= 1 {
+		return [][]string{slices.Clone(names)}
+	}
+	var out [][]string
+	for i := range names {
+		rest := slices.Concat(names[:i], names[i+1:])
+		for _, p := range permutations(rest) {
+			out = append(out, append([]string{names[i]}, p...))
+		}
+	}
+	return out
+}
+
+// A batch never removes an installed package one of its installs needs
+// unless something in the batch provides it again; the consumer waits
+// instead. Each case gives the same batches in every pending order, unless
+// it is a fixed-order case.
+func TestLocalKeepsWhatABatchNeeds(t *testing.T) {
+	type world map[string]system.Package
+	for _, c := range []struct {
+		name      string
+		installed world
+		incoming  world
+		want      string // batches, "|"-separated; "cycle" for a refusal
+		fixed     []string
+	}{
+		{"remover is not the provider",
+			world{"x": pkg("p:virt")},
+			world{"c": pkg("d:virt"), "r": pkg("c:x"), "p": pkg("p:virt", "b:b"), "b": {}},
+			"b r|c p", nil},
+		{"the installed package declares the conflict",
+			world{"x": pkg("p:virt", "c:r")},
+			world{"c": pkg("d:virt"), "r": {}, "p": pkg("p:virt", "b:b"), "b": {}},
+			"b r|c p", nil},
+		{"the replacement builds with what needs the replaced",
+			world{"x": pkg("p:virt")},
+			world{"c": pkg("d:virt"), "p": pkg("p:virt", "c:x", "b:c")},
+			"c|p", nil},
+		{"order case: the remover waits with its dependency",
+			world{"x": pkg("p:virt")},
+			world{"c": pkg("d:virt"), "r": pkg("c:x", "d:b"), "b": pkg("b:c"), "p": pkg("p:virt", "b:c")},
+			"c|b p r", nil},
+		{"order case: an upgrade that stops providing",
+			world{"x": pkg("p:w")},
+			world{"x": pkg("d:a"), "a": pkg("p:w", "d:v"), "b": pkg("p:v", "d:c", "b:c"), "c": pkg("d:w")},
+			"c|a b x", nil},
+		{"own provides is no need",
+			world{},
+			world{"e": pkg("p:virt", "d:virt"), "b": pkg("p:virt", "b:e")},
+			"e|b", nil},
+		{"versioned own provides waits",
+			world{},
+			world{"e": pkg("p:virt", "d:virt>=2"), "b": pkg("p:virt=2", "b:z"), "z": {}},
+			"z|b e", nil},
+		{"a dropped consumer comes back when its remover has to wait",
+			world{"x": pkg("p:virt")},
+			world{"c": pkg("d:virt"), "r": pkg("c:x", "d:c"), "p": pkg("p:virt", "b:b"), "b": {}},
+			"b c|p r", nil},
+		{"drop order",
+			world{"x": pkg("p:virt")},
+			world{"a": pkg("d:b", "d:virt"), "b": pkg("d:a"), "r": pkg("c:x", "d:p"), "p": pkg("p:virt", "b:b")},
+			"a b|p r", nil},
+		{"a pending build's name comes first",
+			world{"p": {}},
+			world{"c": pkg("d:p"), "p": pkg("b:b"), "b": {}},
+			"b|c p", nil},
+		{"the consumer removes its own satisfier",
+			world{"x": pkg("p:virt")},
+			world{"c": pkg("d:virt", "c:x"), "p": pkg("p:virt", "b:b"), "b": {}},
+			"b|c p", nil},
+		{"an upgrade that stops providing what it needs",
+			world{"x": pkg("p:virt")},
+			world{"x": pkg("d:virt"), "p": pkg("p:virt", "b:b"), "b": {}},
+			"b|p x", nil},
+		{"an upgrade that stops providing what another needs",
+			world{"x": pkg("p:virt")},
+			world{"x": {}, "c": pkg("d:virt"), "p": pkg("p:virt", "b:b"), "b": {}},
+			"b x|c p", nil},
+		// Open cases, pinned as they behave now (see localNeeds).
+		{"open: a later removal breaks an earlier install",
+			world{"x": pkg("p:virt")},
+			world{"c": pkg("d:virt"), "r": pkg("c:x", "b:c")},
+			"c|r", nil},
+		{"open: a versioned build need waits for a pending provider",
+			world{"x": pkg("p:virt=2")},
+			world{"p": pkg("p:virt=1", "c:x"), "q": pkg("b:virt>=2")},
+			"p|q", nil},
+		{"open: two builds that need each other aren't re-added",
+			world{"x": pkg("p:virt")},
+			world{"a": pkg("d:b", "d:virt"), "b": pkg("d:a"), "r": pkg("c:x", "d:a"), "p": pkg("p:virt", "b:a")},
+			"cycle", nil},
+		{"open: of two blocking consumers the first waits",
+			world{"x": pkg("p:v", "p:w"), "y": pkg("p:v", "c:b")},
+			world{"x": pkg("d:v"), "b": pkg("d:v"), "c": pkg("p:v", "b:b"), "d": pkg("d:c", "b:b"), "a": pkg("d:b", "b:d")},
+			"cycle", []string{"b", "x", "c", "d", "a"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			orders := [][]string{c.fixed}
+			if c.fixed == nil {
+				orders = permutations(slices.Sorted(maps.Keys(c.incoming)))
+			}
+			for _, order := range orders {
+				got, err := batchesOf(c.installed, c.incoming, order)
+				var s string
+				if err != nil {
+					if !strings.Contains(err.Error(), "cycle") {
+						t.Fatalf("%v: %v", order, err)
+					}
+					s = "cycle"
+				} else {
+					var parts []string
+					for _, b := range got {
+						parts = append(parts, strings.Join(b, " "))
+					}
+					s = strings.Join(parts, "|")
+				}
+				if s != c.want {
+					t.Fatalf("order %v: got %q, want %q", order, s, c.want)
+				}
+			}
+		})
+	}
+}
+
+// The root stage refuses a batch whose built packages need what the batch
+// removes, and one with an install it has no package for.
+func TestCheckBatch(t *testing.T) {
+	type world map[string]system.Package
+	install := func(names ...string) []Step { return localSteps(names...) }
+	removes := func(names ...string) Step { return Step{Stage: LocalPackages, Op: RemoveConflicting, Names: names} }
+	for _, c := range []struct {
+		name      string
+		installed world
+		incoming  world
+		steps     []Step
+		rebuild   []string
+		want      string // part of the error, or "" for none
+	}{
+		{"no package for an install", world{}, world{"a": {}},
+			install("a", "b"), nil, "own build b has no package"},
+		{"a dependency .SRCINFO missed loses its provider",
+			world{"x": pkg("p:virt")}, world{"c": pkg("d:virt"), "r": pkg("c:x")},
+			append([]Step{removes("x")}, install("c", "r")...), nil, "c needs virt, which this batch would remove; this batch was not installed, run the command again"},
+		{"under rebuild the recipe has to list it",
+			world{"x": pkg("p:virt")}, world{"c": pkg("d:virt"), "r": pkg("c:x")},
+			append([]Step{removes("x")}, install("c", "r")...), []string{"c"}, "add it to depends in the PKGBUILD"},
+		{"a soname dependency counts by name",
+			world{"lib": pkg("p:libfoo.so=1-64")}, world{"c": pkg("d:libfoo.so=1-64"), "r": pkg("c:lib")},
+			append([]Step{removes("lib")}, install("c", "r")...), nil, "c needs libfoo.so=1-64"},
+		{"a same-name upgrade stops providing what another install needs",
+			world{"x": pkg("p:virt"), "y": pkg("p:virt")}, world{"x": {}, "c": pkg("d:virt"), "r": pkg("c:y")},
+			append([]Step{removes("y")}, install("x", "c", "r")...), nil, "c needs virt"},
+		{"a same-name upgrade stops providing what it needs itself",
+			world{"x": pkg("p:v"), "z": pkg("p:v")}, world{"x": pkg("d:v"), "b": pkg("c:z")},
+			append([]Step{removes("z")}, install("b", "x")...), nil, "x needs v"},
+		{"a provider in the batch", world{"x": pkg("p:virt")}, world{"c": pkg("d:virt"), "p": pkg("p:virt", "c:x")},
+			append([]Step{removes("x")}, install("c", "p")...), nil, ""},
+		{"the consumer removes its own only provider: pacman decides",
+			world{"x": pkg("p:virt")}, world{"c": pkg("d:virt", "c:x")},
+			append([]Step{removes("x")}, install("c")...), nil, ""},
+		{"not met before the batch: pacman decides", world{}, world{"c": pkg("d:virt")},
+			install("c"), nil, ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			err := CheckBatch(Half{Packages: c.installed, Incoming: c.incoming}, c.steps, c.rebuild)
+			switch {
+			case c.want == "" && err != nil:
+				t.Fatalf("CheckBatch = %v", err)
+			case c.want != "" && (err == nil || !strings.Contains(err.Error(), c.want)):
+				t.Fatalf("CheckBatch = %v, want %q", err, c.want)
+			}
+		})
 	}
 }

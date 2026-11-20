@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 )
 
 // Runner runs commands with the terminal attached, so password, provider
@@ -322,87 +323,104 @@ func parseInfo(info string) map[string]Package {
 }
 
 // SrcInfo returns what the PKGBUILD in dir declares for pkg, from makepkg
-// --printsrcinfo, and what makepkg needs installed to build it. It runs the
+// --printsrcinfo: what the package provides, conflicts with and depends on,
+// and what makepkg --syncdeps needs installed to build it. It runs the
 // PKGBUILD, so only as the user.
 func SrcInfo(dir, pkg string) (Package, error) {
-	info, err := outputIn(dir, "makepkg", "--printsrcinfo")
-	if err != nil {
-		return Package{}, err
-	}
-	build, err := outputIn(dir, "bash", "-c", buildDependsScript)
-	if err != nil {
-		return Package{}, err
-	}
-	arch, deps, _ := strings.Cut(build, "\n")
-	p := parseSrcInfo(info, pkg, arch)
-	p.BuildDepends = strings.Fields(deps)
-	return p, nil
-}
-
-// buildDependsScript prints CARCH, then the dependencies makepkg
-// --syncdeps resolves before building: depends and makedepends, and
-// checkdepends when the PKGBUILD has a check function that BUILDENV
-// doesn't turn off, each with its CARCH variant. It reads makepkg's
-// configuration and the PKGBUILD through libmakepkg, with the startdir
-// makepkg sets, as makepkg does.
-const buildDependsScript = `set -e
-lib=${MAKEPKG_LIBRARY:-/usr/share/makepkg}
-source "$lib/util/config.sh"
-source "$lib/util/option.sh"
-load_makepkg_config
-declare -r startdir="$(pwd -P)"
-source_safe "$startdir/PKGBUILD" >&2
-declare -n arch_depends=depends_$CARCH arch_makedepends=makedepends_$CARCH arch_checkdepends=checkdepends_$CARCH
-deps=("${depends[@]}" "${arch_depends[@]}" "${makedepends[@]}" "${arch_makedepends[@]}")
-if declare -F check >/dev/null && ! check_buildenv check n; then
-	deps+=("${checkdepends[@]}" "${arch_checkdepends[@]}")
-fi
-printf '%s\n' "$CARCH" "${deps[@]}"
-`
-
-// outputIn runs a command in dir and returns its output.
-func outputIn(dir, name string, args ...string) (string, error) {
 	var stdout, stderr bytes.Buffer
-	cmd := exec.Command(name, args...)
+	cmd := exec.Command("makepkg", "--printsrcinfo")
 	cmd.Dir = dir
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("%s in %s: %w: %s", name, dir, err, strings.TrimSpace(stderr.String()))
+		return Package{}, fmt.Errorf("makepkg --printsrcinfo in %s: %w: %s", dir, err, strings.TrimSpace(stderr.String()))
 	}
-	return stdout.String(), nil
+	return parseSrcInfo(stdout.String(), pkg, carch()), nil
 }
 
-// parseSrcInfo reads what .SRCINFO text declares for pkg: Provides,
-// Conflicts and Depends, the latter with its variant for arch
-// (depends_x86_64). A field set in pkg's own section replaces the one of
-// the pkgbase section.
+// carch is the architecture makepkg builds for: $CARCH when it is set,
+// which makepkg prefers to makepkg.conf, otherwise the machine's, which is
+// what the stock /etc/makepkg.conf sets. A CARCH set only in a makepkg.conf
+// file isn't seen; then the _<arch> lists of another architecture are read.
+// Exporting CARCH makes arcus use it too.
+func carch() string {
+	if a := os.Getenv("CARCH"); a != "" {
+		return a
+	}
+	var u syscall.Utsname
+	if syscall.Uname(&u) != nil {
+		return ""
+	}
+	var b []byte
+	for _, c := range u.Machine { // int8 or uint8, by platform
+		if c == 0 {
+			break
+		}
+		b = append(b, byte(c))
+	}
+	return string(b)
+}
+
+// parseSrcInfo reads what .SRCINFO text declares for pkg the way makepkg
+// builds it. Provides, Conflicts and Depends: the list pkg's own section
+// sets, otherwise the pkgbase list with its _<arch> variant, then pkg's own
+// _<arch> variant (makepkg merges the pkgbase variants after sourcing the
+// PKGBUILD and a package's own after its package function). BuildDepends:
+// the pkgbase depends, makedepends and checkdepends with their variants,
+// which makepkg --syncdeps installs; checkdepends always count, even when
+// no check() runs. An emptied list prints as "depends = " and sets it to
+// nothing.
+//
+// .SRCINFO can't tell everything makepkg does: "depends+=(x)" in a package
+// function prints like an override, so the pkgbase depends_<arch> it keeps
+// is dropped here; an arch "+=" next to a plain override can list a
+// dependency the built package doesn't have; and for an arch=(any) recipe
+// makepkg omits makedepends_<arch>, which the build still needs.
 func parseSrcInfo(info, pkg, arch string) Package {
 	base, own := map[string][]string{}, map[string][]string{}
-	section := "pkgbase"
+	section := base
 	for line := range strings.Lines(info) {
-		k, v, ok := strings.Cut(strings.TrimSpace(line), " = ")
+		line = strings.TrimSpace(line)
+		k, v, ok := strings.Cut(line, " = ")
 		if !ok {
+			if k, ok = strings.CutSuffix(line, " ="); !ok {
+				continue
+			}
+			v = ""
+		}
+		switch k {
+		case "pkgbase":
+			section = base
+			continue
+		case "pkgname":
+			section = nil
+			if v == pkg {
+				section = own
+			}
 			continue
 		}
-		switch {
-		case k == "pkgname":
-			section = v
-		case section == "pkgbase":
-			base[k] = append(base[k], v)
-		case section == pkg:
-			own[k] = append(own[k], v)
+		if section == nil {
+			continue
+		}
+		if _, set := section[k]; !set {
+			section[k] = []string{}
+		}
+		if v != "" {
+			section[k] = append(section[k], v)
 		}
 	}
 	field := func(k string) []string {
-		if v, ok := own[k]; ok {
-			return v
+		list, set := own[k]
+		if !set {
+			list = slices.Concat(base[k], base[k+"_"+arch])
 		}
-		return base[k]
+		return slices.Concat(list, own[k+"_"+arch])
 	}
+	build := func(k string) []string { return slices.Concat(base[k], base[k+"_"+arch]) }
 	return Package{
-		Provides:  field("provides"),
-		Conflicts: field("conflicts"),
-		Depends:   slices.Concat(field("depends"), field("depends_"+arch)),
+		Provides:     field("provides"),
+		Conflicts:    field("conflicts"),
+		Depends:      field("depends"),
+		BuildDepends: slices.Concat(build("depends"), build("makedepends"), build("checkdepends")),
 	}
 }
 

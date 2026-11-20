@@ -562,34 +562,82 @@ func Local(in Input, h Half, steps []Step) ([]Step, error) {
 	return slices.Concat(kept, ordered, steps[after:]), nil
 }
 
-// need is a dependency on pending own builds: any one of them satisfies it.
+// need is a dependency on pending own builds. Any one of of meets it. An
+// install need that installed packages meet has rm, one list per installed
+// satisfier of the pending builds that would remove it (never empty): it is
+// also met while one satisfier has none of its removers in the batch.
 type need struct {
 	build bool // makepkg needs it installed before the build
 	of    []string
+	rm    [][]string
+}
+
+func (nd need) met(batch map[string]bool) bool {
+	in := func(p string) bool { return batch[p] }
+	return slices.ContainsFunc(nd.of, in) ||
+		slices.ContainsFunc(nd.rm, func(removers []string) bool { return !slices.ContainsFunc(removers, in) })
 }
 
 // nextBatch returns the pending own build installs that can go in the next
-// batch, in their order, with the packages installed by then: the ones
-// that need no other pending build to build, less the ones whose install
-// needs a pending build outside the batch.
+// batch, in their order, with the packages installed by then.
+//
+// It works in pending order, so the result doesn't depend on map order.
+// First, as before removals counted: the builds with no build need, less
+// those whose needs on pending builds point outside the batch, until
+// stable; a need an installed package meets counts as met. Then, one at a
+// time, a build whose installed satisfier another member would remove, with
+// the first step re-run after each. Last, a dropped build without build
+// needs comes back when every member's needs stay met with it, and all of
+// it repeats until nothing changes.
 func nextBatch(pending []Step, incoming, installed map[string]system.Package) ([]Step, error) {
 	needs := localNeeds(pending, incoming, installed)
-	met := func(nd need, batch map[string]bool) bool {
-		return slices.ContainsFunc(nd.of, func(p string) bool { return batch[p] })
+	names := make([]string, len(pending))
+	for i, s := range pending {
+		names[i] = s.Names[0]
 	}
+	builds := func(n string) bool { return slices.ContainsFunc(needs[n], func(nd need) bool { return nd.build }) }
 	batch := map[string]bool{}
-	for _, s := range pending {
-		if !slices.ContainsFunc(needs[s.Names[0]], func(nd need) bool { return nd.build }) {
-			batch[s.Names[0]] = true
+	for _, n := range names {
+		if !builds(n) {
+			batch[n] = true
 		}
 	}
-	for changed := true; changed; {
-		changed = false
-		for n := range batch {
-			if slices.ContainsFunc(needs[n], func(nd need) bool { return !met(nd, batch) }) {
-				delete(batch, n)
-				changed = true
+	unmet := func(n string, ignoreRemovals bool) bool {
+		return slices.ContainsFunc(needs[n], func(nd need) bool {
+			return !(ignoreRemovals && nd.rm != nil) && !nd.met(batch)
+		})
+	}
+	settle := func() {
+		for changed := true; changed; {
+			changed = false
+			for _, n := range names {
+				if batch[n] && unmet(n, true) {
+					delete(batch, n)
+					changed = true
+				}
 			}
+		}
+	}
+	for {
+		settle()
+		if i := slices.IndexFunc(names, func(n string) bool { return batch[n] && unmet(n, false) }); i >= 0 {
+			delete(batch, names[i])
+			continue
+		}
+		back := false
+		for _, n := range names {
+			if batch[n] || builds(n) {
+				continue
+			}
+			batch[n] = true
+			if slices.ContainsFunc(names, func(m string) bool { return batch[m] && unmet(m, false) }) {
+				delete(batch, n)
+				continue
+			}
+			back = true
+		}
+		if !back {
+			break
 		}
 	}
 	if len(batch) == 0 {
@@ -599,11 +647,22 @@ func nextBatch(pending []Step, incoming, installed map[string]system.Package) ([
 }
 
 // localNeeds lists what each pending own build needs from the other ones.
-// A dependency on the name of a pending own build needs that one, even
-// while an older version is installed: its recipe changed. Otherwise it
-// needs one of the pending builds that provide the name, unless an
-// installed package already does and the dependency has no version
-// constraint, which arcus doesn't compare.
+// A name the build provides itself is no need, unless the dependency has a
+// version, which arcus doesn't compare. A dependency on the name of a
+// pending own build needs that one, even while an older version is
+// installed: its recipe changed. Otherwise an installed satisfier (see
+// satisfiers) meets a build need, and an install need too unless every
+// installed satisfier has a pending remover: then it is met while one of
+// them stays (see need). Without one, it needs one of the pending builds
+// that provide the name, and with none of those either it is pacman's to
+// resolve, as when everything was one transaction.
+//
+// It doesn't cover everything a batch boundary can break: a removal in a
+// later batch can break an own build installed in an earlier one, a build
+// can miss a package an earlier batch removed, two consumers that block
+// each other's satisfier, or two builds that need each other, can be
+// refused although another order works, and a versioned dependency waits
+// for a pending provider even when the installed one would do.
 func localNeeds(steps []Step, incoming, installed map[string]system.Package) map[string][]need {
 	pending := map[string]bool{}
 	for _, s := range steps {
@@ -612,41 +671,95 @@ func localNeeds(steps []Step, incoming, installed map[string]system.Package) map
 	needs := map[string][]need{}
 	for _, s := range steps {
 		n := s.Names[0]
+		self := incoming[n]
 		add := func(deps []string, build bool) {
 			for _, dep := range deps {
 				name, versioned := dep, false
 				if i := strings.IndexAny(dep, "<>="); i >= 0 {
 					name, versioned = dep[:i], true
 				}
-				var of []string
-				_, there := installed[name]
-				switch {
-				case name == n:
-				case pending[name]:
-					of = []string{name}
-				case !versioned && (there || len(providers(installed, name)) > 0):
-				default:
-					of = slices.DeleteFunc(providers(incoming, name), func(p string) bool { return !pending[p] || p == n })
+				if name == n || !versioned && provides(self, name) {
+					continue
 				}
-				if len(of) > 0 {
-					needs[n] = append(needs[n], need{build: build, of: of})
+				if pending[name] {
+					needs[n] = append(needs[n], need{build: build, of: []string{name}})
+					continue
+				}
+				of := slices.DeleteFunc(providers(incoming, name), func(p string) bool { return !pending[p] || p == n })
+				sat := satisfiers(installed, name, n, self)
+				switch {
+				case versioned || len(sat) == 0:
+					if len(of) > 0 {
+						needs[n] = append(needs[n], need{build: build, of: of})
+					}
+				case !build:
+					var rm [][]string
+					for _, q := range sat {
+						r := removers(steps, incoming, n, q, installed[q])
+						if len(r) == 0 {
+							rm = nil
+							break
+						}
+						rm = append(rm, r)
+					}
+					if rm != nil {
+						needs[n] = append(needs[n], need{of: of, rm: rm})
+					}
 				}
 			}
 		}
-		add(incoming[n].BuildDepends, true)
-		add(incoming[n].Depends, false)
+		add(self.BuildDepends, true)
+		add(self.Depends, false)
 	}
 	return needs
+}
+
+// satisfiers returns the installed packages that are or provide name, less
+// those that consumer, whose package is c, removes by its own install: a
+// conflict either way, or the same name. Sorted.
+func satisfiers(installed map[string]system.Package, name, consumer string, c system.Package) []string {
+	var out []string
+	for _, q := range slices.Sorted(maps.Keys(installed)) {
+		p := installed[q]
+		if q != name && !provides(p, name) {
+			continue
+		}
+		if q == consumer || conflicts(c, q, p) || conflicts(p, consumer, c) {
+			continue
+		}
+		out = append(out, q)
+	}
+	return out
+}
+
+// removers returns the pending builds other than consumer whose install
+// removes the installed package q: a conflict either way, or the same name.
+// Sorted.
+func removers(steps []Step, incoming map[string]system.Package, consumer, q string, p system.Package) []string {
+	var out []string
+	for _, s := range steps {
+		r := s.Names[0]
+		if r != consumer && (r == q || conflicts(incoming[r], q, p) || conflicts(p, r, incoming[r])) {
+			out = append(out, r)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// provides reports whether p provides name, whatever the version.
+func provides(p system.Package, name string) bool {
+	return slices.ContainsFunc(p.Provides, func(prov string) bool {
+		n, _, _ := strings.Cut(prov, "=")
+		return n == name
+	})
 }
 
 // providers returns the packages of pkgs that provide name, sorted.
 func providers(pkgs map[string]system.Package, name string) []string {
 	var out []string
 	for _, n := range slices.Sorted(maps.Keys(pkgs)) {
-		if slices.ContainsFunc(pkgs[n].Provides, func(p string) bool {
-			prov, _, _ := strings.Cut(p, "=")
-			return prov == name
-		}) {
+		if provides(pkgs[n], name) {
 			out = append(out, n)
 		}
 	}
@@ -654,17 +767,93 @@ func providers(pkgs map[string]system.Package, name string) []string {
 }
 
 // cycle returns one cycle among pending own builds none of which can go in
-// a batch: each has a need, which only other pending ones meet, so
-// following the first one from any of them comes back to one already
-// visited.
+// a batch: each has a need that only other pending ones can meet or would
+// break, so following the first one from any of them comes back to one
+// already visited.
 func cycle(pending []Step, needs map[string][]need) []string {
 	var path []string
-	for n := pending[0].Names[0]; ; n = needs[n][0].of[0] {
+	for n := pending[0].Names[0]; ; {
 		if i := slices.Index(path, n); i >= 0 {
 			return append(path[i:], n)
 		}
 		path = append(path, n)
+		if nd := needs[n][0]; len(nd.of) > 0 {
+			n = nd.of[0]
+		} else {
+			n = nd.rm[0][0]
+		}
 	}
+}
+
+// CheckBatch refuses a root batch of own builds when one of them has no
+// package to read, or when the batch would remove, before installing them,
+// the only package that one of them depends on. The plan
+// comes from .SRCINFO, which can miss a dependency the built package has
+// (see system.SrcInfo); the hash then matches, and pacman -Rdd would succeed
+// before pacman -U fails. It compares names only, so a soname dependency
+// (libfoo.so=1-64) counts, and refuses only when nothing of any version
+// provides the name after the batch. A dependency that no installed package
+// meets before the batch, or only ones the build itself removes, is
+// pacman's to resolve, as in localNeeds. It checks only the batch's own
+// installs: an installed package that a same-name upgrade stops providing
+// for is let through, as Conflicts lets "needed by" removals through.
+//
+// The refusal heals on the next run, which plans from the built package,
+// unless the build is rebuilt: then the recipe has to list the dependency.
+// With nothing pending providing it, the next run delays the build behind
+// the removal, where pacman decides.
+func CheckBatch(h Half, steps []Step, rebuild []string) error {
+	for _, s := range steps {
+		if s.Op != InstallLocal {
+			continue
+		}
+		for _, n := range s.Names {
+			if _, ok := h.Incoming[n]; !ok {
+				return fmt.Errorf("own build %s has no package to install; nothing was done, run the command again", n)
+			}
+		}
+	}
+	removed := map[string]bool{}
+	var targets []string
+	for _, s := range steps {
+		switch s.Op {
+		case RemoveConflicting:
+			for _, n := range s.Names {
+				removed[n] = true
+			}
+		case InstallLocal:
+			targets = append(targets, s.Names...)
+		}
+	}
+	after := map[string]system.Package{}
+	for q, p := range h.Packages {
+		if !removed[q] {
+			after[q] = p
+		}
+	}
+	for _, t := range targets {
+		after[t] = h.Incoming[t] // a same-name upgrade replaces the old package
+	}
+	for _, t := range targets {
+		p := h.Incoming[t]
+		for _, dep := range p.Depends {
+			name := dep
+			if i := strings.IndexAny(dep, "<>="); i >= 0 {
+				name = dep[:i]
+			}
+			if len(satisfiers(h.Packages, name, t, p)) == 0 {
+				continue
+			}
+			if _, ok := after[name]; ok || len(providers(after, name)) > 0 {
+				continue
+			}
+			if slices.Contains(rebuild, t) {
+				return fmt.Errorf("%s needs %s, which this batch would remove, and its recipe doesn't list it: add it to depends in the PKGBUILD; this batch was not installed", t, dep)
+			}
+			return fmt.Errorf("%s needs %s, which this batch would remove; this batch was not installed, run the command again", t, dep)
+		}
+	}
+	return nil
 }
 
 // conflicts reports whether p, by its conflicts, rules out the package

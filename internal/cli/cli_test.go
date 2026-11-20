@@ -1613,12 +1613,19 @@ func TestDoctorReleasesTheHoldFirst(t *testing.T) {
 // An own build that another pending own build needs to build is installed
 // first, in its own batch; unrelated builds share the first batch.
 func TestOwnBuildDependencies(t *testing.T) {
-	for _, kind := range []string{"depends", "makedepends", "checkdepends"} {
-		t.Run(kind, func(t *testing.T) {
+	for _, c := range []struct{ name, kind, check string }{
+		{"depends", "depends", "check() { :; }\n"},
+		{"makedepends", "makedepends", "check() { :; }\n"},
+		{"checkdepends", "checkdepends", "check() { :; }\n"},
+		// Check dependencies count even without a check function.
+		{"checkdepends without check", "checkdepends", ""},
+	} {
+		kind := c.kind
+		t.Run(c.name, func(t *testing.T) {
 			e := newEnv(t)
 			t.Setenv("XDG_CACHE_HOME", "")
 			e.module("builds", "[packages]\nlocal = [\"consumer\", \"base\", \"other\"]\n", map[string]string{
-				"pkg/consumer/PKGBUILD": "pkgname=consumer\npkgver=1\npkgrel=1\ncheck() { :; }\n",
+				"pkg/consumer/PKGBUILD": "pkgname=consumer\npkgver=1\npkgrel=1\n" + c.check,
 				"pkg/base/PKGBUILD":     "pkgname=base\npkgver=1\npkgrel=1\n",
 				"pkg/other/PKGBUILD":    "pkgname=other\npkgver=1\npkgrel=1\n",
 			})
@@ -1687,8 +1694,7 @@ func TestOwnBuildBatchHashRefusesChangedRecipe(t *testing.T) {
 	}
 }
 
-// A build waits for a pending own build that provides what it needs, and
-// check dependencies only count when the PKGBUILD has a check function.
+// A build waits for a pending own build that provides what it needs.
 func TestOwnBuildDependencyThroughProvides(t *testing.T) {
 	e := newEnv(t)
 	t.Setenv("XDG_CACHE_HOME", "")
@@ -1696,7 +1702,7 @@ func TestOwnBuildDependencyThroughProvides(t *testing.T) {
 		"pkg/consumer/PKGBUILD":   "pkgname=consumer\npkgver=1\npkgrel=1\n",
 		"pkg/libfoo-git/PKGBUILD": "pkgname=libfoo-git\npkgver=1\npkgrel=1\n",
 	})
-	e.sys.SetMeta("consumer makedepends libfoo>=1", "libfoo-git provides libfoo=1", "libfoo-git checkdepends consumer")
+	e.sys.SetMeta("consumer makedepends libfoo>=1", "libfoo-git provides libfoo=1")
 	must(t, e.run("on", "-y", "builds"))
 	if e.count("pacman -U") != 2 {
 		t.Fatal(strings.Join(e.sys.Log(), "\n"))
@@ -1716,7 +1722,7 @@ func TestOwnBuildBatchReplacesWhatAnEarlierOneNeeds(t *testing.T) {
 	})
 	e.sys.SetPackages("old")
 	e.sys.SetRequires("a old")
-	e.sys.SetMeta("replacement makedepends a", "replacement provides old", "replacement conflicts old")
+	e.sys.SetMeta("replacement makedepends a", "replacement provides old", "replacement conflicts old", "a pkgdepends old")
 	must(t, e.run("on", "-y", "builds"))
 	if got := e.sys.Packages(); !slices.Equal(got, []string{"a", "replacement"}) {
 		t.Fatalf("packages = %v\n%s", got, strings.Join(e.sys.Log(), "\n"))
@@ -1782,4 +1788,36 @@ func TestOwnBuildRebuildKeepsOrder(t *testing.T) {
 	e.sys.SetPackages("consumer")
 	must(t, e.run("rebuild", "-y", "consumer", "base"))
 	contains(t, e.sys.Packages(), "base", "consumer")
+}
+
+// The root stage reads the built packages: when one depends on something
+// .SRCINFO didn't list and another member of its batch removes the only
+// provider, it refuses before removing anything.
+func TestOwnBuildBatchKeepsWhatItsPackagesNeed(t *testing.T) {
+	e := newEnv(t)
+	t.Setenv("XDG_CACHE_HOME", "")
+	e.module("builds", "[packages]\nlocal = [\"c\", \"r\"]\n", map[string]string{
+		"pkg/c/PKGBUILD": "pkgname=c\npkgver=1\npkgrel=1\n",
+		"pkg/r/PKGBUILD": "pkgname=r\npkgver=1\npkgrel=1\n",
+	})
+	e.sys.SetPackages("x")
+	meta := []string{"x provides virt", "r conflicts x"}
+	e.sys.SetMeta(meta...)
+
+	a := e.app("")
+	sudo := a.sudo
+	a.sudo = func(args []string) error {
+		// The built package depends on virt; the recipe's .SRCINFO didn't say.
+		e.sys.SetMeta(append(meta, "c pkgdepends virt")...)
+		return sudo(args)
+	}
+	err := a.run([]string{"on", "-y", "builds"})
+	if err == nil || !strings.Contains(err.Error(), "c needs virt, which this batch would remove") {
+		t.Fatalf("on = %v", err)
+	}
+	log := strings.Join(e.sys.Log(), "\n")
+	if strings.Contains(log, "-Rdd") || strings.Contains(log, "pacman -U") {
+		t.Fatalf("the batch ran:\n%s", log)
+	}
+	contains(t, e.sys.Packages(), "x")
 }

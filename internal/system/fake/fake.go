@@ -1,8 +1,7 @@
 // Package fake puts stand-ins for pacman, yay, paru, aurlock, makepkg,
-// systemctl, id and gpasswd on PATH, and for libmakepkg in
-// MAKEPKG_LIBRARY, for tests. They keep their
-// "system" in text files in a temporary directory and log every call, so
-// nothing real is touched.
+// systemctl, id and gpasswd on PATH for tests. They keep their "system" in
+// text files in a temporary directory and log every call, so nothing real
+// is touched.
 package fake
 
 import (
@@ -149,7 +148,7 @@ fi
 echo "makepkg $* in $(basename "$PWD")" >> "$dir/log"
 if [ -f "$dir/fail" ] && grep -qx makepkg "$dir/fail"; then exit 1; fi
 . ./PKGBUILD
-check=; [ -e "$dir/nocheck" ] || ! grep -q '^check()' PKGBUILD || check=checkdepends
+check=; ! grep -q '^check()' PKGBUILD || check=checkdepends
 for dep in $(awk -v p="$pkgname" -v c="$check" '$1 == p && ($2 == "depends" || $2 == "makedepends" || $2 == c) { print $3 }' "$dir/meta" | sed 's/[<>=].*//'); do
   for q in $(cat "$dir/pkgs"); do
     [ "$q" = "$dep" ] && continue 2
@@ -159,35 +158,6 @@ for dep in $(awk -v p="$pkgname" -v c="$check" '$1 == p && ($2 == "depends" || $
 done
 mkdir -p "$PKGDEST"
 cat $(find . -type f | sort) > "$PKGDEST/$pkgname-$pkgver-$pkgrel-x86_64.pkg.tar.zst"
-`
-
-// libmakepkg's configuration loads CARCH=x86_64, with checks on unless
-// $dir/nocheck exists, and sourcing a PKGBUILD adds the depends,
-// makedepends and checkdepends (and their _<arch> variants) that $dir/meta
-// lists for it.
-const configScript = `dir=%DIR%
-load_makepkg_config() {
-  CARCH=x86_64
-  BUILDENV=(check)
-  if [[ -e $dir/nocheck ]]; then BUILDENV=('!check'); fi
-}
-source_safe() {
-  source "$1"
-  touch "$dir/meta"
-  local p k v
-  while read -r p k v; do
-    if [[ $p == "$pkgname" && $k =~ ^(depends|makedepends|checkdepends)(_[a-z0-9_]+)?$ ]]; then
-      eval "$k+=(\"\$v\")"
-    fi
-  done < "$dir/meta"
-}
-`
-
-const optionScript = `check_buildenv() {
-  local v=y
-  [[ " ${BUILDENV[*]} " == *" !$1 "* ]] && v=n
-  [[ $v == "$2" ]]
-}
 `
 
 const systemctlScript = `#!/bin/sh
@@ -226,8 +196,8 @@ case $1 in
 esac
 `
 
-// New installs the fakes in a temporary directory and puts it first on PATH,
-// and its libmakepkg in MAKEPKG_LIBRARY, for the rest of the test.
+// New installs the fakes in a temporary directory and puts it first on PATH
+// for the rest of the test.
 func New(t *testing.T) *System {
 	t.Helper()
 	s := &System{t: t, Dir: t.TempDir()}
@@ -246,17 +216,6 @@ func New(t *testing.T) *System {
 		}
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	lib := filepath.Join(s.Dir, "makepkg")
-	if err := os.MkdirAll(filepath.Join(lib, "util"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for name, script := range map[string]string{"config.sh": configScript, "option.sh": optionScript} {
-		script = strings.ReplaceAll(script, "%DIR%", "'"+s.Dir+"'")
-		if err := os.WriteFile(filepath.Join(lib, "util", name), []byte(script), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	t.Setenv("MAKEPKG_LIBRARY", lib)
 	return s
 }
 
@@ -304,9 +263,6 @@ func (s *System) SetDeps(pkgs ...string) { s.set("deps", pkgs) }
 // SetMeta replaces what packages provide, conflict with and depend on:
 // "<package> <field> <name>" lines (see pkgScript).
 func (s *System) SetMeta(lines ...string) { s.set("meta", lines) }
-
-// SetNoCheck turns makepkg's check function off, as BUILDENV=(!check) does.
-func (s *System) SetNoCheck() { s.set("nocheck", nil) }
 
 // SetRequires replaces the dependencies: "<package> <dependency>" pairs.
 func (s *System) SetRequires(pairs ...string) { s.set("requires", pairs) }

@@ -149,6 +149,9 @@ func (a *app) execSystem(args []string) error {
 	if plan.Hash(steps) != *hash {
 		return errors.New("the root steps changed since the plan was shown; nothing was done, run the command again")
 	}
+	if err := plan.CheckBatch(sit, steps, a.rebuild); err != nil {
+		return err
+	}
 	return a.runSteps(h, sit.State, steps, in, r, *force)
 }
 
