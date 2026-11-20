@@ -47,15 +47,21 @@ func (r *report) fixable(format string, args ...any) {
 // repairing comes right before a repair changes anything; it reports
 // whether to go ahead, which a cancelled run doesn't.
 func (r *report) repairing() bool {
+	cancelled := func() bool {
+		if r.ctx != nil && r.ctx.Err() != nil {
+			r.failed(errors.New("cancelled"))
+			return true
+		}
+		return false
+	}
+	if cancelled() {
+		return false
+	}
 	if r.beforeRepair != nil {
 		r.beforeRepair()
 		r.beforeRepair = nil
 	}
-	if r.ctx != nil && r.ctx.Err() != nil {
-		r.failed(errors.New("cancelled"))
-		return false
-	}
-	return true
+	return !cancelled()
 }
 
 func (r *report) repaired(format string, args ...any) {

@@ -59,9 +59,13 @@ func (a *app) warnHistory(err error) {
 // It returns an error when the command was cancelled meanwhile, so nothing
 // changes after a Ctrl-C there.
 func (a *app) begin() error {
+	cancelled := errors.New("cancelled, nothing was changed")
+	if a.ctx.Err() != nil {
+		return cancelled
+	}
 	a.beginHistory()
-	if err := a.ctx.Err(); err != nil {
-		return errors.New("cancelled, nothing was changed")
+	if a.ctx.Err() != nil {
+		return cancelled
 	}
 	return nil
 }

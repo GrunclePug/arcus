@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/grunclepug/arcus/internal/layer"
 	"github.com/grunclepug/arcus/internal/state"
@@ -144,19 +145,25 @@ func TestFirstCommandOnNoStateIsTheFirstEntry(t *testing.T) {
 	e.wantSubjects("on -y tool")
 }
 
-func TestFailedCommandWithACancelledContextIsRecorded(t *testing.T) {
+// Ctrl-C during the package transaction: the command still gets its
+// entry, marked failed.
+func TestInterruptedCommandIsRecordedAsFailed(t *testing.T) {
 	e := histEnv(t)
-	e.module("tool", "[packages]\npacman = [\"tool\"]\n", nil)
-	must(t, e.run("on", "-y", "tool"))
+	e.wlBase()
+	e.sys.Slow("0.3")
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	defer cancel()
 	e.ctx = ctx
-	if err := e.run("off", "-y", "tool"); err == nil {
-		t.Skip("off ran despite the cancelled context")
+	go func() {
+		for deadline := time.Now().Add(10 * time.Second); !e.sys.Started() && time.Now().Before(deadline); {
+			time.Sleep(5 * time.Millisecond)
+		}
+		cancel()
+	}()
+	if err := e.run("on", "-y", "wl-base"); err == nil {
+		t.Fatal("the interrupted on succeeded")
 	}
-	if got := e.subjects()[0]; got != "off -y tool (failed)" {
-		t.Errorf("latest = %q", got)
-	}
+	e.wantSubjects("on -y wl-base (failed)")
 }
 
 func TestHostChangeWithAnEmptyPlanIsRecorded(t *testing.T) {
@@ -634,6 +641,7 @@ func TestCancelDuringBeginChangesNothing(t *testing.T) {
 	must(t, e.run("on", "-y", "b"))
 	hostBefore, err := os.ReadFile(e.hostPath())
 	must(t, err)
+	must(t, os.Chmod(e.historyDir(), 0o755))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	e.ctx = ctx
@@ -650,6 +658,12 @@ func TestCancelDuringBeginChangesNothing(t *testing.T) {
 	if now, _ := os.ReadFile(e.hostPath()); !bytes.Equal(now, hostBefore) {
 		t.Error("a cancelled on changed the host file")
 	}
+	if info, err := os.Stat(e.historyDir()); err != nil {
+		t.Error(err)
+	} else if info.Mode().Perm() != 0o755 {
+		t.Errorf("a cancelled command touched the history: mode %v", info.Mode())
+	}
+	e.wantSubjects("on -y b", "on -y m")
 }
 
 // When the entry of what changed in between can't be made, the command
@@ -688,6 +702,7 @@ func TestCancelledDoctorFixRepairsNothing(t *testing.T) {
 	must(t, layer.NewHome(e.home, filepath.Join(e.home, ".local", "state", "arcus"), dirs).Activate(context.Background(), "orphan", nil))
 	lock := filepath.Join(e.historyDir(), "HEAD.lock")
 	must(t, os.WriteFile(lock, nil, 0o644))
+	must(t, os.Chmod(e.historyDir(), 0o755))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	e.ctx = ctx
@@ -696,6 +711,11 @@ func TestCancelledDoctorFixRepairsNothing(t *testing.T) {
 	}
 	if _, err := os.Stat(lock); err != nil {
 		t.Error("a cancelled doctor -fix removed the stale lock")
+	}
+	if info, err := os.Stat(e.historyDir()); err != nil {
+		t.Error(err)
+	} else if info.Mode().Perm() != 0o755 {
+		t.Errorf("a cancelled doctor -fix touched the history: mode %v", info.Mode())
 	}
 	if e.read("home/u/.orphan") == "<missing>" {
 		t.Error("a cancelled doctor -fix rolled the orphan back")
