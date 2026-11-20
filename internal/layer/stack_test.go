@@ -829,20 +829,24 @@ func TestCachesDeployedBeforeTheSkipAreStale(t *testing.T) {
 }
 
 func TestRewrittenCacheIsRemoved(t *testing.T) {
-	sb := newSandbox(t, halves[0])
-	pristine := sb.snapshot()
-	sb.moduleFile("p", "bin/tool", "tool")
-	must(t, sb.activate("p"))
-	host, _ := sb.deployOldCache("tool.cpython-314.pyc", false)
-	pythonRewrite(t, host, pycBytes("rewritten"))
+	for _, name := range []string{"tool.cpython-314.pyc", "tool.cpython-314.opt-1.pyc", "tool..helper.cpython-314.pyc"} {
+		t.Run(name, func(t *testing.T) {
+			sb := newSandbox(t, halves[0])
+			pristine := sb.snapshot()
+			sb.moduleFile("p", "bin/tool", "tool")
+			must(t, sb.activate("p"))
+			host, _ := sb.deployOldCache(name, false)
+			pythonRewrite(t, host, pycBytes("rewritten"))
 
-	findings, err := sb.s.Audit("p", sb.stack)
-	must(t, err)
-	if len(findings) != 0 {
-		t.Fatalf("findings = %v", findings)
+			findings, err := sb.s.Audit("p", sb.stack)
+			must(t, err)
+			if len(findings) != 0 {
+				t.Fatalf("findings = %v", findings)
+			}
+			must(t, sb.deactivate("p", false))
+			assertSame(t, pristine, sb.snapshot())
+		})
 	}
-	must(t, sb.deactivate("p", false))
-	assertSame(t, pristine, sb.snapshot())
 }
 
 func TestRewrittenCacheRestoresBackup(t *testing.T) {

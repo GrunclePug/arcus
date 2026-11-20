@@ -53,9 +53,9 @@ func (s *Stacker) inCache(e Entry) bool {
 // tree itself (home or system).
 func cacheEntry(e Entry) bool {
 	stem, ok := strings.CutSuffix(filepath.Base(e.Src), ".pyc")
-	parts := strings.Split(stem, ".")
+	tag := strings.LastIndexByte(stem, '.') // the module name may itself hold dots
 	return e.Kind == KindLink && filepath.Base(filepath.Dir(e.Src)) == "__pycache__" &&
-		ok && len(parts) >= 2 && !slices.Contains(parts, "")
+		ok && tag > 0 && tag < len(stem)-1
 }
 
 // isPyc reports whether path is a regular file laid out like a CPython
