@@ -104,9 +104,9 @@ func (a *app) cmdDoctor(args []string) error {
 	failed := false
 	defer func() { a.record(failed) }()
 
-	// Before any repair, so the history can record it.
+	// Before any repair, so the history can record it; not once cancelled.
 	var unlocked []string
-	if o.fix {
+	if o.fix && a.ctx.Err() == nil {
 		unlocked = a.fixHistory()
 	}
 

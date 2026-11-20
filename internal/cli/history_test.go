@@ -686,11 +686,16 @@ func TestCancelledDoctorFixRepairsNothing(t *testing.T) {
 	e.module("orphan", "", map[string]string{"home/.orphan": "x"})
 	dirs := map[string]string{"orphan": filepath.Join(e.home, ".config", "arcus", "modules", "orphan")}
 	must(t, layer.NewHome(e.home, filepath.Join(e.home, ".local", "state", "arcus"), dirs).Activate(context.Background(), "orphan", nil))
+	lock := filepath.Join(e.historyDir(), "HEAD.lock")
+	must(t, os.WriteFile(lock, nil, 0o644))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	e.ctx = ctx
 	if err := e.run("doctor", "-fix"); err == nil {
 		t.Error("a cancelled doctor -fix succeeded")
+	}
+	if _, err := os.Stat(lock); err != nil {
+		t.Error("a cancelled doctor -fix removed the stale lock")
 	}
 	if e.read("home/u/.orphan") == "<missing>" {
 		t.Error("a cancelled doctor -fix rolled the orphan back")
