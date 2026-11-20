@@ -769,7 +769,7 @@ func TestCheckBatch(t *testing.T) {
 			append([]Step{removes("x")}, install("c", "r")...), []string{"c"}, "add it to depends in the PKGBUILD"},
 		{"a soname dependency counts by name",
 			world{"lib": pkg("p:libfoo.so=1-64")}, world{"c": pkg("d:libfoo.so=1-64"), "r": pkg("c:lib")},
-			append([]Step{removes("lib")}, install("c", "r")...), nil, "c needs libfoo.so=1-64, which this batch would remove and nothing pending provides; this batch was not installed: install a provider of libfoo.so first"},
+			append([]Step{removes("lib")}, install("c", "r")...), nil, "c needs libfoo.so=1-64, which this batch would remove and nothing in it provides; this batch was not installed: run the command again if an own build provides libfoo.so, otherwise install a provider of it first"},
 		{"a same-name upgrade stops providing what another install needs",
 			world{"x": pkg("p:virt"), "y": pkg("p:virt")}, world{"x": {}, "c": pkg("d:virt"), "r": pkg("c:y")},
 			append([]Step{removes("y")}, install("x", "c", "r")...), nil, "c needs virt"},

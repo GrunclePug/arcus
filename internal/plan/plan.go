@@ -806,8 +806,9 @@ func cycle(pending []Step, needs map[string][]need) []string {
 //
 // The refusal heals on the next run, which plans from the built package,
 // unless the build is rebuilt (then the recipe has to list the dependency)
-// or the dependency has a version and nothing pending provides it (then
-// the next run plans the same batch, so a provider has to come first).
+// or the dependency has a version and no own build provides it (then the
+// next run plans the same batch, so a provider has to come first). Root sees
+// only its batch, so the message names both ways.
 // With nothing pending providing it, the next run delays the build behind
 // the removal, where pacman decides.
 func CheckBatch(h Half, steps []Step, rebuild []string) error {
@@ -861,7 +862,7 @@ func CheckBatch(h Half, steps []Step, rebuild []string) error {
 			case name != dep:
 				// A versioned need waits only for a pending provider, so with
 				// none the next run plans the same batch.
-				return fmt.Errorf("%s needs %s, which this batch would remove and nothing pending provides; this batch was not installed: install a provider of %s first", t, dep, name)
+				return fmt.Errorf("%s needs %s, which this batch would remove and nothing in it provides; this batch was not installed: run the command again if an own build provides %s, otherwise install a provider of it first", t, dep, name)
 			}
 			return fmt.Errorf("%s needs %s, which this batch would remove; this batch was not installed, run the command again", t, dep)
 		}
