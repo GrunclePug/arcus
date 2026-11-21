@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	iofs "io/fs"
+	"net/http"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -42,6 +43,8 @@ type env struct {
 	// history turns the state history on: real git, so only the tests of
 	// it do.
 	history bool
+	// client downloads AppImages (from an httptest server).
+	client *http.Client
 }
 
 func newEnv(t *testing.T) *env {
@@ -70,7 +73,7 @@ func (e *env) app(stdin string) *app {
 		root: e.root, euid: 1000, uid: os.Getuid(), history: e.history, getenv: os.Getenv,
 		hostname: func() (string, error) { return "testhost", nil },
 		exe:      func() (string, error) { return e.exe, nil },
-		version:  e.version, releases: e.releases,
+		version:  e.version, releases: e.releases, client: e.client,
 	}
 	a.sudo = func(args []string) error {
 		e.sudos++
@@ -339,6 +342,27 @@ func TestApplyPicksUpModuleChanges(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(dir, "module.toml"), manifest, 0o644))
 	must(t, e.run("apply", "-y"))
 	lacks(t, e.sys.Packages(), "mako")
+}
+
+// AppImages that came to clash in two modules that are on keep neither from
+// being turned off; the selection that remains is what must not clash.
+func TestOffDespiteAppImagesThatClash(t *testing.T) {
+	e := newEnv(t)
+	e.module("a", "", nil)
+	e.module("b", "", nil)
+	must(t, e.run("on", "-y", "a"))
+	must(t, e.run("on", "-y", "b"))
+	app := func(name string) string {
+		return fmt.Sprintf("[appimages.%s]\nurl = \"https://x.org/app\"\nsha256 = %q\npath = \"Applications/app.AppImage\"\n", name, strings.Repeat("0", 64))
+	}
+	e.module("a", app("app"), nil)
+	e.module("b", app("other"), nil)
+
+	if err := e.run("apply", "-n"); err == nil || !strings.Contains(err.Error(), "both put an AppImage") {
+		t.Fatalf("apply with the clash: %v", err)
+	}
+	must(t, e.run("off", "-n", "a"))
+	must(t, e.run("off", "-n", "b"))
 }
 
 // What a module lists and was already there is taken over, so off removes

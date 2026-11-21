@@ -16,8 +16,8 @@ import (
 
 // Resource kinds whose ownership is recorded. Each half records only its own
 // kinds: the system half pacman packages, own builds, system units and
-// groups; the user half AUR packages, user units, home directories and
-// home links.
+// groups; the user half AUR packages, user units, home directories, home
+// links and AppImages.
 const (
 	Pacman      = "pacman"
 	Local       = "local" // own builds from recipes
@@ -27,6 +27,8 @@ const (
 	Groups      = "groups"
 	HomeDirs    = "home-dirs"  // directories in $HOME, removed only when empty
 	HomeLinks   = "home-links" // symlinks in $HOME, removed only while they still point at their target
+	// AppImages in $HOME, by path. Each also has a record in State.AppImages.
+	HomeAppImages = "home-appimages"
 )
 
 // Version is the state file format. Load refuses any other, so an older
@@ -49,6 +51,31 @@ type State struct {
 	// Built records, per own build installed by arcus, the hash of the recipe
 	// it was built from, so apply rebuilds only when the recipe changes.
 	Built map[string]string `json:"built,omitempty"`
+
+	// AppImages records, per AppImage path below $HOME that is owned as
+	// HomeAppImages, the file arcus installed or took over there.
+	AppImages map[string]AppImage `json:"appimages,omitempty"`
+}
+
+// AppImage is the record of an AppImage file.
+type AppImage struct {
+	// SHA256 is the file's content when arcus installed or took it over.
+	SHA256 string `json:"sha256"`
+	// SelfUpdate is the module's self_update then: the app may replace the
+	// file, so off removes it even if it changed.
+	SelfUpdate bool `json:"self_update,omitempty"`
+	// Stamp is the file as it was when SHA256 was taken: while it still
+	// matches, the file still has SHA256 and needn't be read again.
+	Stamp Stamp `json:"stamp"`
+}
+
+// Stamp identifies a version of a file the way git's index does: any write,
+// rename over it, chmod or touch changes one of these.
+type Stamp struct {
+	Size  int64  `json:"size"`
+	MTime int64  `json:"mtime"` // nanoseconds
+	CTime int64  `json:"ctime"` // nanoseconds
+	Inode uint64 `json:"inode"`
 }
 
 // Load reads the state file. A missing file is an empty state.
@@ -138,7 +165,7 @@ func (s *State) Release(kind, module string, r Removal) {
 
 // Clone returns a deep copy, for planning against a state without changing it.
 func (s *State) Clone() *State {
-	c := &State{Version: s.Version, Modules: slices.Clone(s.Modules), Built: maps.Clone(s.Built)}
+	c := &State{Version: s.Version, Modules: slices.Clone(s.Modules), Built: maps.Clone(s.Built), AppImages: maps.Clone(s.AppImages)}
 	for kind, byModule := range s.Owned {
 		for module, names := range byModule {
 			c.Own(kind, module, names)
@@ -181,6 +208,7 @@ func (s *State) Reconcile(kind string, order []string, declares map[string][]str
 			}
 		}
 	}
+	s.dropUnownedAppImages(kind)
 	return remove
 }
 
@@ -204,8 +232,50 @@ func (s *State) Prune(kind string, present map[string]bool) []string {
 	if len(s.Owned[kind]) == 0 {
 		delete(s.Owned, kind)
 	}
+	s.dropUnownedAppImages(kind)
 	slices.Sort(pruned)
 	return pruned
+}
+
+// Owner returns the module that owns name as kind, or "".
+func (s *State) Owner(kind, name string) string {
+	for owner, names := range s.Owned[kind] {
+		if slices.Contains(names, name) {
+			return owner
+		}
+	}
+	return ""
+}
+
+// AppImage returns the record of the AppImage at path, or nil if no module
+// owns it or it has no record (one an older arcus dropped on saving).
+func (s *State) AppImage(path string) *AppImage {
+	r, ok := s.AppImages[path]
+	if !ok || s.Owner(HomeAppImages, path) == "" {
+		return nil
+	}
+	return &r
+}
+
+// SetAppImage records that module owns the AppImage at path, as r.
+func (s *State) SetAppImage(module, path string, r AppImage) {
+	s.Own(HomeAppImages, module, []string{path})
+	if s.AppImages == nil {
+		s.AppImages = map[string]AppImage{}
+	}
+	s.AppImages[path] = r
+}
+
+// dropUnownedAppImages forgets the records of AppImages that reconciling or
+// pruning kind left without an owner.
+func (s *State) dropUnownedAppImages(kind string) {
+	if kind != HomeAppImages {
+		return
+	}
+	maps.DeleteFunc(s.AppImages, func(path string, _ AppImage) bool { return s.Owner(HomeAppImages, path) == "" })
+	if len(s.AppImages) == 0 {
+		s.AppImages = nil
+	}
 }
 
 // Rename moves every record of module oldName to newName.
