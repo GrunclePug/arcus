@@ -2,6 +2,8 @@ package plan
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"maps"
 	"os"
 	"path/filepath"
@@ -10,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/grunclepug/arcus/internal/appimage"
 	"github.com/grunclepug/arcus/internal/layer"
 	"github.com/grunclepug/arcus/internal/module"
 	"github.com/grunclepug/arcus/internal/state"
@@ -793,5 +796,212 @@ func TestCheckBatch(t *testing.T) {
 				t.Fatalf("CheckBatch = %v, want %q", err, c.want)
 			}
 		})
+	}
+}
+
+// appImageFixture is a home with module desk declaring AppImages and
+// module old, which is being turned off, owning some. record writes a file
+// and records it as arcus installed it; place writes one arcus doesn't know.
+type appImageFixture struct {
+	t    *testing.T
+	home string
+	in   Input
+	st   *state.State
+}
+
+func newAppImageFixture(t *testing.T) *appImageFixture {
+	root := t.TempDir()
+	f := &appImageFixture{t: t, home: filepath.Join(root, "home"), st: &state.State{}}
+	f.in = Input{Desired: []string{"desk"}, Modules: module.Set{
+		"desk": {Name: "desk", Dir: filepath.Join(root, "desk")},
+		"old":  {Name: "old", Dir: filepath.Join(root, "old")},
+	}}
+	f.in.Modules["desk"].AppImages = map[string]module.AppImage{}
+	return f
+}
+
+func sum(content string) string {
+	s := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(s[:])
+}
+
+func (f *appImageFixture) declare(p, content string, selfUpdate bool) {
+	f.in.Modules["desk"].AppImages[p] = module.AppImage{URL: "https://x.org/" + p, SHA256: sum(content), Path: p, SelfUpdate: selfUpdate}
+}
+
+func (f *appImageFixture) place(p, content string) {
+	f.t.Helper()
+	path := filepath.Join(f.home, p)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		f.t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func (f *appImageFixture) record(owner, p, content string, selfUpdate bool) {
+	f.t.Helper()
+	f.place(p, content)
+	got, err := appimage.Sum(filepath.Join(f.home, p), nil)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	f.st.SetAppImage(owner, p, state.AppImage{SHA256: got.SHA256, SelfUpdate: selfUpdate, Stamp: got.Stamp})
+}
+
+func (f *appImageFixture) plan() []Step {
+	f.t.Helper()
+	l := layer.NewHome(f.home, filepath.Join(f.home, ".state"), nil)
+	removable, err := appimage.Removable(f.home, f.st, l.SymlinkedParent)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	h := Half{State: f.st, Layer: l, Home: f.home, AppImages: removable}
+	steps, err := User(f.in, h)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return steps
+}
+
+// Each case of the AppImage decision table becomes its step.
+func TestAppImagePlan(t *testing.T) {
+	f := newAppImageFixture(t)
+	f.declare("missing", "v1", false)
+	f.declare("pinned", "v1", false)
+	f.declare("self", "v1", true)
+	f.place("pinned", "v1")
+	f.place("self", "the app's own")
+	f.declare("foreign", "v1", false)
+	f.place("foreign", "mine")
+	f.declare("bumped", "v2", false)
+	f.record("desk", "bumped", "v1", false)
+	f.declare("fine", "v1", false)
+	f.record("desk", "fine", "v1", false)
+	f.declare("updated", "v1", true)
+	f.record("desk", "updated", "v1", true)
+	f.place("updated", "v2 from the app")
+	f.declare("gone", "v1", true)
+	f.record("desk", "gone", "v1", true)
+	if err := os.Remove(filepath.Join(f.home, "gone")); err != nil {
+		t.Fatal(err)
+	}
+	f.declare("now-self", "v1", true)
+	f.record("desk", "now-self", "v1", false)
+
+	f.record("old", "unchanged", "v1", false)
+	f.record("old", "modified", "v1", false)
+	f.place("modified", "edited")
+	f.record("old", "app-updated", "v1", true)
+	f.place("app-updated", "v2")
+	f.record("old", "vanished", "v1", false)
+	if err := os.Remove(filepath.Join(f.home, "vanished")); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []Step{
+		{Stage: UserTeardown, Op: RemoveAppImage, Names: []string{"unchanged", "app-updated"}, Changes: []string{
+			"= modified: changed since arcus installed it, so it stays", "= vanished: already gone",
+		}},
+		{Stage: UserSetup, Op: Adopt, Of: state.HomeAppImages, Module: "desk", Names: []string{"pinned", "self"}, Changes: []string{
+			"= self: not the pinned version; self_update keeps it as it is",
+		}},
+		{Stage: UserSetup, Op: UpdateAppImage, Module: "desk", Names: []string{"bumped"}, Changes: []string{"from https://x.org/bumped"}},
+		{Stage: UserSetup, Op: ReplaceAppImage, Module: "desk", Names: []string{"foreign"}, Changes: []string{
+			"! foreign: not the pinned version nor the one arcus installed; it is moved aside to <path>.arcus-foreign",
+			"from https://x.org/foreign",
+		}},
+		{Stage: UserSetup, Op: InstallAppImage, Module: "desk", Names: []string{"gone"}, Changes: []string{"from https://x.org/gone"}},
+		{Stage: UserSetup, Op: InstallAppImage, Module: "desk", Names: []string{"missing"}, Changes: []string{"from https://x.org/missing"}},
+		{Stage: UserSetup, Op: RecordAppImage, Module: "desk", Names: []string{"now-self"}, Changes: []string{"self_update = true"}},
+	}
+	steps := f.plan()
+	if !reflect.DeepEqual(steps, want) {
+		t.Fatalf("got  %+v\nwant %+v", steps, want)
+	}
+	if len(f.st.Owned[state.HomeAppImages]["old"]) != 4 {
+		t.Error("planning must not change the state")
+	}
+}
+
+// An AppImage moved to another module is handed over, and one whose record
+// is left behind changed is forgotten in the same step.
+func TestAppImageHandOver(t *testing.T) {
+	f := newAppImageFixture(t)
+	f.declare("app", "v1", false)
+	f.record("old", "app", "v1", false)
+	if got := f.plan(); !reflect.DeepEqual(got, []Step{{Stage: UserTeardown, Op: HandOver, Of: state.HomeAppImages, Changes: []string{"app: old → desk"}}}) {
+		t.Fatalf("hand-over: %+v", got)
+	}
+
+	f.record("old", "edited", "v1", false)
+	f.place("edited", "mine")
+	want := []Step{{Stage: UserTeardown, Op: RemoveAppImage, Changes: []string{"app: old → desk", "= edited: changed since arcus installed it, so it stays"}}}
+	if got := f.plan(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("got  %+v\nwant %+v", got, want)
+	}
+}
+
+// Removing a file below a symlinked directory would follow the link, into
+// a dotfiles checkout say: it stays, self-updating or not.
+func TestAppImageBelowASymlinkedParentStays(t *testing.T) {
+	f := newAppImageFixture(t)
+	f.record("old", "linked/app", "v1", true)
+	checkout := filepath.Join(filepath.Dir(f.home), "checkout")
+	if err := os.Rename(filepath.Join(f.home, "linked"), checkout); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(checkout, filepath.Join(f.home, "linked")); err != nil {
+		t.Fatal(err)
+	}
+	want := []Step{{Stage: UserTeardown, Op: RemoveAppImage, Changes: []string{
+		"= linked/app: parent " + filepath.Join(f.home, "linked") + " is a symlink, so it stays",
+	}}}
+	if got := f.plan(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("got  %+v\nwant %+v", got, want)
+	}
+}
+
+func TestAppImagePlanRefusesADirectory(t *testing.T) {
+	f := newAppImageFixture(t)
+	f.declare("app", "v1", false)
+	if err := os.MkdirAll(filepath.Join(f.home, "app"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	l := layer.NewHome(f.home, filepath.Join(f.home, ".state"), nil)
+	removable, _ := appimage.Removable(f.home, f.st, l.SymlinkedParent)
+	_, err := User(f.in, Half{State: f.st, Layer: l, Home: f.home, AppImages: removable})
+	if err == nil || !strings.Contains(err.Error(), "isn't a regular file") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestAppImageNotInArcusData(t *testing.T) {
+	f := newAppImageFixture(t)
+	f.declare(".state/state.json", "v1", false)
+	_, err := User(f.in, Half{State: f.st, Layer: layer.NewHome(f.home, filepath.Join(f.home, ".state"), nil), Home: f.home})
+	if err == nil || !strings.Contains(err.Error(), "inside arcus's own data") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// A parent symlinked into, say, a dotfiles checkout is refused, as layers
+// refuse one: the AppImage would be written into the checkout.
+func TestAppImageBelowASymlinkedParentIsRefused(t *testing.T) {
+	f := newAppImageFixture(t)
+	checkout := filepath.Join(filepath.Dir(f.home), "checkout")
+	for _, dir := range []string{f.home, checkout} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(checkout, filepath.Join(f.home, ".apps")); err != nil {
+		t.Fatal(err)
+	}
+	f.declare(".apps/bin/app.AppImage", "v1", false)
+	_, err := User(f.in, Half{State: f.st, Layer: layer.NewHome(f.home, filepath.Join(f.home, ".state"), nil), Home: f.home})
+	if err == nil || !strings.Contains(err.Error(), "parent "+filepath.Join(f.home, ".apps")+" is a symlink") {
+		t.Fatalf("got %v", err)
 	}
 }

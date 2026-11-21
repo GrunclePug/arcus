@@ -115,8 +115,9 @@ func (s *Stacker) hostPathFor(tree, src string) (string, error) {
 	return filepath.Join(s.Target, rel), nil
 }
 
-// ownData reports whether host lies inside arcus's own data.
-func (s *Stacker) ownData(host string) bool {
+// OwnData reports whether host lies inside arcus's own data: the state
+// directory or a module directory.
+func (s *Stacker) OwnData(host string) bool {
 	if isWithin(host, s.StateDir) {
 		return true
 	}
@@ -290,6 +291,10 @@ func (s *Stacker) symlinkedParent(host string) string {
 	return ""
 }
 
+// SymlinkedParent is symlinkedParent for files arcus puts below Target
+// outside a layer, such as AppImages.
+func (s *Stacker) SymlinkedParent(host string) string { return s.symlinkedParent(host) }
+
 func (s *Stacker) planActivation(module string, below []*Ledger, checkAccess bool, freed map[string]bool) ([]Entry, error) {
 	tree := s.tree(module)
 	if tree == "" {
@@ -313,7 +318,7 @@ func (s *Stacker) planActivation(module string, below []*Ledger, checkAccess boo
 			return err
 		}
 
-		if s.ownData(host) {
+		if s.OwnData(host) {
 			problems = append(problems, fmt.Sprintf("%s: refusing to layer over arcus's own data", host))
 			return nil
 		}
