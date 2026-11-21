@@ -550,7 +550,11 @@ func (a *app) doctorHalf(h *half, st *state.State, fix bool, r *report) {
 	}
 
 	dangling, err := h.layer.DanglingBackups()
-	if err != nil {
+	// The system half's store is root-only, while the initial audit runs
+	// without sudo. Report the limitation once and keep any readable findings.
+	if errors.Is(err, layer.ErrStoreUnreadable) {
+		fmt.Fprintf(r.w, "  · %v\n", err)
+	} else if err != nil {
 		r.problem("%v", err)
 	}
 	for _, d := range dangling {

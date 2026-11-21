@@ -124,7 +124,7 @@ modules  = ["aurora"]
 |----------|------|---------|-------------|
 | | `-y` | off | Don't ask for confirmation |
 | | `-n` | off | Only show the plan |
-| | `-f` | off | `off`: also turn off modules that require it; `off`, `apply`: move files edited since deployment aside to `<path>.arcus-foreign` |
+| | `-f` | off | `off`: also turn off modules that require it; `off`, `apply`: move files edited since deployment aside to `foreign/` in the state directory |
 | | `-fix` | off | `doctor`: apply the safe repairs |
 | | `-yes` | off | `arcus-install run`: don't ask to type the device name |
 | | `-version` | | Print the version (both binaries) |
@@ -137,7 +137,11 @@ modules  = ["aurora"]
 
 ## State and history
 
-arcus records the machine's state in a bare git repository at `~/.local/state/arcus/history`, readable only by you: the host file, both halves' state and ledgers, and the machine module's `module.toml`, as arcus read them. It records what arcus decided and did, never the contents of the files modules deploy. The system half is recorded as it was when the entry was made.
+The user half keeps its state in `~/.local/state/arcus` and the system half in `/var/lib/arcus`. A file a layer displaces is moved into that directory, to `backups/<tag>/<path>`, where `<tag>` is `orig` for the host's own file or the name of the layer whose file it was, and `<path>` mirrors its path below `$HOME` or `/`. Turning the layer off moves it back to the exact path recorded in the ledger, recreating its directory if you removed it (private on the user half, `0755` on the system half). Ledgers written by older versions name sidecar backups such as `.bashrc.orig` next to the file; those still restore.
+
+`-f` moves a file edited since deployment to `foreign/<path>` in the same state directory. Both stores use private directories, and the system half's is readable only by root: `arcus doctor` without sudo says once that it can't verify it, and still reports a deployed file that was edited. A move across filesystems preserves file content, mode, owner and mtime, and hard links become independent files. A copy would lose extended attributes, so a file with an ACL, an SELinux label or capabilities is not copied, nor is one arcus can't read: forced teardown leaves it beside the deployment as `<path>.arcus-foreign`, like a directory or special file, activation keeps such an original beside the host as `<path>.<tag>`, and a backup that would need such a copy stops the turn-off before anything changes, with the backup kept in the store. A file is also kept beside the host path, as `<path>.<tag>` or `<path>.arcus-foreign`, when the store holds a file where its directory would go, or another backup of the same activation takes that directory's name. A name already taken, on disk or by a path the same activation deploys, gets the next free `.N` suffix. `<path>.arcus-foreign` files left by an older version's `-f` stay beside the host path. `arcus doctor` lists files in `backups/` that no ledger names, such as ones a crash left behind.
+
+arcus records the machine's state in a bare git repository at `~/.local/state/arcus/history`, readable only by you: the host file, both halves' state and ledgers, and the machine module's `module.toml`, as arcus read them. The ledgers name the backup paths, but the history never records the contents of `backups/` or `foreign/`, nor of the files modules deploy. The system half is recorded as it was when the entry was made.
 
 Each command that changes the machine (`on`, `off`, `apply`, `rebuild`, `rollback`, `clean`, `machine`, `mv` of a module something selects or records, and `doctor -fix` when it repairs something) adds an entry once it is past its confirmation, named after the command line, with ` (failed)` when it failed. Plans, dry runs and declined confirmations add nothing. A change made in between, such as a hand edit of the host file or a run without git, becomes an entry of its own, `unrecorded changes`, before the next command's; the first entry on a machine with state is `history starts`.
 

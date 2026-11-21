@@ -1117,7 +1117,11 @@ func layerSteps(in Input, h Half, teardown, setup Stage, unlinked []string) (lay
 		var replaced []string
 		for _, e := range entries {
 			if e.Backup != "" {
-				replaced = append(replaced, fmt.Sprintf("! %s (kept as %s)", e.Host, filepath.Base(e.Backup)))
+				where := "kept as " + filepath.Base(e.Backup) // beside the host: the store is blocked
+				if tag := h.Layer.BackupTag(e.Backup); tag != "" {
+					where = "kept in arcus backups: " + tag
+				}
+				replaced = append(replaced, fmt.Sprintf("! %s (%s)", e.Host, where))
 			}
 		}
 		if from < len(kept) {

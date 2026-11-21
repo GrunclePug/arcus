@@ -721,3 +721,26 @@ func TestCancelledDoctorFixRepairsNothing(t *testing.T) {
 		t.Error("a cancelled doctor -fix rolled the orphan back")
 	}
 }
+
+func TestHistoryRecordsLedgerPathsWithoutDisplacedFiles(t *testing.T) {
+	e := histEnv(t)
+	e.module("tool", "", map[string]string{"home/.toolrc": "deployed"})
+	must(t, os.WriteFile(filepath.Join(e.home, ".toolrc"), []byte("original"), 0o600))
+	userState := filepath.Dir(e.historyDir())
+	foreign := filepath.Join(userState, "foreign")
+	must(t, os.MkdirAll(foreign, 0o700))
+	must(t, os.WriteFile(filepath.Join(foreign, ".toolrc"), []byte("kept edit"), 0o600))
+
+	must(t, os.WriteFile(e.hostPath(), []byte("modules = []\n"), 0o644))
+
+	must(t, e.run("on", "-y", "tool"))
+	e.wantSubjects("on -y tool", "history starts")
+	backup := filepath.Join(userState, "backups", "orig", ".toolrc")
+	ref := "refs/heads/arcus"
+	if ledger := e.git("show", ref+":ledger/tool.json"); !strings.Contains(ledger, backup) {
+		t.Errorf("history ledger is missing the backup path %s:\n%s", backup, ledger)
+	}
+	if files := e.files(ref); !slices.Equal(files, []string{"host.toml", "ledger/tool.json", "state.json"}) {
+		t.Errorf("history files = %v", files)
+	}
+}

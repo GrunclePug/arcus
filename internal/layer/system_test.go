@@ -195,7 +195,7 @@ func TestSymlinkedParentIsRefused(t *testing.T) {
 			t.Fatalf("want a symlinked-parent refusal, got %v", err)
 		}
 		data, _ := os.ReadFile(filepath.Join(elsewhere, "init.lua"))
-		if string(data) != "mine" || exists(filepath.Join(elsewhere, "init.lua.orig")) {
+		if string(data) != "mine" || exists(filepath.Join(elsewhere, "init.lua.orig")) || exists(filepath.Join(sb.s.StateDir, "backups")) {
 			t.Error("nothing may be written through the symlink")
 		}
 	})
