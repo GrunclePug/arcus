@@ -545,6 +545,17 @@ func (s *Stacker) teardownEntry(l *Ledger, idx int, above []*Ledger) error {
 	return nil
 }
 
+// SetAside moves the file at host aside to <host>.arcus-foreign, at the next
+// free name, as teardown does with a file edited since deployment, and
+// returns where it went.
+func (s *Stacker) SetAside(host string) (string, error) {
+	aside := uniquePath(host + ".arcus-foreign")
+	if err := renameDurable(host, aside); err != nil {
+		return "", fmt.Errorf("moving %q aside: %w", host, err)
+	}
+	return aside, nil
+}
+
 // HoldLedger is the ledger that keeps the directories of the layers a
 // restack turns off until the layers are on again. Module names start with a
 // letter or digit, so no module can have it. Doctor releases a hold that an
