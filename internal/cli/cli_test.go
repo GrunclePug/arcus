@@ -1419,6 +1419,57 @@ func TestHomeLinks(t *testing.T) {
 	}
 }
 
+// A link that is already gone when its module stops listing it is
+// forgotten by apply, not left for doctor, also when a home file of the
+// module takes over its path.
+func TestReleasedLinkAlreadyGoneIsForgotten(t *testing.T) {
+	e := newEnv(t)
+	e.module("lk", `links = { ".config/app/data" = "Sync/app/data" }`, nil)
+	must(t, e.run("on", "-y", "lk"))
+	must(t, os.Remove(filepath.Join(e.home, ".config/app/data")))
+	e.module("lk", "", map[string]string{"home/.config/app/data": "mine"})
+
+	must(t, e.run("plan"))
+	for _, want := range []string{"update the record of home links that nothing removes:", ".config/app/data -> Sync/app/data: lk, already gone, forgotten"} {
+		if !strings.Contains(e.out.String(), want) {
+			t.Errorf("plan lacks %q:\n%s", want, e.out.String())
+		}
+	}
+	must(t, e.run("apply", "-y"))
+	if got := e.state(false).Owned[state.HomeLinks]; len(got) != 0 {
+		t.Errorf("still recorded: %v", got)
+	}
+	if got := e.read("home/u/.config/app/data"); got != "mine" {
+		t.Errorf("data = %q", got)
+	}
+	must(t, e.run("plan"))
+	if !strings.Contains(e.out.String(), "Nothing to do.") {
+		t.Errorf("plan after apply:\n%s", e.out.String())
+	}
+	must(t, e.run("doctor"))
+}
+
+// A home file that takes over the path of a link its module dropped
+// replaces nothing: the link goes first, so the plan promises no backup.
+func TestHomeFileReplacesDroppedLink(t *testing.T) {
+	e := newEnv(t)
+	e.module("lk", `links = { ".config/app/data" = "Sync/app/data" }`, nil)
+	must(t, e.run("on", "-y", "lk"))
+	e.module("lk", "", map[string]string{"home/.config/app/data": "mine"})
+
+	must(t, e.run("apply", "-y"))
+	out := e.out.String()
+	if !strings.Contains(out, "remove home links that still point at their target: .config/app/data -> Sync/app/data") || strings.Contains(out, "kept as") {
+		t.Errorf("apply:\n%s", out)
+	}
+	if got := e.read("home/u/.config/app/data"); got != "mine" {
+		t.Errorf("data = %q", got)
+	}
+	if got := e.state(false).Owned[state.HomeLinks]; len(got) != 0 {
+		t.Errorf("still recorded: %v", got)
+	}
+}
+
 // Turning on a module that conflicts with one the host file lists swaps
 // them; one a profile brings in is refused.
 func TestOnSwapsConflicts(t *testing.T) {

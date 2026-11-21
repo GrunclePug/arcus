@@ -1,5 +1,5 @@
 # arcus version
-VERSION = 0.10.0
+VERSION = 0.10.1
 
 # paths
 PREFIX = /usr/local

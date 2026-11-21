@@ -77,7 +77,7 @@ const (
 
 	RemoveConflicting = "remove-conflicting" // installed packages that the next install conflicts with
 
-	HandOver = "hand-over" // ownership moves to the modules that list the resources now
+	HandOver = "hand-over" // ownership moves to the modules that list the resources now, or is dropped
 	Adopt    = "adopt"     // resources already there become recorded for the module that lists them
 	Mkdir    = "mkdir"     // home directories
 	Rmdir    = "rmdir"
@@ -228,7 +228,7 @@ func System(in Input, h Half) ([]Step, error) {
 	var steps []Step
 	steps = append(steps, removals(in, h.State, Leave, SystemTeardown, state.Groups, h.Groups)...)
 	steps = append(steps, removals(in, h.State, Disable, SystemTeardown, state.SystemUnits, h.Units)...)
-	layers, err := layerSteps(in, h, SystemTeardown, SystemSetup)
+	layers, err := layerSteps(in, h, SystemTeardown, SystemSetup, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -254,13 +254,26 @@ func System(in Input, h Half) ([]Step, error) {
 func User(in Input, h Half) ([]Step, error) {
 	var steps []Step
 	steps = append(steps, removals(in, h.State, Disable, UserTeardown, state.UserUnits, h.Units)...)
-	layers, err := layerSteps(in, h, UserTeardown, UserSetup)
+	// The links removed leave their paths free for the layers, which come
+	// on after them.
+	unlinks := removals(in, h.State, Unlink, UserTeardown, state.HomeLinks, h.Links)
+	var unlinked []string
+	for _, s := range unlinks {
+		if s.Op == Unlink {
+			for _, n := range s.Names {
+				if p, _, ok := module.SplitLink(n); ok {
+					unlinked = append(unlinked, filepath.Join(h.Layer.Target, p))
+				}
+			}
+		}
+	}
+	layers, err := layerSteps(in, h, UserTeardown, UserSetup, unlinked)
 	if err != nil {
 		return nil, err
 	}
 	steps = append(steps, layers.off...)
 	// After the layers, so a directory that held only deployed files is empty.
-	steps = append(steps, removals(in, h.State, Unlink, UserTeardown, state.HomeLinks, h.Links)...)
+	steps = append(steps, unlinks...)
 	steps = append(steps, removals(in, h.State, Rmdir, UserTeardown, state.HomeDirs, h.Dirs)...)
 	steps = append(steps, packageRemovals(in, h, Remove, AURRemove, state.AUR)...)
 	steps = append(steps, additions(in, h.State, Install, AURInstall, state.AUR, h.Installed)...)
@@ -335,8 +348,9 @@ func Hash(steps []Step) string {
 
 // removals plans what reconciling kind removes, one step per owner so units
 // are stopped according to their own module's `now`. When nothing is
-// removed but resources move to another module, a hand-over step records
-// that; a removal step records it along with the removal.
+// removed but the record still changes (resources move to another module,
+// or are released while already gone or protected), a hand-over step
+// records that; a removal step records it along with the removal.
 func removals(in Input, st *state.State, op string, stage Stage, kind string, present map[string]bool) []Step {
 	remove := in.Removals(st, kind, present)
 	if len(remove) == 0 {
@@ -887,18 +901,32 @@ func conflicts(p system.Package, other string, o system.Package) bool {
 	return false
 }
 
-// handOvers lists the resources of kind that reconciling moves to another
-// module, as "<name>: <old> → <new>".
+// handOvers lists how reconciling kind changes its record without removing
+// anything: a resource that moves to another module as "<name>: <old> →
+// <new>", one that is dropped as "<name>: <old>, <why>, forgotten".
 func handOvers(in Input, st *state.State, kind string, present map[string]bool) []string {
 	after := st.Clone()
 	in.Reconcile(after, kind, present)
 	var moves []string
 	for _, owner := range slices.Sorted(maps.Keys(st.Owned[kind])) {
 		for _, n := range st.Owned[kind][owner] {
-			for to, names := range after.Owned[kind] {
-				if to != owner && slices.Contains(names, n) {
-					moves = append(moves, fmt.Sprintf("%s: %s → %s", n, owner, to))
+			if slices.Contains(after.Owned[kind][owner], n) {
+				continue
+			}
+			to := ""
+			for _, other := range slices.Sorted(maps.Keys(after.Owned[kind])) {
+				if slices.Contains(after.Owned[kind][other], n) {
+					to = other
+					break
 				}
+			}
+			switch {
+			case to != "":
+				moves = append(moves, fmt.Sprintf("%s: %s → %s", n, owner, to))
+			case present != nil && !present[n]:
+				moves = append(moves, fmt.Sprintf("%s: %s, already gone, forgotten", n, owner))
+			default:
+				moves = append(moves, fmt.Sprintf("%s: %s, protected and kept, forgotten", n, owner))
 			}
 		}
 	}
@@ -1001,7 +1029,7 @@ type layerPlan struct{ off, on []Step }
 // from the lowest kept layer whose module changed or that sits out of order,
 // every layer goes off and the desired ones come on again in order (a
 // restack); new layers above all kept ones just go on top.
-func layerSteps(in Input, h Half, teardown, setup Stage) (layerPlan, error) {
+func layerSteps(in Input, h Half, teardown, setup Stage, unlinked []string) (layerPlan, error) {
 	var p layerPlan
 	var kept []string
 	for i := len(h.State.Modules) - 1; i >= 0; i-- {
@@ -1030,8 +1058,12 @@ func layerSteps(in Input, h Half, teardown, setup Stage) (layerPlan, error) {
 	}
 
 	// freed holds the paths that the steps before a new layer leave empty:
-	// what the layers going off deploy and what changed modules dropped.
+	// the links removed, what the layers going off deploy and what changed
+	// modules dropped.
 	freed := map[string]bool{}
+	for _, host := range unlinked {
+		freed[host] = true
+	}
 	for _, s := range p.off {
 		if err := h.Layer.Frees(s.Module, nil, freed); err != nil {
 			return p, err

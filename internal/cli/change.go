@@ -643,7 +643,7 @@ func describe(s plan.Step) string {
 	case plan.RemoveConflicting:
 		return fmt.Sprintf("remove packages that conflict with what is installed next: %s", names)
 	case plan.HandOver:
-		return fmt.Sprintf("record %s under the modules that list them now:", kindNames[s.Of])
+		return fmt.Sprintf("update the record of %s that nothing removes:", kindNames[s.Of])
 	case plan.Adopt:
 		return fmt.Sprintf("take over %s for %s (already there): %s", kindNames[s.Of], s.Module, names)
 	case plan.MarkAdopted:
