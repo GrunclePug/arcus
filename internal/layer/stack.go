@@ -290,6 +290,20 @@ func (s *Stacker) symlinkedParent(host string) string {
 	return ""
 }
 
+// symlinkProblem refuses teardown of an entry whose host path lies below a
+// directory that has become a symlink since activation, which refuses such a
+// path too. Everything teardown would look at or change there (the
+// deployment, its backup, a lower layer's file) comes through the link, so
+// nothing about the entry can be trusted, not even that nothing is left to do.
+func (s *Stacker) symlinkProblem(host string) error {
+	dir := s.symlinkedParent(host)
+	if dir == "" {
+		return nil
+	}
+	target, _ := os.Readlink(dir)
+	return fmt.Errorf("%s: parent %s is a symlink (to %s); make it a real directory again, with everything that was in it back in place if you moved it", host, dir, target)
+}
+
 func (s *Stacker) planActivation(module string, below []*Ledger, checkAccess bool, freed map[string]bool) ([]Entry, error) {
 	tree := s.tree(module)
 	if tree == "" {
@@ -462,12 +476,20 @@ func (s *Stacker) Deactivate(ctx context.Context, module string, activeStack []s
 		return fmt.Errorf("module %q is on but has no ledger; run 'arcus doctor'", module)
 	}
 
-	// Pre-flight: refuse before mutating anything if unforced and foreign.
-	var foreign []string
-	for i := range l.Entries {
+	// Pre-flight: refuse before mutating anything if a path lies below a
+	// symlinked parent, which -f doesn't override, or if unforced and foreign.
+	var linked, foreign []string
+	for i, e := range l.Entries {
+		if err := s.symlinkProblem(e.Host); err != nil {
+			linked = append(linked, err.Error())
+			continue
+		}
 		if st := s.planStep(l, i, above); st.foreign {
 			foreign = append(foreign, st.loc)
 		}
+	}
+	if len(linked) > 0 {
+		return fmt.Errorf("cannot turn off %q, nothing was changed in its %s files:\n  %s", module, s.Subdir, strings.Join(linked, "\n  "))
 	}
 	if len(foreign) > 0 && !force {
 		return fmt.Errorf("%w: these paths changed since %q was turned on, nothing was changed (use -f to move them aside):\n  %s",
@@ -503,6 +525,9 @@ func (s *Stacker) Deactivate(ctx context.Context, module string, activeStack []s
 
 func (s *Stacker) teardownEntry(l *Ledger, idx int, above []*Ledger) error {
 	e := l.Entries[idx]
+	if err := s.symlinkProblem(e.Host); err != nil {
+		return err
+	}
 	st := s.planStep(l, idx, above)
 	if st.finished {
 		return nil
@@ -737,6 +762,11 @@ func (s *Stacker) Rollback(module string) error {
 
 	var problems []string
 	for i := len(l.Entries) - 1; i >= 0; i-- {
+		// Before planStep, whose view through the link can't be trusted.
+		if err := s.symlinkProblem(l.Entries[i].Host); err != nil {
+			problems = append(problems, err.Error())
+			continue
+		}
 		st := s.planStep(l, i, nil)
 		if st.foreign {
 			problems = append(problems, fmt.Sprintf("%s was modified; left in place", st.loc))

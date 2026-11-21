@@ -33,21 +33,12 @@ func (s *Stacker) Audit(module string, activeStack []string) ([]string, error) {
 	deployed := make(map[string]bool, len(l.Entries))
 	for i, e := range l.Entries {
 		deployed[e.Src] = true
-		st := s.planStep(l, i, above)
-		switch {
-		case st.foreign:
-			findings = append(findings, fmt.Sprintf("%s was modified after activation (teardown will require -f)", st.loc))
-		case st.cache:
-			// A cache Python rewrote; the next restack removes it.
-		case !st.remove && !st.finished:
-			findings = append(findings, fmt.Sprintf("%s: deployment is missing", e.Host))
-		case st.remove && e.Kind == KindCopy:
-			if f := attrDrift(e, st.loc); f != "" {
-				findings = append(findings, f)
-			}
-		}
-		if e.Backup != "" && !exists(e.Backup) && !st.finished {
-			findings = append(findings, fmt.Sprintf("%s: recorded backup %s is missing", e.Host, e.Backup))
+		// Below a symlinked parent the deployment can't be judged, and
+		// teardown refuses; the module's source can still be checked.
+		if err := s.symlinkProblem(e.Host); err != nil {
+			findings = append(findings, err.Error())
+		} else {
+			findings = append(findings, s.auditDeployment(l, i, above)...)
 		}
 		if !exists(e.Src) {
 			findings = append(findings, fmt.Sprintf("%s: source %s was deleted from the module", e.Host, e.Src))
@@ -71,6 +62,29 @@ func (s *Stacker) Audit(module string, activeStack []string) ([]string, error) {
 		findings = append(findings, fmt.Sprintf("%d file(s) added to %s/ since the module was turned on", added, s.Subdir))
 	}
 	return findings, nil
+}
+
+// auditDeployment reports the drift of entry idx's deployment and backup.
+func (s *Stacker) auditDeployment(l *Ledger, idx int, above []*Ledger) []string {
+	e := l.Entries[idx]
+	st := s.planStep(l, idx, above)
+	var findings []string
+	switch {
+	case st.foreign:
+		findings = append(findings, fmt.Sprintf("%s was modified after activation (teardown will require -f)", st.loc))
+	case st.cache:
+		// A cache Python rewrote; the next restack removes it.
+	case !st.remove && !st.finished:
+		findings = append(findings, fmt.Sprintf("%s: deployment is missing", e.Host))
+	case st.remove && e.Kind == KindCopy:
+		if f := attrDrift(e, st.loc); f != "" {
+			findings = append(findings, f)
+		}
+	}
+	if e.Backup != "" && !exists(e.Backup) && !st.finished {
+		findings = append(findings, fmt.Sprintf("%s: recorded backup %s is missing", e.Host, e.Backup))
+	}
+	return findings
 }
 
 // attrDrift reports a copy whose mode or owner no longer match the ledger.

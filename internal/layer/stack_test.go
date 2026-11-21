@@ -908,13 +908,6 @@ func TestOnlyRewrittenCachesAreRemoved(t *testing.T) {
 			must(t, os.Remove(host))
 			must(t, os.Symlink(other, host))
 		}},
-		{"symlinked parent", halves[0], name, func(t *testing.T, sb *sandbox, host string) {
-			other := filepath.Join(sb.root, "other", "__pycache__")
-			must(t, os.MkdirAll(other, 0o755))
-			must(t, os.WriteFile(filepath.Join(other, name), []byte(pycBytes("other")), 0o644))
-			must(t, os.RemoveAll(filepath.Dir(host)))
-			must(t, os.Symlink(other, filepath.Dir(host)))
-		}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -928,14 +921,29 @@ func TestOnlyRewrittenCachesAreRemoved(t *testing.T) {
 				t.Fatalf("deactivate = %v, want ErrForeign", err)
 			}
 			assertSame(t, before, sb.snapshot())
-			if c.name == "symlinked parent" {
-				data, err := os.ReadFile(filepath.Join(sb.root, "other", "__pycache__", name))
-				if err != nil || string(data) != pycBytes("other") {
-					t.Fatalf("file behind the symlink: %q, %v", data, err)
-				}
-			}
 		})
 	}
+
+	// A rewritten-looking cache behind a symlinked parent isn't removed:
+	// teardown refuses the entry before it looks through the link.
+	t.Run("symlinked parent", func(t *testing.T) {
+		sb := newSandbox(t, halves[0])
+		sb.moduleFile("p", "bin/tool", "tool")
+		must(t, sb.activate("p"))
+		host, _ := sb.deployOldCache(name, false)
+		other := filepath.Join(sb.root, "other", "__pycache__")
+		must(t, os.MkdirAll(other, 0o755))
+		must(t, os.WriteFile(filepath.Join(other, name), []byte(pycBytes("other")), 0o644))
+		must(t, os.RemoveAll(filepath.Dir(host)))
+		must(t, os.Symlink(other, filepath.Dir(host)))
+		before := sb.snapshot()
+		wantSymlinkRefusal(t, sb.deactivate("p", false))
+		assertSame(t, before, sb.snapshot())
+		data, err := os.ReadFile(filepath.Join(other, name))
+		if err != nil || string(data) != pycBytes("other") {
+			t.Fatalf("file behind the symlink: %q, %v", data, err)
+		}
+	})
 
 	t.Run("rollback removes a rewritten cache", func(t *testing.T) {
 		sb := newSandbox(t, halves[0])
@@ -1424,5 +1432,264 @@ func TestRestackSkipsAnUnreadableCache(t *testing.T) {
 		must(t, sb.deactivate("a", false))
 		must(t, sb.activate("a"))
 		must(t, sb.s.Release())
+	})
+}
+
+// snapDir is snapshot for any directory, such as the target of a symlink
+// the sandbox's own snapshot doesn't follow.
+func (sb *sandbox) snapDir(dir string) map[string]string {
+	sb.t.Helper()
+	saved := sb.host
+	sb.host = dir
+	defer func() { sb.host = saved }()
+	return sb.snapshot()
+}
+
+// moveAndLink moves <host>/rel to elsewhere and puts a symlink to it in its
+// place, as a user moving a config directory into a synced folder does.
+func (sb *sandbox) moveAndLink(rel, elsewhere string) {
+	sb.t.Helper()
+	must(sb.t, os.MkdirAll(filepath.Dir(elsewhere), 0o755))
+	must(sb.t, os.Rename(filepath.Join(sb.host, rel), elsewhere))
+	must(sb.t, os.Symlink(elsewhere, filepath.Join(sb.host, rel)))
+}
+
+// moveBack undoes moveAndLink.
+func (sb *sandbox) moveBack(rel, elsewhere string) {
+	sb.t.Helper()
+	must(sb.t, os.Remove(filepath.Join(sb.host, rel)))
+	must(sb.t, os.Rename(elsewhere, filepath.Join(sb.host, rel)))
+}
+
+func wantSymlinkRefusal(t *testing.T, err error) {
+	t.Helper()
+	if err == nil || errors.Is(err, ErrForeign) || !strings.Contains(err.Error(), "is a symlink") {
+		t.Fatalf("err = %v, want the symlinked-parent refusal", err)
+	}
+}
+
+func (sb *sandbox) wantEntries(module string, n int) {
+	sb.t.Helper()
+	l, err := sb.s.LoadLedger(module)
+	must(sb.t, err)
+	if l == nil || len(l.Entries) != n {
+		sb.t.Fatalf("ledger of %s = %+v, want %d entries", module, l, n)
+	}
+}
+
+func TestTeardownRefusesASymlinkedParent(t *testing.T) {
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		sb.hostFile("foo/rc", "original")
+		sb.moduleFile("p", "foo/rc", "from p")
+		must(t, sb.activate("p"))
+		sync := filepath.Join(sb.root, "sync", "foo")
+		sb.moveAndLink("foo", sync)
+		before := sb.snapDir(sync)
+
+		wantSymlinkRefusal(t, sb.deactivate("p", false))
+		wantSymlinkRefusal(t, sb.deactivate("p", true))
+		assertSame(t, before, sb.snapDir(sync))
+		sb.wantEntries("p", 1)
+
+		sb.moveBack("foo", sync)
+		must(t, sb.deactivate("p", false))
+		if got := sb.read("foo/rc"); got != "original" {
+			t.Fatalf("rc = %q, want the original back", got)
+		}
+		sb.assertNoLedgers()
+	})
+}
+
+func TestTeardownRefusesASymlinkedParentWithAnEdit(t *testing.T) {
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		sb.hostFile("foo/rc", "original")
+		sb.moduleFile("p", "foo/rc", "from p")
+		must(t, sb.activate("p"))
+		must(t, os.Remove(filepath.Join(sb.host, "foo/rc")))
+		sb.hostFile("foo/rc", "edited")
+		sync := filepath.Join(sb.root, "sync", "foo")
+		sb.moveAndLink("foo", sync)
+		before := sb.snapDir(sync)
+
+		wantSymlinkRefusal(t, sb.deactivate("p", true))
+		assertSame(t, before, sb.snapDir(sync))
+
+		sb.moveBack("foo", sync)
+		if err := sb.deactivate("p", false); !errors.Is(err, ErrForeign) {
+			t.Fatalf("deactivate = %v, want ErrForeign once the directory is back", err)
+		}
+		must(t, sb.deactivate("p", true))
+		if got := sb.read("foo/rc"); got != "original" {
+			t.Fatalf("rc = %q, want the original back", got)
+		}
+		if got := sb.read("foo/rc.arcus-foreign"); got != "edited" {
+			t.Fatalf("rc.arcus-foreign = %q, want the edit kept", got)
+		}
+	})
+}
+
+// With the real directory elsewhere and the link pointing at an empty one,
+// planStep would see the backup as restored and drop the entry, stranding
+// the original.
+func TestTeardownRefusesALinkToAnEmptyDirectory(t *testing.T) {
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		sb.hostFile("foo/rc", "original")
+		sb.moduleFile("p", "foo/rc", "from p")
+		must(t, sb.activate("p"))
+		saved := filepath.Join(sb.root, "saved", "foo")
+		must(t, os.MkdirAll(filepath.Dir(saved), 0o755))
+		must(t, os.Rename(filepath.Join(sb.host, "foo"), saved))
+		empty := filepath.Join(sb.root, "empty")
+		must(t, os.Mkdir(empty, 0o755))
+		must(t, os.Symlink(empty, filepath.Join(sb.host, "foo")))
+
+		wantSymlinkRefusal(t, sb.deactivate("p", false))
+		sb.wantEntries("p", 1)
+
+		sb.moveBack("foo", saved)
+		must(t, sb.deactivate("p", false))
+		if got := sb.read("foo/rc"); got != "original" {
+			t.Fatalf("rc = %q, want the original back", got)
+		}
+		sb.assertNoLedgers()
+	})
+}
+
+func TestTeardownRefusesASymlinkedParentInASplice(t *testing.T) {
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		sb.hostFile("foo/rc", "original")
+		sb.moduleFile("a", "foo/rc", "from a")
+		sb.moduleFile("b", "foo/rc", "from b")
+		must(t, sb.activate("a"))
+		must(t, sb.activate("b"))
+		upper, err := os.ReadFile(sb.s.ledgerPath("b"))
+		must(t, err)
+		sync := filepath.Join(sb.root, "sync", "foo")
+		sb.moveAndLink("foo", sync)
+		before := sb.snapDir(sync)
+
+		wantSymlinkRefusal(t, sb.deactivate("a", false))
+		assertSame(t, before, sb.snapDir(sync))
+		if after, err := os.ReadFile(sb.s.ledgerPath("b")); err != nil || string(after) != string(upper) {
+			t.Fatalf("upper ledger changed: %v", err)
+		}
+	})
+}
+
+// A link that appears after the pre-flight still stops teardown before it
+// changes anything.
+func TestTeardownRechecksForASymlinkedParent(t *testing.T) {
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		sb.hostFile("foo/rc", "original")
+		sb.moduleFile("p", "foo/rc", "from p")
+		must(t, sb.activate("p"))
+		sync := filepath.Join(sb.root, "sync", "foo")
+		sb.s.crashHook = func() {
+			sb.s.crashHook = nil
+			sb.moveAndLink("foo", sync)
+		}
+		before := sb.snapshot()
+		wantSymlinkRefusal(t, sb.deactivate("p", false))
+		if sb.s.crashHook != nil {
+			t.Fatal("the hook never ran")
+		}
+		sb.moveBack("foo", sync)
+		assertSame(t, before, sb.snapshot())
+		sb.wantEntries("p", 1)
+		must(t, sb.deactivate("p", false))
+		if got := sb.read("foo/rc"); got != "original" {
+			t.Fatalf("rc = %q, want the original back", got)
+		}
+	})
+}
+
+func TestRollbackRefusesASymlinkedParent(t *testing.T) {
+	for _, edited := range []bool{false, true} {
+		t.Run(fmt.Sprintf("edited=%v", edited), func(t *testing.T) {
+			eachHalf(t, func(t *testing.T, sb *sandbox) {
+				sb.hostFile("foo/rc", "original")
+				sb.moduleFile("p", "foo/rc", "from p")
+				must(t, sb.activate("p"))
+				if edited {
+					must(t, os.Remove(filepath.Join(sb.host, "foo/rc")))
+					sb.hostFile("foo/rc", "edited")
+				}
+				sync := filepath.Join(sb.root, "sync", "foo")
+				sb.moveAndLink("foo", sync)
+				before := sb.snapDir(sync)
+
+				err := sb.s.Rollback("p")
+				wantSymlinkRefusal(t, err)
+				if strings.Contains(err.Error(), "was modified") {
+					t.Fatalf("rollback blamed an edit: %v", err)
+				}
+				assertSame(t, before, sb.snapDir(sync))
+				sb.wantEntries("p", 1)
+			})
+		})
+	}
+}
+
+// A link where no directory existed before: removing it is the way out.
+func TestRollbackRefusesALinkWhereNoDirectoryWas(t *testing.T) {
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		sb.moduleFile("p", "new/rc", "from p")
+		must(t, sb.activate("p"))
+		must(t, os.RemoveAll(filepath.Join(sb.host, "new")))
+		elsewhere := filepath.Join(sb.root, "elsewhere")
+		must(t, os.Mkdir(elsewhere, 0o755))
+		must(t, os.Symlink(elsewhere, filepath.Join(sb.host, "new")))
+
+		wantSymlinkRefusal(t, sb.s.Rollback("p"))
+		sb.wantEntries("p", 1)
+
+		must(t, os.Remove(filepath.Join(sb.host, "new")))
+		must(t, sb.s.Rollback("p"))
+		sb.assertNoLedgers()
+	})
+}
+
+func TestAuditReportsASymlinkedParent(t *testing.T) {
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		sb.hostFile("foo/rc", "original")
+		src := sb.moduleFile("p", "foo/rc", "from p")
+		must(t, sb.activate("p"))
+		sync := filepath.Join(sb.root, "sync", "foo")
+		sb.moveAndLink("foo", sync)
+
+		findings, err := sb.s.Audit("p", sb.stack)
+		must(t, err)
+		if len(findings) != 1 || !strings.Contains(findings[0], "is a symlink") {
+			t.Fatalf("findings = %q, want only the symlinked parent", findings)
+		}
+
+		// With the deployment gone behind the link, too, only the parent
+		// and the source are reported: Audit doesn't look through the link.
+		must(t, os.Remove(filepath.Join(sync, "rc")))
+		must(t, os.Remove(src))
+		findings, err = sb.s.Audit("p", sb.stack)
+		must(t, err)
+		if len(findings) != 2 || !strings.Contains(findings[0], "is a symlink") || !strings.Contains(findings[1], "was deleted from the module") {
+			t.Fatalf("findings = %q, want the symlinked parent and the deleted source", findings)
+		}
+	})
+}
+
+// The pre-flight refuses the whole layer before teardown starts, so the
+// module's other files stay deployed.
+func TestTeardownRefusalLeavesTheLayerWhole(t *testing.T) {
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		sb.hostFile("foo/rc", "original")
+		sb.moduleFile("p", "foo/rc", "from p")
+		sb.moduleFile("p", "zz/other", "other from p")
+		must(t, sb.activate("p"))
+		sb.moveAndLink("foo", filepath.Join(sb.root, "sync", "foo"))
+		before := sb.snapshot()
+
+		for _, force := range []bool{false, true} {
+			wantSymlinkRefusal(t, sb.deactivate("p", force))
+			assertSame(t, before, sb.snapshot())
+			sb.wantEntries("p", 2)
+		}
 	})
 }
