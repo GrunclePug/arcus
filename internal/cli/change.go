@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/grunclepug/arcus/internal/appimage"
 	"github.com/grunclepug/arcus/internal/host"
 	"github.com/grunclepug/arcus/internal/machine"
 	"github.com/grunclepug/arcus/internal/module"
@@ -319,6 +320,12 @@ func (a *app) present(kind string) (map[string]bool, error) {
 		return a.homeDirs()
 	case state.HomeLinks:
 		return a.homeLinks()
+	case state.HomeAppImages:
+		st, err := a.userHalf().loadState()
+		if err != nil {
+			return nil, err
+		}
+		return appimage.Removable(a.paths.Home, st, a.userHalf().layer.SymlinkedParent)
 	}
 	return nil, fmt.Errorf("unknown kind %q", kind)
 }
@@ -379,13 +386,16 @@ func (a *app) situation(in plan.Input, h *half) (plan.Half, error) {
 	if err != nil {
 		return plan.Half{}, err
 	}
-	s := plan.Half{State: st, Layer: h.layer}
+	s := plan.Half{State: st, Layer: h.layer, Home: a.paths.Home}
 	// Each query runs only if one of its kinds is declared or owned.
 	type query struct {
 		kinds []string
 		into  *map[string]bool
 	}
-	queries := []query{{[]string{state.AUR}, &s.Installed}, {[]string{state.UserUnits}, &s.Units}, {[]string{state.HomeDirs}, &s.Dirs}, {[]string{state.HomeLinks}, &s.Links}}
+	queries := []query{
+		{[]string{state.AUR}, &s.Installed}, {[]string{state.UserUnits}, &s.Units}, {[]string{state.HomeDirs}, &s.Dirs},
+		{[]string{state.HomeLinks}, &s.Links}, {[]string{state.HomeAppImages}, &s.AppImages},
+	}
 	if h.name == "system" {
 		queries = []query{
 			{[]string{state.Pacman, state.Local}, &s.Installed},
@@ -578,6 +588,7 @@ func (a *app) printPlan(steps []plan.Step) {
 var kindNames = map[string]string{
 	state.Pacman: "packages", state.AUR: "AUR packages", state.Local: "own builds",
 	state.SystemUnits: "system units", state.UserUnits: "user units", state.Groups: "groups", state.HomeDirs: "home directories", state.HomeLinks: "home links",
+	state.HomeAppImages: "AppImages",
 }
 
 func describe(s plan.Step) string {
@@ -636,6 +647,19 @@ func describe(s plan.Step) string {
 		return fmt.Sprintf("create home links for %s: %s", s.Module, strings.Join(s.Names, ", "))
 	case plan.Unlink:
 		return fmt.Sprintf("remove home links that still point at their target: %s", strings.Join(s.Names, ", "))
+	case plan.InstallAppImage:
+		return fmt.Sprintf("install AppImage for %s: %s", s.Module, names)
+	case plan.UpdateAppImage:
+		return fmt.Sprintf("update AppImage for %s to the pinned version: %s", s.Module, names)
+	case plan.ReplaceAppImage:
+		return fmt.Sprintf("replace AppImage for %s with the pinned version: %s", s.Module, names)
+	case plan.RecordAppImage:
+		return fmt.Sprintf("update the record of AppImage for %s: %s", s.Module, names)
+	case plan.RemoveAppImage:
+		if len(s.Names) == 0 {
+			return "update the records of AppImages:"
+		}
+		return fmt.Sprintf("remove AppImages that arcus installed: %s", names)
 	case plan.BuildLocal:
 		return fmt.Sprintf("build %s from %s/pkg/%s", names, s.Module, names)
 	case plan.InstallLocal:
@@ -794,12 +818,22 @@ func (a *app) runSteps(h *half, st *state.State, steps []plan.Step, in plan.Inpu
 				return err
 			}
 			i = j - 1
-		case plan.Remove, plan.RemoveLocal, plan.Disable, plan.Leave, plan.Rmdir, plan.Unlink:
+		case plan.InstallAppImage, plan.UpdateAppImage, plan.ReplaceAppImage, plan.RecordAppImage:
+			if err := a.appImage(h, st, s, in, save); err != nil {
+				return err
+			}
+		case plan.Remove, plan.RemoveLocal, plan.Disable, plan.Leave, plan.Rmdir, plan.Unlink, plan.RemoveAppImage:
 			if err := a.remove(st, steps[i:j], in, r, save); err != nil {
 				return err
 			}
 			i = j - 1
 		case plan.Adopt:
+			if s.Of == state.HomeAppImages {
+				if err := a.appImage(h, st, s, in, save); err != nil {
+					return err
+				}
+				continue
+			}
 			present, err := a.present(s.Kind())
 			if err != nil {
 				return err
@@ -948,6 +982,13 @@ func (a *app) remove(st *state.State, steps []plan.Step, in plan.Input, r *syste
 				if err = os.Remove(host); err != nil {
 					break
 				}
+			}
+		}
+	case plan.RemoveAppImage:
+		// Removals has checked that each is still arcus's to remove.
+		for _, p := range remove {
+			if err = os.Remove(filepath.Join(a.paths.Home, p)); err != nil {
+				break
 			}
 		}
 	case plan.Rmdir:

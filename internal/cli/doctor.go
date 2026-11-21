@@ -116,16 +116,26 @@ func (a *app) cmdDoctor(args []string) error {
 		unlocked = a.fixHistory()
 	}
 
+	in, selectionErr := a.hostSelection(&o)
+	auditUser := func(r *report, fix bool) {
+		st, err := uh.loadState()
+		if err != nil {
+			r.problem("%v", err)
+			return
+		}
+		a.doctorHalf(uh, st, fix, r)
+		if selectionErr == nil {
+			a.doctorAppImages(uh, st, in, fix, r)
+		}
+	}
 	ur := &report{w: a.stdout, beforeRepair: a.beginHistory, ctx: a.ctx}
 	fmt.Fprintln(a.stdout, "User half:")
-	if st, err := uh.loadState(); err != nil {
-		ur.problem("%v", err)
-	} else {
-		a.doctorHalf(uh, st, o.fix, ur)
-	}
+	auditUser(ur, o.fix)
 	userLeft := ur.issues
 	if o.fix && ur.repairable > 0 {
-		userLeft = a.auditHalf(uh, io.Discard, false).issues // under the lock held
+		after := &report{w: io.Discard}
+		auditUser(after, false) // under the lock held
+		userLeft = after.issues
 	}
 
 	// The system half is checked read-only first; sudo is only asked for
@@ -155,7 +165,7 @@ func (a *app) cmdDoctor(args []string) error {
 
 	r := &report{w: a.stdout}
 	fmt.Fprintln(a.stdout, "Host file:")
-	a.doctorHost(&o, r)
+	a.doctorHost(in, selectionErr, r)
 	fmt.Fprintln(a.stdout, "Machine:")
 	a.doctorMachine(&o, r)
 	a.doctorVersion(r)
@@ -245,10 +255,9 @@ func (a *app) doctorHistory(r *report, unlocked []string) {
 // doctorHost reports a host file that doesn't resolve or that the system
 // doesn't match. Making it match is apply's job, not doctor's. Packages no
 // module lists are a note, not a problem: 'arcus clean' handles them.
-func (a *app) doctorHost(o *opts, r *report) {
-	in, err := a.hostSelection(o)
-	if err != nil {
-		r.problem("%v", err)
+func (a *app) doctorHost(in plan.Input, selectionErr error, r *report) {
+	if selectionErr != nil {
+		r.problem("%v", selectionErr)
 		return
 	}
 	steps, err := a.plan(in)
