@@ -33,7 +33,8 @@ var (
 )
 
 // reservedNames cannot be module names: "orig" is the backup tag for host
-// originals, and the others are suffixes arcus itself puts next to host files.
+// originals (a module of that name would share backups/orig), and the others are
+// suffixes arcus puts or used to put next to host files.
 var reservedNames = map[string]bool{"orig": true, "arcus-foreign": true, "arcus-tmp": true}
 
 // ValidateName rejects names that are unsafe as a directory name or

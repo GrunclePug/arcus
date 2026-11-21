@@ -206,7 +206,7 @@ func (s *Stacker) Activate(ctx context.Context, module string, activeStack []str
 			}
 		}
 		if e.Backup != "" {
-			if err := renameDurable(e.Host, e.Backup); err != nil {
+			if err := moveIn(e.Host, e.Backup, s.journalCopy(l, len(l.Entries)-1)); err != nil {
 				return fmt.Errorf("backing up %q to %q: %w", e.Host, e.Backup, err)
 			}
 			s.crashPoint()
@@ -219,6 +219,15 @@ func (s *Stacker) Activate(ctx context.Context, module string, activeStack []str
 
 	l.Status = StatusActive
 	return s.saveLedger(l)
+}
+
+// journalCopy returns the journal of a move between the Host and Backup of
+// l's entry i, which marks the entry while the move copies.
+func (s *Stacker) journalCopy(l *Ledger, i int) func(copying bool) error {
+	return func(copying bool) error {
+		l.Entries[i].Copying = copying
+		return s.saveLedger(l)
+	}
 }
 
 func deploy(e Entry) error {
@@ -300,7 +309,9 @@ func (s *Stacker) planActivation(module string, below []*Ledger, checkAccess boo
 	}
 
 	var plan []Entry
+	var replaced []int // indices of the entries that replace a host file
 	var problems []string
+	taken := newReserved()
 	err := walkTree(tree, func(src string, d iofs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -356,13 +367,32 @@ func (s *Stacker) planActivation(module string, below []*Ledger, checkAccess boo
 				problems = append(problems, fmt.Sprintf("%s: module provides a file but the host has a directory", host))
 				return nil
 			}
-			e.Backup = uniquePath(host + "." + ownerTag(host, below))
+			replaced = append(replaced, len(plan))
 		}
 		plan = append(plan, e)
 		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("scanning %s of %q: %w", s.Subdir, module, err)
+	}
+	// A backup beside the host must not take a path the plan deploys, or
+	// the directory of one.
+	for _, e := range plan {
+		taken.add(e.Host)
+	}
+	for _, i := range replaced {
+		host := plan[i].Host
+		tag := ownerTag(host, below)
+		sidecar := host + "." + tag
+		backup := s.storeOr(s.backupPath(host, tag), sidecar)
+		// The backup also stays beside the host where a backup earlier
+		// in this plan takes the name of a directory it needs, and when
+		// the store is on another filesystem if a copy would strip the
+		// file or can't read it.
+		if backup != sidecar && (taken.blocked(backup) || movable(host, existingDir(filepath.Dir(backup)), filepath.Dir(host)) != nil) {
+			backup = sidecar
+		}
+		plan[i].Backup = taken.unused(backup)
 	}
 	if len(problems) > 0 {
 		return nil, fmt.Errorf("pre-flight failed for %q, nothing was changed:\n  %s", module, strings.Join(problems, "\n  "))
@@ -383,14 +413,15 @@ func ownerTag(host string, below []*Ledger) string {
 
 // step is one planned teardown action for an entry.
 type step struct {
-	idx      int     // index into the ledger's entries
-	next     *Ledger // lowest module above that deploys the same host path, or nil
-	nextIdx  int
-	loc      string // where this entry's deployment currently lives ("" = nowhere)
-	remove   bool   // loc holds our deployment and must be removed
-	foreign  bool   // loc holds something we did not put there
-	cache    bool   // loc holds a home-half bytecode cache Python rewrote; teardown removes it
-	finished bool   // a previous interrupted run already completed this step
+	idx       int     // index into the ledger's entries
+	next      *Ledger // lowest module above that deploys the same host path, or nil
+	nextIdx   int
+	loc       string // where this entry's deployment currently lives ("" = nowhere)
+	remove    bool   // loc holds our deployment and must be removed
+	foreign   bool   // loc holds something we did not put there
+	cache     bool   // loc holds a home-half bytecode cache Python rewrote; teardown removes it
+	finished  bool   // a previous interrupted run already completed this step
+	duplicate bool   // an interrupted move left the backup next to an identical host file
 }
 
 // planStep classifies one entry. It is written so that re-running teardown
@@ -431,10 +462,22 @@ func (s *Stacker) planStep(l *Ledger, idx int, above []*Ledger) step {
 		st.remove = true
 	case st.next == nil && e.Backup != "" && !exists(e.Backup):
 		st.finished = true // original already restored by an interrupted run
+	case st.next == nil && e.Backup != "" && e.Copying && identical(st.loc, e.Backup):
+		// A move across filesystems copies before it removes the source, so a
+		// crash can leave both; the ledger marks that window. Outside it an
+		// identical host file is the user's, perhaps with an ACL the backup
+		// lacks, and the backup must stay. Activation crashed after copying the host's
+		// file into the backup: the host still holds it, and nothing was
+		// deployed. Teardown crashed after copying the backup back: the host
+		// already holds the restored original. Either way the host has the
+		// real file and the backup is a duplicate to drop. (A deployment
+		// identical to the backup was matched by owns above and is replaced by
+		// the backup, which is the same content.)
+		st.duplicate = true
 	case st.next == nil && cacheEntry(e) && isWithin(st.loc, s.Target) && s.symlinkedParent(st.loc) == "" && isPyc(st.loc):
 		// Ledgers written before 0.8.2 hold cache links, and Python replaces a
-		// cache by renaming a new file over it. This comes after finished, so
-		// an original a re-run already put back is kept.
+		// cache by renaming a new file over it. Check restored originals first,
+		// including duplicates left by an interrupted move.
 		st.cache = true
 	default:
 		st.foreign = true
@@ -444,7 +487,7 @@ func (s *Stacker) planStep(l *Ledger, idx int, above []*Ledger) step {
 
 // Deactivate removes module's layer. activeStack is the full current stack
 // (containing module). In force mode, files that were modified after
-// activation are moved aside to <path>.arcus-foreign[.N] instead of blocking;
+// activation are moved aside to <StateDir>/foreign/<path>[.N] instead of blocking;
 // arcus never deletes data it did not create, except a home-half bytecode
 // cache Python rewrote over one arcus deployed.
 func (s *Stacker) Deactivate(ctx context.Context, module string, activeStack []string, force bool) error {
@@ -462,12 +505,20 @@ func (s *Stacker) Deactivate(ctx context.Context, module string, activeStack []s
 		return fmt.Errorf("module %q is on but has no ledger; run 'arcus doctor'", module)
 	}
 
-	// Pre-flight: refuse before mutating anything if unforced and foreign.
-	var foreign []string
+	// Pre-flight: refuse before mutating anything if a backup can't be
+	// restored, or if unforced and foreign.
+	var foreign, blocked []string
 	for i := range l.Entries {
-		if st := s.planStep(l, i, above); st.foreign {
+		st := s.planStep(l, i, above)
+		if st.foreign {
 			foreign = append(foreign, st.loc)
 		}
+		if err := s.restoreProblem(l.Entries[i], st); err != nil {
+			blocked = append(blocked, err.Error())
+		}
+	}
+	if len(blocked) > 0 {
+		return fmt.Errorf("turning %q off, nothing was changed:\n  %s", module, strings.Join(blocked, "\n  "))
 	}
 	if len(foreign) > 0 && !force {
 		return fmt.Errorf("%w: these paths changed since %q was turned on, nothing was changed (use -f to move them aside):\n  %s",
@@ -501,10 +552,44 @@ func (s *Stacker) Deactivate(ctx context.Context, module string, activeStack []s
 	return s.removeLedger(module)
 }
 
+// restoreProblem returns why the backup step st restores to e's host can't
+// be restored there, or nil if it can or nothing is restored. It is checked
+// before teardown removes or moves aside anything at the host.
+func (s *Stacker) restoreProblem(e Entry, st step) error {
+	if st.finished || st.duplicate || st.next != nil || e.Backup == "" || !exists(e.Backup) {
+		return nil
+	}
+	if dir := s.symlinkedParent(e.Host); dir != "" {
+		target, _ := os.Readlink(dir)
+		return fmt.Errorf("cannot restore %q to %q: parent %s is a symlink (to %s); remove it first", e.Backup, e.Host, dir, target)
+	}
+	if err := movable(e.Backup, filepath.Dir(e.Backup), existingDir(filepath.Dir(e.Host))); err != nil {
+		return fmt.Errorf("cannot restore %q to %q: %w", e.Backup, e.Host, err)
+	}
+	return nil
+}
+
 func (s *Stacker) teardownEntry(l *Ledger, idx int, above []*Ledger) error {
 	e := l.Entries[idx]
 	st := s.planStep(l, idx, above)
 	if st.finished {
+		return nil
+	}
+	if err := s.restoreProblem(e, st); err != nil {
+		return err
+	}
+
+	if st.duplicate {
+		// A restore whose directory fsync failed leaves the host's copy
+		// published but not durable; the backup goes only once it is. (The
+		// copy's content was fsynced before it was renamed into place.)
+		if err := syncCopyDir(e.Host); err != nil {
+			return fmt.Errorf("syncing the directory of %q before removing the duplicate backup %q: %w", e.Host, e.Backup, err)
+		}
+		if err := removeDurable(e.Backup); err != nil {
+			return fmt.Errorf("removing the duplicate backup %q: %w", e.Backup, err)
+		}
+		s.pruneStore(e.Backup)
 		return nil
 	}
 
@@ -513,13 +598,31 @@ func (s *Stacker) teardownEntry(l *Ledger, idx int, above []*Ledger) error {
 		if err := removeDurable(st.loc); err != nil {
 			return fmt.Errorf("removing %q: %w", st.loc, err)
 		}
+		s.pruneStore(st.loc)
 		s.crashPoint()
 	case st.foreign:
-		aside := uniquePath(st.loc + ".arcus-foreign")
-		if err := renameDurable(st.loc, aside); err != nil {
+		// It stays next to the host when a file in the store blocks the way
+		// (storeOr), or when it is a directory or special file where a file
+		// was deployed, on another filesystem than the state directory.
+		aside := s.storeOr(s.storePath(s.foreignDir(), e.Host), "")
+		note := " (the store holds a file where its directory would go, so it stays here)"
+		var err error
+		if aside != "" {
+			aside, note = uniquePath(aside), ""
+			if err = moveIn(st.loc, aside, nil); errors.Is(err, errCannotCopy) {
+				s.pruneStore(aside)
+				aside, note = "", " (it can't be copied to another filesystem, so it stays here)"
+			}
+		}
+		if aside == "" {
+			aside = uniquePath(st.loc + ".arcus-foreign")
+			err = renameDurable(st.loc, aside)
+		}
+		if err != nil {
 			return fmt.Errorf("moving modified %q aside: %w", st.loc, err)
 		}
-		s.Warn("%s was modified after activation; preserved as %s", st.loc, aside)
+		s.pruneStore(st.loc)
+		s.Warn("%s was modified after activation; preserved as %s%s", st.loc, aside, note)
 		s.crashPoint()
 	}
 
@@ -533,9 +636,15 @@ func (s *Stacker) teardownEntry(l *Ledger, idx int, above []*Ledger) error {
 		if exists(e.Host) {
 			return fmt.Errorf("cannot restore %q: %q is occupied", e.Backup, e.Host)
 		}
-		if err := renameDurable(e.Backup, e.Host); err != nil {
+		// The directory may be gone, removed by the user along with our
+		// deployment; without it the restore fails and stops the whole removal.
+		if err := mkdirAllDurable(filepath.Dir(e.Host), s.restoredDirMode()); err != nil {
+			return fmt.Errorf("recreating the directory of %q: %w", e.Host, err)
+		}
+		if err := moveDurable(e.Backup, e.Host, s.journalCopy(l, idx)); err != nil {
 			return fmt.Errorf("restoring %q to %q: %w", e.Backup, e.Host, err)
 		}
+		s.pruneStore(e.Backup)
 	}
 	return nil
 }
@@ -796,15 +905,21 @@ func (s *Stacker) Rename(oldName, newName, oldDir, newDir string, activeStack []
 		dirty := false
 		for i := range other.Entries {
 			e := &other.Entries[i]
-			// Only ".<old>" or ".<old>.<N>".
-			if tag, ok := strings.CutPrefix(e.Backup, e.Host+"."); !ok || backupTag(tag) != oldName {
+			// Either backups/<old>/... in the store, or the sidecar form
+			// older versions left: ".<old>" or ".<old>.<N>" next to the host.
+			var fresh string
+			if tag, ok := strings.CutPrefix(e.Backup, e.Host+"."); s.BackupTag(e.Backup) == oldName {
+				fresh = uniquePath(s.storeOr(s.backupPath(e.Host, newName), e.Host+"."+newName))
+			} else if ok && backupTag(tag) == oldName {
+				fresh = uniquePath(e.Host + "." + newName)
+			} else {
 				continue
 			}
-			fresh := uniquePath(e.Host + "." + newName)
 			if exists(e.Backup) {
-				if err := renameDurable(e.Backup, fresh); err != nil {
+				if err := moveIn(e.Backup, fresh, nil); err != nil {
 					return fmt.Errorf("renaming backup %q: %w", e.Backup, err)
 				}
+				s.pruneStore(e.Backup)
 			}
 			e.Backup, dirty = fresh, true
 		}
@@ -813,6 +928,11 @@ func (s *Stacker) Rename(oldName, newName, oldDir, newDir string, activeStack []
 				return err
 			}
 		}
+	}
+
+	// Whatever backups/<old>/ held has moved; drop the directory if it is empty.
+	if syscall.Rmdir(filepath.Join(s.backupsDir(), oldName)) == nil {
+		_ = atomicfile.SyncDir(s.backupsDir())
 	}
 
 	l.Module = newName

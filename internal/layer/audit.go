@@ -34,19 +34,36 @@ func (s *Stacker) Audit(module string, activeStack []string) ([]string, error) {
 	for i, e := range l.Entries {
 		deployed[e.Src] = true
 		st := s.planStep(l, i, above)
+		// planStep will not call a copy deployed when it cannot see the
+		// recorded backup. The host file may be the untouched original, and
+		// teardown must not delete it. An unreadable backup store — root-only
+		// on the system half, which doctor checks without sudo — is not the
+		// same as a missing backup. Paths this process can stat are still
+		// checked. DanglingBackups tells doctor the store needs sudo.
+		hiddenBackup := s.BackupTag(e.Backup) != "" && unreadable(e.Backup)
+		// A lower layer's file lives at the backup path recorded above it.
+		// Only that store is allowed to be unreadable without a finding;
+		// an unreadable host path is still reported.
+		hiddenLoc := st.loc != "" && s.BackupTag(st.loc) != "" && unreadable(st.loc)
 		switch {
-		case st.foreign:
+		case st.duplicate:
+			findings = append(findings, fmt.Sprintf("%s: an interrupted move left %s as a duplicate of the file there (turning the module off removes it)", e.Host, e.Backup))
+		case st.foreign, hiddenBackup && st.next == nil && st.finished && exists(st.loc) && !owns(e, st.loc):
+			// planStep calls the entry finished when it cannot see the
+			// backup, as after an interrupted teardown; a host file that is
+			// not the deployment is more likely an edit, and root's teardown
+			// classes it as foreign too.
 			findings = append(findings, fmt.Sprintf("%s was modified after activation (teardown will require -f)", st.loc))
 		case st.cache:
 			// A cache Python rewrote; the next restack removes it.
-		case !st.remove && !st.finished:
-			findings = append(findings, fmt.Sprintf("%s: deployment is missing", e.Host))
-		case st.remove && e.Kind == KindCopy:
+		case !hiddenLoc && e.Kind == KindCopy && (st.remove || (hiddenBackup && owns(e, st.loc))):
 			if f := attrDrift(e, st.loc); f != "" {
 				findings = append(findings, f)
 			}
+		case !hiddenLoc && !st.remove && !st.finished:
+			findings = append(findings, fmt.Sprintf("%s: deployment is missing", e.Host))
 		}
-		if e.Backup != "" && !exists(e.Backup) && !st.finished {
+		if e.Backup != "" && !hiddenBackup && !exists(e.Backup) && !st.finished {
 			findings = append(findings, fmt.Sprintf("%s: recorded backup %s is missing", e.Host, e.Backup))
 		}
 		if !exists(e.Src) {
@@ -90,10 +107,16 @@ func attrDrift(e Entry, loc string) string {
 	return ""
 }
 
-// DanglingBackups looks next to every host path any known module can deploy
-// for files named <path>.orig, <path>.<module> or <path>.<tag>.<N> that no
-// ledger references. These are leftovers of crashes. The scan is bounded to
-// those paths; it never crawls the target.
+// ErrStoreUnreadable is returned when the backup store exists but this
+// process cannot read it. On the system half the store is root-only; doctor
+// says so once instead of treating the backups as missing.
+var ErrStoreUnreadable = errors.New("backup store is not readable; sudo is needed to verify it")
+
+// DanglingBackups lists the files in the backup store that no ledger
+// references, and looks next to every host path any known module can deploy
+// for the sidecar files older versions left: <path>.orig, <path>.<module> or
+// <path>.<tag>.<N>. These are leftovers of crashes. The sidecar scan is
+// bounded to those paths; it never crawls the target.
 func (s *Stacker) DanglingBackups() ([]string, error) {
 	tags := map[string]bool{"orig": true}
 	modules := make([]string, 0, len(s.Dirs))
@@ -145,6 +168,24 @@ func (s *Stacker) DanglingBackups() ([]string, error) {
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return nil, err
 		}
+	}
+
+	// Backups in the store are all arcus's own: any that no ledger names
+	// were left by a crash.
+	err = filepath.WalkDir(s.backupsDir(), func(p string, d iofs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		if !referenced[p] {
+			dangling = append(dangling, p)
+		}
+		return nil
+	})
+	if errors.Is(err, os.ErrPermission) {
+		return dangling, fmt.Errorf("%w: %s", ErrStoreUnreadable, s.backupsDir())
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
 	}
 	return dangling, nil
 }

@@ -222,7 +222,7 @@ func TestMergeByStageAndHash(t *testing.T) {
 	if Hash(a) != Hash(b) {
 		t.Error("hash must be deterministic")
 	}
-	b[0].Changes = append(b[0].Changes, "! /etc/x.conf (kept as x.conf.orig)")
+	b[0].Changes = append(b[0].Changes, "! /etc/x.conf (kept in arcus backups: orig)")
 	if Hash(a) != Hash(b) {
 		t.Error("a file that an earlier stage created must not change the hash")
 	}

@@ -172,7 +172,7 @@ func TestSingleLayerRoundTrip(t *testing.T) {
 		if got := sb.read("foot/foot.ini"); got != "from A" {
 			t.Fatalf("foot.ini = %q", got)
 		}
-		if got := sb.read("foot/foot.ini.orig"); got != "host original" {
+		if got := sb.stored("backups/orig/etc/foot/foot.ini"); got != "host original" {
 			t.Fatalf("backup = %q", got)
 		}
 
@@ -330,7 +330,7 @@ func TestPreexistingOrigFileIsNotConfused(t *testing.T) {
 }
 
 // A file edited after deployment blocks teardown; -f moves it to
-// <path>.arcus-foreign and never deletes it. For the system half this is also
+// <StateDir>/foreign/<path> and never deletes it. For the system half this is also
 // "a changed hash blocks teardown" (same-size edit).
 func TestForeignModificationIsProtected(t *testing.T) {
 	eachHalf(t, func(t *testing.T, sb *sandbox) {
@@ -346,7 +346,7 @@ func TestForeignModificationIsProtected(t *testing.T) {
 		if !errors.Is(err, ErrForeign) {
 			t.Fatalf("want ErrForeign, got %v", err)
 		}
-		if sb.read("g.cfg") != "BBBB" || sb.read("g.cfg.orig") != "ORIGINAL" {
+		if sb.read("g.cfg") != "BBBB" || sb.stored("backups/orig/etc/g.cfg") != "ORIGINAL" {
 			t.Fatal("refused teardown must not change anything")
 		}
 
@@ -354,8 +354,8 @@ func TestForeignModificationIsProtected(t *testing.T) {
 		if sb.read("g.cfg") != "ORIGINAL" {
 			t.Errorf("original not restored: %q", sb.read("g.cfg"))
 		}
-		if sb.read("g.cfg.arcus-foreign") != "BBBB" {
-			t.Errorf("user edit not preserved: %q", sb.read("g.cfg.arcus-foreign"))
+		if sb.stored("foreign/etc/g.cfg") != "BBBB" {
+			t.Errorf("user edit not preserved: %q", sb.stored("foreign/etc/g.cfg"))
 		}
 		if len(sb.warns) == 0 {
 			t.Error("moving a file aside must warn")
@@ -422,6 +422,13 @@ func TestCancelledActivationRollsBack(t *testing.T) {
 	}
 }
 
+// copyMoves makes every move in the test copy across filesystems, as if the
+// state directory were on another one.
+func copyMoves(t *testing.T, on bool) {
+	forceExdev = on
+	t.Cleanup(func() { forceExdev = false })
+}
+
 type crash struct{}
 
 // runUntilCrash runs op with a crash injected at the n-th crash point and
@@ -433,8 +440,9 @@ func runUntilCrash(sb *sandbox, n int, op func() error) (crashed bool, err error
 			panic(crash{})
 		}
 	}
+	afterCopy = sb.s.crashPoint
 	defer func() {
-		sb.s.crashHook = nil
+		sb.s.crashHook, afterCopy = nil, nil
 		if r := recover(); r != nil {
 			if _, ok := r.(crash); !ok {
 				panic(r)
@@ -473,6 +481,20 @@ func (sb *sandbox) assertLedgerCovers(before, pristine map[string]string) {
 			sb.t.Errorf("%s changed (%q -> %q) but no ledger describes it", rel, before[rel], v)
 		}
 	}
+	// Backups live in the state directory, outside the snapshot.
+	_ = filepath.WalkDir(sb.s.backupsDir(), func(p string, d iofs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if info, err := d.Info(); err == nil && info.Mode().IsRegular() {
+			data, _ := os.ReadFile(p)
+			present[fmt.Sprintf("file:%v:%s", info.Mode().Perm(), data)] = true
+			if !known[p] {
+				sb.t.Errorf("backup %s is in no ledger", p)
+			}
+		}
+		return nil
+	})
 	for rel, v := range pristine {
 		if strings.HasPrefix(v, "file:") && !present[v] {
 			sb.t.Errorf("host file %s (%q) was lost", rel, v)
@@ -495,66 +517,74 @@ func TestCrashAtAnyPointConverges(t *testing.T) {
 	}
 
 	for _, h := range halves {
-		t.Run(h.name+"/activation", func(t *testing.T) {
-			for n := 1; ; n++ {
-				sb := newSandbox(t, h)
-				setup(sb)
-				original := sb.snapshot()
-				must(t, sb.activate("a"))
-				withA := sb.snapshot()
+		for _, exdev := range []bool{false, true} {
+			name := h.name
+			if exdev {
+				name += "-exdev"
+			}
+			t.Run(name+"/activation", func(t *testing.T) {
+				copyMoves(t, exdev)
+				for n := 1; ; n++ {
+					sb := newSandbox(t, h)
+					setup(sb)
+					original := sb.snapshot()
+					must(t, sb.activate("a"))
+					withA := sb.snapshot()
 
-				crashed, err := runUntilCrash(sb, n, func() error { return sb.s.Activate(context.Background(), "b", sb.stack) })
-				must(t, err)
-				if !crashed {
-					if n == 1 {
-						t.Fatal("no crash points were hit")
+					crashed, err := runUntilCrash(sb, n, func() error { return sb.s.Activate(context.Background(), "b", sb.stack) })
+					must(t, err)
+					if !crashed {
+						if n == 1 {
+							t.Fatal("no crash points were hit")
+						}
+						t.Logf("crashed at each of %d points", n-1)
+						break
 					}
-					t.Logf("crashed at each of %d points", n-1)
-					break
+					sb.assertLedgerCovers(withA, original)
+
+					must(t, sb.s.Rollback("b"))
+					assertSame(t, withA, sb.snapshot())
+					must(t, sb.deactivate("a", false))
+					assertSame(t, original, sb.snapshot())
+					sb.assertNoLedgers()
 				}
-				sb.assertLedgerCovers(withA, original)
+			})
 
-				must(t, sb.s.Rollback("b"))
-				assertSame(t, withA, sb.snapshot())
-				must(t, sb.deactivate("a", false))
-				assertSame(t, original, sb.snapshot())
-				sb.assertNoLedgers()
-			}
-		})
+			t.Run(name+"/deactivation", func(t *testing.T) {
+				copyMoves(t, exdev)
+				// Reference: the target after a clean removal of a from under b.
+				ref := newSandbox(t, h)
+				setup(ref)
+				must(t, ref.activate("a"))
+				must(t, ref.activate("b"))
+				must(t, ref.deactivate("a", false))
+				onlyB := ref.snapshot()
 
-		t.Run(h.name+"/deactivation", func(t *testing.T) {
-			// Reference: the target after a clean removal of a from under b.
-			ref := newSandbox(t, h)
-			setup(ref)
-			must(t, ref.activate("a"))
-			must(t, ref.activate("b"))
-			must(t, ref.deactivate("a", false))
-			onlyB := ref.snapshot()
+				for n := 1; ; n++ {
+					sb := newSandbox(t, h)
+					setup(sb)
+					original := sb.snapshot()
+					must(t, sb.activate("a"))
+					must(t, sb.activate("b"))
+					both := sb.snapshot()
 
-			for n := 1; ; n++ {
-				sb := newSandbox(t, h)
-				setup(sb)
-				original := sb.snapshot()
-				must(t, sb.activate("a"))
-				must(t, sb.activate("b"))
-				both := sb.snapshot()
+					crashed, err := runUntilCrash(sb, n, func() error { return sb.deactivate("a", false) })
+					must(t, err)
+					if !crashed {
+						assertSame(t, onlyB, sb.snapshot())
+						t.Logf("crashed at each of %d points", n-1)
+						break
+					}
+					sb.assertLedgerCovers(both, original)
 
-				crashed, err := runUntilCrash(sb, n, func() error { return sb.deactivate("a", false) })
-				must(t, err)
-				if !crashed {
+					must(t, sb.deactivate("a", false))
 					assertSame(t, onlyB, sb.snapshot())
-					t.Logf("crashed at each of %d points", n-1)
-					break
+					must(t, sb.deactivate("b", false))
+					assertSame(t, original, sb.snapshot())
+					sb.assertNoLedgers()
 				}
-				sb.assertLedgerCovers(both, original)
-
-				must(t, sb.deactivate("a", false))
-				assertSame(t, onlyB, sb.snapshot())
-				must(t, sb.deactivate("b", false))
-				assertSame(t, original, sb.snapshot())
-				sb.assertNoLedgers()
-			}
-		})
+			})
+		}
 	}
 }
 
@@ -618,6 +648,56 @@ func TestDeletedDeploymentStillRestoresBackup(t *testing.T) {
 	})
 }
 
+func TestBackupRestoresIntoADeletedDirectory(t *testing.T) {
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		sb.hostFile("sub/dir/f", "ORIGINAL")
+		sb.moduleFile("p", "sub/dir/f", "p")
+		before := sb.snapshot()
+		must(t, sb.activate("p"))
+		must(t, os.RemoveAll(filepath.Join(sb.host, "sub"))) // user deleted the whole directory
+		must(t, sb.deactivate("p", false))
+
+		// The old mode is gone with the directory. A home directory may
+		// have been private (~/.ssh), so it comes back private; the system
+		// half's are read by other users.
+		if !sb.s.Copy {
+			before["sub"], before["sub/dir"] = "dir:-rwx------", "dir:-rwx------"
+		}
+		assertSame(t, before, sb.snapshot())
+	})
+}
+
+// The user replaced the deployment's directory with a symlink, say into a
+// dotfiles checkout. The backup stays in the store rather than going there.
+func TestBackupIsNotRestoredThroughASymlinkedParent(t *testing.T) {
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		sb.hostFile("sub/dir/f", "ORIGINAL")
+		sb.moduleFile("p", "sub/dir/f", "p")
+		must(t, sb.activate("p"))
+		checkout := filepath.Join(sb.root, "checkout")
+		must(t, os.Mkdir(checkout, 0o755))
+		must(t, os.RemoveAll(filepath.Join(sb.host, "sub")))
+		must(t, os.Symlink(checkout, filepath.Join(sb.host, "sub")))
+
+		err := sb.deactivate("p", false)
+		if err == nil || !strings.Contains(err.Error(), "is a symlink") {
+			t.Fatalf("deactivate = %v", err)
+		}
+		if entries, _ := os.ReadDir(checkout); len(entries) != 0 {
+			t.Errorf("restored into the symlink's target: %v", entries)
+		}
+		if sb.stored("backups/orig/etc/sub/dir/f") != "ORIGINAL" {
+			t.Error("the backup left the store")
+		}
+
+		must(t, os.Remove(filepath.Join(sb.host, "sub")))
+		must(t, sb.deactivate("p", false))
+		if got := sb.read("sub/dir/f"); got != "ORIGINAL" {
+			t.Errorf("f = %q", got)
+		}
+	})
+}
+
 func TestSharedCreatedDirectoryIsHandedOver(t *testing.T) {
 	eachHalf(t, func(t *testing.T, sb *sandbox) {
 		sb.moduleFile("a", "fresh/a", "a")
@@ -672,8 +752,8 @@ func TestRenameRelinksAndRetagsBackups(t *testing.T) {
 		must(t, sb.activate("old"))
 		must(t, sb.activate("oldx"))
 		must(t, sb.activate("top"))
-		if sb.read("f.old") != "old" || sb.read("g.oldx") != "oldx" {
-			t.Fatalf("expected backups tagged with owner, got %q, %q", sb.read("f.old"), sb.read("g.oldx"))
+		if sb.stored("backups/old/etc/f") != "old" || sb.stored("backups/oldx/etc/g") != "oldx" {
+			t.Fatalf("expected backups tagged with owner, got %q, %q", sb.stored("backups/old/etc/f"), sb.stored("backups/oldx/etc/g"))
 		}
 
 		oldDir, newDir := sb.s.Dirs["old"], filepath.Join(sb.profDir, "new")
@@ -683,16 +763,143 @@ func TestRenameRelinksAndRetagsBackups(t *testing.T) {
 		must(t, sb.s.Rename("old", "new", oldDir, newDir, sb.stack))
 		sb.stack = []string{"new", "oldx", "top"}
 
-		if sb.read("f.new") != "old" {
-			t.Errorf("backup not retagged / relinked: %q", sb.read("f.new"))
+		if sb.stored("backups/new/etc/f") != "old" {
+			t.Errorf("backup not retagged / relinked: %q", sb.stored("backups/new/etc/f"))
 		}
-		if sb.read("g.oldx") != "oldx" {
-			t.Errorf("unrelated backup g.oldx was touched: %q", sb.read("g.oldx"))
+		if sb.stored("backups/oldx/etc/g") != "oldx" {
+			t.Errorf("unrelated backup g.oldx was touched: %q", sb.stored("backups/oldx/etc/g"))
 		}
 		must(t, sb.deactivate("new", false))
 		must(t, sb.deactivate("top", false))
 		must(t, sb.deactivate("oldx", false))
 		assertSame(t, before, sb.snapshot())
+	})
+}
+
+// A root-only backup store is not evidence that a deployment or its backup
+// is gone. Doctor reads the system half without privileges; the store is
+// mode 0700, so stat and walk fail with EACCES. That must not be reported
+// as a missing file. A file that is actually gone, in a store this process
+// can read, still is.
+func TestUnreadableBackupStoreIsNotMissing(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission checks are bypassed as root")
+	}
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		sb.hostFile("locale.conf", "LANG=C\n")
+		sb.moduleFile("base", "locale.conf", "LANG=en_US.UTF-8\n")
+		sb.moduleFile("top", "locale.conf", "LANG=C.UTF-8\n")
+		must(t, sb.activate("base"))
+		must(t, sb.activate("top"))
+		host := filepath.Join(sb.host, "locale.conf")
+
+		must(t, os.Chmod(sb.s.backupsDir(), 0))
+		t.Cleanup(func() { _ = os.Chmod(sb.s.backupsDir(), 0o700) })
+
+		for _, name := range []string{"base", "top"} {
+			findings, err := sb.s.Audit(name, sb.stack)
+			must(t, err)
+			if joined := strings.Join(findings, "\n"); strings.Contains(joined, "missing") {
+				t.Fatalf("%s: unreadable backup store reported as missing:\n%s", name, joined)
+			}
+		}
+		dangling, err := sb.s.DanglingBackups()
+		if !errors.Is(err, ErrStoreUnreadable) {
+			t.Fatalf("DanglingBackups err = %v, want ErrStoreUnreadable", err)
+		}
+		if len(dangling) != 0 {
+			t.Fatalf("dangling = %v", dangling)
+		}
+
+		// The host file is still visible. A mode change is drift even though
+		// the backup cannot be read. (Home deployments are symlinks; chmod
+		// would follow them into the module.)
+		if sb.s.Copy {
+			must(t, os.Chmod(host, 0o600))
+			findings, err := sb.s.Audit("top", sb.stack)
+			must(t, err)
+			joined := strings.Join(findings, "\n")
+			if !strings.Contains(joined, "mode/owner is 0600") || strings.Contains(joined, "missing") {
+				t.Fatalf("mode drift with an unreadable store:\n%s", joined)
+			}
+			must(t, os.Chmod(host, 0o644))
+		}
+
+		// The top deployment is the host file. Removing it is visible without
+		// the store; the backup is not, so only the deployment is reported.
+		must(t, os.Remove(host))
+		findings, err := sb.s.Audit("top", sb.stack)
+		must(t, err)
+		joined := strings.Join(findings, "\n")
+		if !strings.Contains(joined, host+": deployment is missing") || strings.Contains(joined, "recorded backup") {
+			t.Fatalf("host file removed, store unreadable:\n%s", joined)
+		}
+	})
+}
+
+// An edited deployment stays visible when its backup is in a store doctor
+// cannot read: planStep cannot see the backup, so it calls the entry
+// finished, but the host file is there and is not the deployment.
+func TestEditWithUnreadableBackupStoreIsReported(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission checks are bypassed as root")
+	}
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		sb.hostFile("locale.conf", "LANG=C\n")
+		sb.moduleFile("base", "locale.conf", "LANG=en_US.UTF-8\n")
+		must(t, sb.activate("base"))
+		host := filepath.Join(sb.host, "locale.conf")
+		must(t, os.Remove(host))
+		must(t, os.WriteFile(host, []byte("LANG=edited\n"), 0o644))
+
+		must(t, os.Chmod(sb.s.backupsDir(), 0))
+		t.Cleanup(func() { _ = os.Chmod(sb.s.backupsDir(), 0o700) })
+
+		findings, err := sb.s.Audit("base", sb.stack)
+		must(t, err)
+		joined := strings.Join(findings, "\n")
+		if !strings.Contains(joined, host+" was modified after activation") || strings.Contains(joined, "missing") {
+			t.Fatalf("edited host file with an unreadable store:\n%s", joined)
+		}
+	})
+}
+
+// A deployment or backup that is actually absent is still reported when the
+// store can be read. A missing copy backup also leaves the host file
+// indistinguishable from the original, which planStep refuses to call
+// deployed.
+func TestMissingDeploymentAndBackupAreReported(t *testing.T) {
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		sb.hostFile("locale.conf", "LANG=C\n")
+		sb.moduleFile("base", "locale.conf", "LANG=en_US.UTF-8\n")
+		must(t, sb.activate("base"))
+		l, err := sb.s.LoadLedger("base")
+		must(t, err)
+		host, backup := l.Entries[0].Host, l.Entries[0].Backup
+
+		must(t, os.Remove(host))
+		findings, err := sb.s.Audit("base", sb.stack)
+		must(t, err)
+		joined := strings.Join(findings, "\n")
+		if !strings.Contains(joined, "deployment is missing") || strings.Contains(joined, "recorded backup") {
+			t.Fatalf("missing host file:\n%s", joined)
+		}
+
+		if sb.s.Copy {
+			must(t, os.WriteFile(host, []byte("LANG=en_US.UTF-8\n"), 0o644))
+		} else {
+			must(t, os.Symlink(l.Entries[0].Src, host))
+		}
+		must(t, os.Remove(backup))
+		findings, err = sb.s.Audit("base", sb.stack)
+		must(t, err)
+		joined = strings.Join(findings, "\n")
+		if !strings.Contains(joined, "recorded backup "+backup+" is missing") {
+			t.Fatalf("missing backup:\n%s", joined)
+		}
+		if sb.s.Copy && !strings.Contains(joined, "deployment is missing") {
+			t.Fatalf("missing copy backup should leave the host file unclaimed:\n%s", joined)
+		}
 	})
 }
 
@@ -709,7 +916,7 @@ func TestDanglingBackupsAndAudit(t *testing.T) {
 			t.Fatalf("dangling = %v", got)
 		}
 
-		must(t, sb.activate("p")) // backs up to f.orig.1
+		must(t, sb.activate("p")) // backs up to backups/orig/etc/f
 		got, _ = sb.s.DanglingBackups()
 		if len(got) != 1 {
 			t.Fatalf("referenced backup reported as dangling: %v", got)
@@ -793,6 +1000,45 @@ func (sb *sandbox) deployOldCache(name string, backup bool) (host, src string) {
 }
 
 // pythonRewrite replaces path the way Python writes a cache: a new file
+
+// Behind the symlinked parent the checkout holds a copy of the deployment,
+// or the user's own file. The refusal comes before teardown removes the one
+// or moves the other aside: nothing beyond the symlink is touched, even
+// under -f.
+func TestNothingIsTornDownThroughASymlinkedParent(t *testing.T) {
+	for _, force := range []bool{false, true} {
+		eachHalf(t, func(t *testing.T, sb *sandbox) {
+			sb.hostFile("sub/dir/f", "ORIGINAL")
+			src := sb.moduleFile("p", "sub/dir/f", "p")
+			must(t, sb.activate("p"))
+			checkout := filepath.Join(sb.root, "checkout")
+			must(t, os.MkdirAll(filepath.Join(checkout, "dir"), 0o755))
+			behind := filepath.Join(checkout, "dir", "f")
+			switch {
+			case force:
+				must(t, os.WriteFile(behind, []byte("mine"), 0o644))
+			case sb.s.Copy:
+				must(t, os.WriteFile(behind, []byte("p"), 0o644))
+			default:
+				must(t, os.Symlink(src, behind))
+			}
+			must(t, os.RemoveAll(filepath.Join(sb.host, "sub")))
+			must(t, os.Symlink(checkout, filepath.Join(sb.host, "sub")))
+
+			err := sb.deactivate("p", force)
+			if err == nil || !strings.Contains(err.Error(), "is a symlink") {
+				t.Fatalf("force=%v: deactivate = %v", force, err)
+			}
+			if !exists(behind) {
+				t.Errorf("force=%v: %s was torn down through the symlink", force, behind)
+			}
+			if sb.stored("backups/orig/etc/sub/dir/f") != "ORIGINAL" {
+				t.Errorf("force=%v: the backup left the store", force)
+			}
+		})
+	}
+}
+
 // renamed over it, so a deployed link becomes a regular file.
 func pythonRewrite(t *testing.T, path, content string) {
 	t.Helper()
@@ -1285,8 +1531,8 @@ func TestRemovingDirsLeavesOtherThingsAlone(t *testing.T) {
 		sb.moduleFile("c", "foo", "from c")
 		must(t, sb.activate("c"))
 		must(t, sb.s.Release())
-		if got, orig := sb.read("foo"), sb.read("foo.orig"); got != "from c" || orig != "user data" {
-			t.Errorf("foo = %q, foo.orig = %q", got, orig)
+		if got, orig := sb.read("foo"), sb.stored("backups/orig/etc/foo"); got != "from c" || orig != "user data" {
+			t.Errorf("foo = %q, its backup = %q", got, orig)
 		}
 		must(t, sb.deactivate("c", false))
 		if got := sb.read("foo"); got != "user data" {
