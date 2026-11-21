@@ -1,6 +1,7 @@
 package state
 
 import (
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -270,5 +271,49 @@ func TestStateRejectsOtherFormats(t *testing.T) {
 		if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "format") {
 			t.Errorf("%s: got %v", src, err)
 		}
+	}
+}
+
+// AppImage records follow their ownership: a record moves with a transfer
+// and goes when nothing owns its path any more.
+func TestAppImageRecords(t *testing.T) {
+	s := &State{}
+	rec := AppImage{SHA256: "aa", SelfUpdate: true, Stamp: Stamp{Size: 1, MTime: 2, CTime: 3, Inode: 4}}
+	s.SetAppImage("desk", "Applications/a.AppImage", rec)
+	s.SetAppImage("desk", "Applications/b.AppImage", AppImage{SHA256: "bb"})
+	s.SetAppImage("old", "Applications/c.AppImage", AppImage{SHA256: "cc"})
+
+	if got := s.AppImage("Applications/a.AppImage"); got == nil || *got != rec {
+		t.Fatalf("record = %+v", got)
+	}
+	c := s.Clone()
+	c.AppImages["Applications/a.AppImage"] = AppImage{}
+	if *s.AppImage("Applications/a.AppImage") != rec {
+		t.Error("Clone must not share records with the original")
+	}
+
+	// desk drops b, old goes off and its c moves to desk.
+	declares := map[string][]string{"desk": {"Applications/a.AppImage", "Applications/c.AppImage"}}
+	present := set("Applications/a.AppImage", "Applications/b.AppImage", "Applications/c.AppImage")
+	if remove := s.Reconcile(HomeAppImages, []string{"desk"}, declares, nil, present); !slices.Equal(remove, []string{"Applications/b.AppImage"}) {
+		t.Errorf("remove = %v", remove)
+	}
+	if s.AppImage("Applications/b.AppImage") != nil || s.AppImages["Applications/b.AppImage"].SHA256 != "" {
+		t.Error("the record of a released AppImage must go")
+	}
+	if got := s.AppImage("Applications/c.AppImage"); got == nil || got.SHA256 != "cc" || s.Owner(HomeAppImages, "Applications/c.AppImage") != "desk" {
+		t.Errorf("transferred record = %+v, owner %q", got, s.Owner(HomeAppImages, "Applications/c.AppImage"))
+	}
+
+	// A record without an owner counts as none.
+	s.AppImages["Applications/stray"] = AppImage{SHA256: "dd"}
+	if s.AppImage("Applications/stray") != nil {
+		t.Error("an unowned record must not count")
+	}
+	if pruned := s.Prune(HomeAppImages, set("Applications/c.AppImage")); !slices.Equal(pruned, []string{"Applications/a.AppImage"}) {
+		t.Errorf("pruned %v", pruned)
+	}
+	if !maps.Equal(s.AppImages, map[string]AppImage{"Applications/c.AppImage": {SHA256: "cc"}}) {
+		t.Errorf("records after prune: %+v", s.AppImages)
 	}
 }
