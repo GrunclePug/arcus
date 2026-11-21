@@ -341,6 +341,27 @@ func TestApplyPicksUpModuleChanges(t *testing.T) {
 	lacks(t, e.sys.Packages(), "mako")
 }
 
+// AppImages that came to clash in two modules that are on keep neither from
+// being turned off; the selection that remains is what must not clash.
+func TestOffDespiteAppImagesThatClash(t *testing.T) {
+	e := newEnv(t)
+	e.module("a", "", nil)
+	e.module("b", "", nil)
+	must(t, e.run("on", "-y", "a"))
+	must(t, e.run("on", "-y", "b"))
+	app := func(name string) string {
+		return fmt.Sprintf("[appimages.%s]\nurl = \"https://x.org/app\"\nsha256 = %q\npath = \"Applications/app.AppImage\"\n", name, strings.Repeat("0", 64))
+	}
+	e.module("a", app("app"), nil)
+	e.module("b", app("other"), nil)
+
+	if err := e.run("apply", "-n"); err == nil || !strings.Contains(err.Error(), "both put an AppImage") {
+		t.Fatalf("apply with the clash: %v", err)
+	}
+	must(t, e.run("off", "-n", "a"))
+	must(t, e.run("off", "-n", "b"))
+}
+
 // What a module lists and was already there is taken over, so off removes
 // it like anything arcus installed; only what another module that's on
 // lists, or what is protected, stays.
