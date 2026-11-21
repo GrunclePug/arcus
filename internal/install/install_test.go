@@ -81,7 +81,7 @@ func TestLoad(t *testing.T) {
 }
 
 // Every installer module loads, and the machine module follows the plan,
-// the firmware and the CPU.
+// the firmware, the CPU and the audio driver.
 func TestModulesAndMachineFacts(t *testing.T) {
 	p, err := Load(writePlan(t, validPlan))
 	if err != nil {
@@ -95,24 +95,37 @@ func TestModulesAndMachineFacts(t *testing.T) {
 		t.Fatalf("%d installer modules (%v)", len(set), err)
 	}
 
-	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "proc"), 0o755); err != nil {
+	// One root per CPU, read like the live system's /proc and /sys. The AMD
+	// root has no audio device bound, so it needs no sof-firmware; the Intel
+	// one has its audio on an Intel SOF driver.
+	amd, intel := t.TempDir(), t.TempDir()
+	for root, vendor := range map[string]string{amd: "AuthenticAMD", intel: "GenuineIntel"} {
+		if err := os.MkdirAll(filepath.Join(root, "proc"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "proc/cpuinfo"), []byte("vendor_id\t: "+vendor+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dev := filepath.Join(intel, "sys/bus/pci/devices/0000:00:1f.3")
+	if err := os.MkdirAll(dev, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "proc/cpuinfo"), []byte("vendor_id\t: AuthenticAMD\n"), 0o644); err != nil {
+	if err := os.Symlink("../../../../bus/pci/drivers/sof-audio-pci-intel-tgl", filepath.Join(dev, "driver")); err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
-		fs, swap string
-		uefi     bool
-		want     []string
+		root, fs, swap string
+		uefi           bool
+		want           []string
 	}{
-		{"btrfs", "zram", true, []string{"linux", "linux-firmware", "amd-ucode", "grub", "efibootmgr", "btrfs-progs", "dosfstools", "zram-generator"}},
-		{"ext4", "none", true, []string{"linux", "linux-firmware", "amd-ucode", "grub", "efibootmgr", "dosfstools", "e2fsprogs"}},
-		{"xfs", "none", false, []string{"linux", "linux-firmware", "amd-ucode", "grub", "e2fsprogs", "xfsprogs"}},
+		{amd, "btrfs", "zram", true, []string{"linux", "linux-firmware", "amd-ucode", "grub", "efibootmgr", "btrfs-progs", "dosfstools", "zram-generator"}},
+		{amd, "ext4", "none", true, []string{"linux", "linux-firmware", "amd-ucode", "grub", "efibootmgr", "dosfstools", "e2fsprogs"}},
+		{amd, "xfs", "none", false, []string{"linux", "linux-firmware", "amd-ucode", "grub", "e2fsprogs", "xfsprogs"}},
+		{intel, "ext4", "none", true, []string{"linux", "linux-firmware", "sof-firmware", "intel-ucode", "grub", "efibootmgr", "dosfstools", "e2fsprogs"}},
 	} {
 		p.Disk.Filesystem, p.Disk.Swap = tc.fs, tc.swap
-		if got := MachineFacts(p, tc.uefi, root).Packages(); !slices.Equal(got, tc.want) {
+		if got := MachineFacts(p, tc.uefi, tc.root).Packages(); !slices.Equal(got, tc.want) {
 			t.Errorf("%s, uefi=%v: %v, want %v", tc.fs, tc.uefi, got, tc.want)
 		}
 	}

@@ -27,6 +27,7 @@ type Facts struct {
 	UEFI        bool
 	Kernels     []string // kernel packages
 	Firmware    bool     // linux-firmware
+	IntelSOF    bool     // audio runs on Intel's Sound Open Firmware: sof-firmware
 	GRUB        bool
 	Filesystems []string // types in use: btrfs, ext4, vfat, ...
 	CPU         string   // vendor_id from /proc/cpuinfo
@@ -55,6 +56,9 @@ func (f Facts) Packages() []string {
 	pkgs := slices.Sorted(slices.Values(f.Kernels))
 	if f.Firmware {
 		pkgs = append(pkgs, "linux-firmware")
+	}
+	if f.IntelSOF {
+		pkgs = append(pkgs, "sof-firmware")
 	}
 	if m := microcode[f.CPU]; m != "" {
 		pkgs = append(pkgs, m)
@@ -185,6 +189,31 @@ func GPUs(root string) []string {
 	return gpus
 }
 
+// IntelSOF reports whether a device below root is bound to one of Intel's
+// Sound Open Firmware drivers, whose firmware sof-firmware holds. It reads
+// the driver bound now, not the modules loaded: the kernel loads SOF and HDA
+// modules side by side, and only one binds. For the drivers that consult
+// snd_intel_dspcfg, the binding is its choice and follows dsp_driver=. With
+// the probe work queue Arch's kernel enables, a missing firmware fails after
+// the device is bound, so a machine without sof-firmware is still found; an
+// earlier probe failure leaves no driver to find. AMD's SOF drivers load
+// firmware that sof-firmware doesn't ship, so they don't count.
+func IntelSOF(root string) bool {
+	for _, bus := range []string{"pci", "platform"} {
+		links, _ := filepath.Glob(filepath.Join(root, "sys/bus", bus, "devices/*/driver"))
+		for _, link := range links {
+			target, err := os.Readlink(link)
+			if err != nil {
+				continue
+			}
+			if name := filepath.Base(target); strings.HasPrefix(name, "sof-audio-pci-intel-") || strings.HasPrefix(name, "sof-audio-acpi-intel-") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // SSD reports whether a disk below root is solid state: a non-removable,
 // non-rotational block device with a device behind it, which leaves out
 // loop, zram and device-mapper devices.
@@ -210,6 +239,7 @@ func Detect(root string, installed map[string]bool) Facts {
 	f := Facts{
 		UEFI:     err == nil,
 		Firmware: installed["linux-firmware"],
+		IntelSOF: IntelSOF(root),
 		GRUB:     installed["grub"],
 		CPU:      CPU(filepath.Join(root, "proc/cpuinfo")),
 		GPUs:     GPUs(root),

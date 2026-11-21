@@ -56,6 +56,7 @@ func MachineFacts(p *Plan, uefi bool, root string) machine.Facts {
 		Filesystems: slices.Compact(filesystems),
 		CPU:         machine.CPU(filepath.Join(root, "proc/cpuinfo")),
 		GPUs:        machine.GPUs(root),
+		IntelSOF:    machine.IntelSOF(root),
 		Zram:        p.Disk.Swap == "zram",
 		SSD:         machine.SSD(root),
 	}

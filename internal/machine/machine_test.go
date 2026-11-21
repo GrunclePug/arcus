@@ -24,6 +24,10 @@ func TestPackages(t *testing.T) {
 			[]string{"linux", "mesa", "vulkan-radeon", "vulkan-intel", "intel-media-driver"}},
 		{"nvidia, a prebuilt and a dkms kernel", Facts{Kernels: []string{"linux-zen", "linux"}, CPU: "AuthenticAMD", GPUs: []string{NVIDIA}},
 			[]string{"linux", "linux-zen", "amd-ucode", "nvidia-open", "nvidia-open-dkms", "linux-zen-headers", "nvidia-utils"}},
+		{"intel sof", Facts{Kernels: []string{"linux"}, Firmware: true, CPU: "GenuineIntel", IntelSOF: true},
+			[]string{"linux", "linux-firmware", "sof-firmware", "intel-ucode"}},
+		{"intel sof without linux-firmware", Facts{Kernels: []string{"linux"}, IntelSOF: true},
+			[]string{"linux", "sof-firmware"}},
 	} {
 		if got := tc.f.Packages(); !slices.Equal(got, tc.want) {
 			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
@@ -54,9 +58,11 @@ func TestDetect(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "sys/firmware/efi"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	bind(t, root, "pci", "0000:00:1f.3", "sof-audio-pci-intel-tgl")
+	// sof-firmware is not installed: the module asks for it all the same.
 	installed := map[string]bool{"linux": true, "linux-firmware": true, "grub": true, "zram-generator": true, "xfsprogs": true}
 	got := Detect(root, installed)
-	want := Facts{UEFI: true, Kernels: []string{"linux"}, Firmware: true, GRUB: true, Filesystems: []string{"btrfs", "vfat"}, CPU: "AuthenticAMD", GPUs: []string{NVIDIA}, Zram: true, SSD: true}
+	want := Facts{UEFI: true, Kernels: []string{"linux"}, Firmware: true, IntelSOF: true, GRUB: true, Filesystems: []string{"btrfs", "vfat"}, CPU: "AuthenticAMD", GPUs: []string{NVIDIA}, Zram: true, SSD: true}
 	if got.Hash() != want.Hash() {
 		t.Errorf("detected %+v, want %+v", got, want)
 	}
@@ -66,7 +72,7 @@ func TestDetect(t *testing.T) {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "module.toml"))
-	if err != nil || !strings.Contains(string(data), `"btrfs-progs", "dosfstools", "zram-generator"`) || !strings.Contains(string(data), `system = ["fstrim.timer"]`) {
+	if err != nil || !strings.Contains(string(data), `"linux-firmware", "sof-firmware"`) || !strings.Contains(string(data), `"btrfs-progs", "dosfstools", "zram-generator"`) || !strings.Contains(string(data), `system = ["fstrim.timer"]`) {
 		t.Errorf("module.toml: %s (%v)", data, err)
 	}
 	got.Zram = false
@@ -104,5 +110,71 @@ func TestSSD(t *testing.T) {
 		if got := SSD(root); got != tc.want {
 			t.Errorf("%s: SSD = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// bind fakes a device on bus below root that is bound to driver, with a
+// relative link as sysfs makes it.
+func bind(t *testing.T, root, bus, device, driver string) {
+	t.Helper()
+	dir := filepath.Join(root, "sys/bus", bus, "devices", device)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("../../../../bus", bus, "drivers", driver), filepath.Join(dir, "driver")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Only a device bound to an Intel SOF driver needs sof-firmware; a loaded
+// module that nothing is bound to doesn't count.
+func TestIntelSOF(t *testing.T) {
+	for _, tc := range []struct {
+		name, bus, driver string
+		modules           []string
+		want              bool
+	}{
+		{"no devices", "", "", nil, false},
+		{"intel pci", "pci", "sof-audio-pci-intel-tgl", nil, true},
+		{"intel acpi", "platform", "sof-audio-acpi-intel-byt", nil, true},
+		{"amd", "pci", "snd_sof_amd_rembrandt", []string{"snd_sof", "snd_sof_amd_rembrandt"}, false},
+		{"arm", "platform", "sof-audio-of-imx8", nil, false},
+		{"hda, sof modules loaded", "pci", "snd_hda_intel", []string{"snd_sof", "snd_sof_pci_intel_cnl"}, false},
+	} {
+		root := t.TempDir()
+		if tc.bus != "" {
+			bind(t, root, tc.bus, "0000:00:1f.3", tc.driver)
+		}
+		for _, m := range tc.modules {
+			if err := os.MkdirAll(filepath.Join(root, "sys/module", m), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if got := IntelSOF(root); got != tc.want {
+			t.Errorf("%s: IntelSOF = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	// As in sysfs, the bus lists its devices as links into sys/devices, and
+	// the SOF device is not the first one.
+	root := t.TempDir()
+	for dev, driver := range map[string]string{"0000:00:0e.0": "snd_hda_intel", "0000:00:1f.3": "sof-audio-pci-intel-tgl"} {
+		real := filepath.Join(root, "sys/devices/pci0000:00", dev)
+		if err := os.MkdirAll(real, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("../../../bus/pci/drivers/"+driver, filepath.Join(real, "driver")); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(root, "sys/bus/pci/devices", dev)
+		if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("../../../devices/pci0000:00/"+dev, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !IntelSOF(root) {
+		t.Error("sysfs layout with an HDA device first: IntelSOF = false, want true")
 	}
 }
