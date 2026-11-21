@@ -109,7 +109,7 @@ func (a *app) offModule(f *host.File, name string, force bool) error {
 	if err != nil {
 		return err
 	}
-	desired, err := a.modules.Resolve(selected)
+	desired, err := a.modules.Order(selected)
 	if err != nil {
 		return err
 	}

@@ -2,14 +2,30 @@ package module
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 )
 
 // Resolve expands names with everything they require, directly or
 // transitively, and orders the result so every module comes after its
 // requirements. Apart from that the order of names is kept, since it is the
-// stacking order. It fails on unknown modules, cycles and conflicts.
+// stacking order. It fails on unknown modules, cycles and conflicts, and on
+// AppImages that clash.
 func (s Set) Resolve(names []string) ([]string, error) {
+	order, err := s.Order(names)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.appImageClashes(order); err != nil {
+		return nil, err
+	}
+	return order, nil
+}
+
+// Order is Resolve without the AppImage checks, for a selection that is
+// being taken apart: AppImages that came to clash in two modules that are
+// on mustn't keep either from being turned off.
+func (s Set) Order(names []string) ([]string, error) {
 	order := []string{}
 	visited := map[string]bool{}
 	visiting := map[string]bool{}
@@ -56,6 +72,36 @@ func (s Set) Resolve(names []string) ([]string, error) {
 		}
 	}
 	return order, nil
+}
+
+// appImageClashes rejects two modules declaring an AppImage of the same name
+// or at the same path (or one inside the other), and an AppImage where a
+// module's home files, links or dirs go.
+func (s Set) appImageClashes(order []string) error {
+	names, paths := map[string]string{}, map[string]string{}
+	for _, m := range order {
+		for _, name := range slices.Sorted(maps.Keys(s[m].AppImages)) {
+			p := s[m].AppImages[name].Path
+			if other, ok := names[name]; ok {
+				return fmt.Errorf("modules %q and %q both declare AppImage %q", other, m, name)
+			}
+			for _, q := range slices.Sorted(maps.Keys(paths)) {
+				if paths[q] != m && nested(p, q) {
+					if p == q {
+						return fmt.Errorf("modules %q and %q both put an AppImage at ~/%s", paths[q], m, p)
+					}
+					return fmt.Errorf("modules %q and %q put AppImages at ~/%s and ~/%s, one inside the other", paths[q], m, q, p)
+				}
+			}
+			names[name], paths[p] = m, m
+			for _, other := range order {
+				if what := s[other].claims(p); what != "" {
+					return fmt.Errorf("module %q puts an AppImage at ~/%s, but module %q %s", m, p, other, what)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // Dependents returns every module in stack that requires target, directly
