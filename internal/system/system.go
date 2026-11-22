@@ -234,13 +234,13 @@ func Explicit() (map[string]bool, error) {
 }
 
 // Foreign returns the installed packages that no sync repository has:
-// from the AUR or built by hand. Without a sync database pacman counts
-// every package as foreign and only warns, so that warning is an error
-// here; others, such as an outdated pacman.conf directive, aren't. Exit 1
-// with no output is no foreign package only when pacman printed nothing
-// but warnings: an error there (no repositories, a missing database
-// signature) would count every package as native. pacman runs untranslated
-// so its messages can be recognised.
+// from the AUR or built by hand. pacman decides that from its sync
+// databases, and when one is missing, corrupt or unusable it still lists
+// packages, wrongly, and only says so on stderr, whatever its exit status.
+// So any error there, or the warning that a database is missing, fails
+// this; other warnings, such as an outdated pacman.conf directive, don't.
+// Exit 1 without output is no foreign package. pacman runs untranslated so
+// its messages can be recognised.
 func Foreign() (map[string]bool, error) {
 	var stdout, stderr bytes.Buffer
 	cmd := exec.Command("pacman", "-Qqm")
@@ -248,19 +248,13 @@ func Foreign() (map[string]bool, error) {
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
 	for line := range strings.Lines(stderr.String()) {
-		if strings.Contains(line, "database file for") {
+		if !strings.HasPrefix(line, "warning:") || strings.Contains(line, "database file for") {
 			return nil, fmt.Errorf("pacman -Qqm: %s", strings.TrimSpace(line))
 		}
 	}
 	var exit *exec.ExitError
-	none := errors.As(err, &exit) && exit.ExitCode() == 1 && stdout.Len() == 0
-	for line := range strings.Lines(stderr.String()) {
-		if !strings.HasPrefix(line, "warning:") {
-			none = false
-		}
-	}
-	if err != nil && !none {
-		return nil, fmt.Errorf("pacman -Qqm: %w: %s", err, strings.TrimSpace(stderr.String()))
+	if err != nil && !(errors.As(err, &exit) && exit.ExitCode() == 1 && stdout.Len() == 0) {
+		return nil, fmt.Errorf("pacman -Qqm: %w", err)
 	}
 	set := map[string]bool{}
 	for _, f := range strings.Fields(stdout.String()) {

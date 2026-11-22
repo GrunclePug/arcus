@@ -243,6 +243,7 @@ func TestNewUnlistedRefusals(t *testing.T) {
 		}, nil, "host file moved"},
 		{"no sync databases", func(e *env) { e.sys.NoSync() }, nil, "database file"},
 		{"no repositories", func(e *env) { e.sys.NoRepos() }, nil, "no usable package repositories"},
+		{"corrupt sync database", func(e *env) { e.sys.CorruptSync() }, nil, "Unrecognized archive format"},
 		{"mv to machine", func(e *env) { e.module("mine", "", nil) }, []string{"mv", "mine", "machine"}, "machine module's name"},
 		{"broken host file", func(e *env) { must(t, os.WriteFile(e.hostPath(), []byte("modules = [\"nope\"]\n"), 0o644)) }, nil, "nope"},
 	} {
