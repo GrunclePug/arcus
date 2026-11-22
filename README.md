@@ -15,6 +15,7 @@ The project is in early development: until 1.0, commands and file formats may st
 * **Every resource kind is reversible**: turning a module off removes the packages, units, groups and files it brought, whether arcus installed them or took them over (packages it takes over are marked explicitly installed, like the ones it installs), but never ones another module still wants or that are protected. A package another installed package still needs stays, marked as a dependency, so pacman removes it with the last package that needs it.
 * **Same result on any machine**: a machine set up by hand ends up like a fresh install of the same profile after `arcus machine`, `apply` and `clean`.
 * **Own builds**: a module can carry PKGBUILD recipes; arcus builds them with makepkg as you, installs them with pacman, and rebuilds when a recipe changes. An own build that another pending one needs to build (its `depends`, `makedepends` and `checkdepends` as `makepkg --printsrcinfo` lists them, by name or through `provides`) is built and installed in an earlier batch, and one that a package depends on is installed with it or before; unrelated builds share a batch, a batch doesn't remove what one of its builds needs, and a dependency cycle is refused before anything changes.
+* **AppImages**: a module can pin a vendor AppImage by URL and sha256; arcus downloads it into `$HOME` as you, updates it when the pin moves, and leaves it alone once the app updates itself.
 * **Conflicts in the plan**: an installed package that a package to install conflicts with is listed in the plan and removed right before its replacement goes in, unless a module wants it.
 * **Clean on request**: `apply` never touches packages arcus didn't install; `arcus clean` removes the ones no module lists, after showing its plan.
 * **Updates**: from a clone with `make install`, or `arcus update` for the latest release, checksum-verified.
@@ -104,24 +105,23 @@ system = []
 user   = ["mako.service"]
 now    = false
 
-[appimages.t3code]          # one table per AppImage, downloaded into $HOME
-url         = "https://github.com/pingdotgg/t3code/releases/download/v0.1.11/T3-Code-x86_64.AppImage"
-sha256      = "8baa06a7bbaa3f729d69466fb211ed7006d6a6e4d800b9ecdacd831fd1686b14"
-path        = "Applications/T3-Code.AppImage"   # relative to $HOME; default Applications/<name>.AppImage
-self_update = true                               # the app updates its own file; default false
+[appimages.editor]          # one table per AppImage, downloaded into $HOME
+url    = "https://example.org/releases/1.2.0/Editor-x86_64.AppImage"
+sha256 = "<the release's sha256>"
+path   = "Applications/Editor.AppImage"   # relative to $HOME; default Applications/<name>.AppImage
 ```
 
-Arcus downloads an AppImage as your user into a temporary file beside its destination. It checks `sha256` before making the file executable and moving it into place. It never replaces a file that turned up or changed there during the download: an update swaps the new version in atomically (`renameat2` with `RENAME_EXCHANGE`) and swaps back a file that changed at the last moment, and on a kernel or filesystem that can't swap files it fails and leaves the old file. A failed or mismatched download stops the command and removes its temporary file. The next download or `arcus doctor -fix` removes temporary files left by an interrupted download. An update interrupted mid-swap can leave a `.<name>.<digits>.swap` file beside the destination, holding the new version or the old file; `arcus doctor` reports it for you to inspect, also once the AppImage is off, and never removes it. The `url` must be https, and the path can't be named `.<name>.<digits>.tmp` or `.<name>.<digits>.swap`, the names of these temporary files. No two modules that are on may declare the same AppImage name or path, an AppImage can't go where a module that is on deploys a home file, a link or a directory from `dirs`, and, as with home files, not below a directory in `$HOME` that is a symlink.
+An AppImage is downloaded as your user into `<path>.arcus-tmp` beside its destination, checked against `sha256`, made executable, and put in place without replacing anything that appeared there meanwhile. Keep `path` free of the version: an app that updates itself under a new name would otherwise be downloaded again. arcus acts on the file only while it is exactly what arcus installed:
 
-| At the path | `self_update = false` | `self_update = true` |
-|-------------|-----------------------|----------------------|
-| nothing | download it | download it |
-| a file arcus didn't install, with the pinned `sha256` | take it over | take it over |
-| a file arcus didn't install, any other | move it aside to `<path>.arcus-foreign`, then download | take it over as it is |
-| the file arcus installed, unchanged, and the pin moved | download over it | leave it |
-| the file arcus installed, changed since | move it aside, then download | leave it |
+| At the path | `apply` |
+|-------------|---------|
+| nothing | downloads the pin |
+| the pinned file, which arcus didn't install or which isn't executable | takes it over and makes it executable |
+| what arcus installed, and the pin moved | downloads the new pin over it |
+| what arcus installed, changed since (the app updated itself, or you replaced it) | leaves it alone and says so; remove it to get the pin |
+| any other file, or a directory | refuses: move it away, then apply again |
 
-Turning the module off, or dropping the table, removes the file arcus recorded: a pinned one only while it is unchanged (a changed one stays and is forgotten), a self-updating one either way. A file below a directory that has become a symlink stays, and `arcus doctor -fix` removes no temporary files there: arcus doesn't follow the link. Directories created for it stay; list them in `dirs` to have them removed when empty. `arcus doctor` reports a declared AppImage that is missing, and a pinned one that doesn't match its pin; `apply` downloads it again. The state records each file's size, times and inode with its `sha256`, so a large AppImage is read again only once it changed.
+Turning the module off, or dropping the table, removes the file while it is what arcus installed; a changed one stays, is named, and is forgotten. arcus never deletes a `<path>.arcus-tmp` left by an interrupted download: the next run refuses until you remove it. As with home files, an AppImage can't go below a directory in `$HOME` that is a symlink, nor where two modules that are on both put one, nor where a module deploys a home file; a module's home file turning into an AppImage at the same path takes two applies (remove the file, apply, then add the AppImage).
 
 A profile is a file that lists modules in stacking order, and the host file `~/.local/state/arcus/host.toml` picks profiles and adds the machine's own modules:
 

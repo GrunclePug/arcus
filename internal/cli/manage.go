@@ -38,7 +38,6 @@ now    = false
 # url         = "https://..."
 # sha256      = ""
 # path        = "Applications/name.AppImage"
-# self_update = false
 `
 
 // cmdNew creates a module skeleton in ~/.config/arcus/modules.

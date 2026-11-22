@@ -110,7 +110,7 @@ func (a *app) offModule(f *host.File, name string, force bool) error {
 	if err != nil {
 		return err
 	}
-	desired, err := a.modules.Order(selected)
+	desired, err := a.modules.Resolve(selected)
 	if err != nil {
 		return err
 	}
@@ -215,11 +215,15 @@ func (a *app) change(o *opts, create bool, edit func(*host.File) error) (err err
 	if err != nil {
 		return err
 	}
-	steps, err := a.plan(in)
+	var notes []string
+	steps, err := a.plan(in, func(n string) { notes = append(notes, n) })
 	if err != nil {
 		return err
 	}
 	a.printPlan(steps)
+	for _, n := range notes {
+		fmt.Fprintf(a.stdout, "  = %s\n", n)
+	}
 	if o.dry {
 		return nil
 	}
@@ -321,11 +325,9 @@ func (a *app) present(kind string) (map[string]bool, error) {
 	case state.HomeLinks:
 		return a.homeLinks()
 	case state.HomeAppImages:
-		st, err := a.userHalf().loadState()
-		if err != nil {
-			return nil, err
-		}
-		return appimage.Removable(a.paths.Home, st, a.userHalf().layer.SymlinkedParent)
+		// Every recorded AppImage counts as present, so one that changed is
+		// handed over rather than dropped; the plan sorts out which go.
+		return nil, nil
 	}
 	return nil, fmt.Errorf("unknown kind %q", kind)
 }
@@ -386,16 +388,13 @@ func (a *app) situation(in plan.Input, h *half) (plan.Half, error) {
 	if err != nil {
 		return plan.Half{}, err
 	}
-	s := plan.Half{State: st, Layer: h.layer, Home: a.paths.Home}
+	s := plan.Half{State: st, Layer: h.layer}
 	// Each query runs only if one of its kinds is declared or owned.
 	type query struct {
 		kinds []string
 		into  *map[string]bool
 	}
-	queries := []query{
-		{[]string{state.AUR}, &s.Installed}, {[]string{state.UserUnits}, &s.Units}, {[]string{state.HomeDirs}, &s.Dirs},
-		{[]string{state.HomeLinks}, &s.Links}, {[]string{state.HomeAppImages}, &s.AppImages},
-	}
+	queries := []query{{[]string{state.AUR}, &s.Installed}, {[]string{state.UserUnits}, &s.Units}, {[]string{state.HomeDirs}, &s.Dirs}, {[]string{state.HomeLinks}, &s.Links}}
 	if h.name == "system" {
 		queries = []query{
 			{[]string{state.Pacman, state.Local}, &s.Installed},
@@ -541,8 +540,10 @@ func (a *app) localInfo(s plan.Step) (system.Package, bool, error) {
 }
 
 // plan computes the steps of both halves. The system half is read under a
-// shared lock, which is released again before any root step runs.
-func (a *app) plan(in plan.Input) ([]plan.Step, error) {
+// shared lock, which is released again before any root step runs. note, if
+// not nil, receives what the user plan leaves alone that is worth saying,
+// as plan.Half.Note describes.
+func (a *app) plan(in plan.Input, note func(string)) ([]plan.Step, error) {
 	sh := a.systemHalf()
 	lock, err := sh.lock(false)
 	if err != nil {
@@ -558,6 +559,7 @@ func (a *app) plan(in plan.Input) ([]plan.Step, error) {
 	if err != nil {
 		return nil, err
 	}
+	us.Note = note
 	usr, err := plan.User(in, us)
 	if err != nil {
 		return nil, err
@@ -648,13 +650,7 @@ func describe(s plan.Step) string {
 	case plan.Unlink:
 		return fmt.Sprintf("remove home links that still point at their target: %s", strings.Join(s.Names, ", "))
 	case plan.InstallAppImage:
-		return fmt.Sprintf("install AppImage for %s: %s", s.Module, names)
-	case plan.UpdateAppImage:
-		return fmt.Sprintf("update AppImage for %s to the pinned version: %s", s.Module, names)
-	case plan.ReplaceAppImage:
-		return fmt.Sprintf("replace AppImage for %s with the pinned version: %s", s.Module, names)
-	case plan.RecordAppImage:
-		return fmt.Sprintf("update the record of AppImage for %s: %s", s.Module, names)
+		return fmt.Sprintf("download the pinned AppImage for %s: %s", s.Module, names)
 	case plan.RemoveAppImage:
 		if len(s.Names) == 0 {
 			return "update the records of AppImages:"
@@ -818,7 +814,7 @@ func (a *app) runSteps(h *half, st *state.State, steps []plan.Step, in plan.Inpu
 				return err
 			}
 			i = j - 1
-		case plan.InstallAppImage, plan.UpdateAppImage, plan.ReplaceAppImage, plan.RecordAppImage:
+		case plan.InstallAppImage:
 			if err := a.appImage(h, st, s, in, save); err != nil {
 				return err
 			}
@@ -985,10 +981,20 @@ func (a *app) remove(st *state.State, steps []plan.Step, in plan.Input, r *syste
 			}
 		}
 	case plan.RemoveAppImage:
-		// Removals has checked that each is still arcus's to remove.
-		for _, p := range remove {
-			if err = os.Remove(filepath.Join(a.paths.Home, p)); err != nil {
-				break
+		// Only the names the plan removes, each once more as arcus
+		// recorded it; anything else stays. Turning off never stops here:
+		// the records go either way.
+		h := a.userHalf()
+		for _, p := range steps[0].Names {
+			path := filepath.Join(a.paths.Home, p)
+			if h.layer.SymlinkedParent(path) != "" || !appimage.Removable(path, st.AppImages[p]) {
+				if _, err := os.Lstat(path); err == nil {
+					h.layer.Warn("~/%s changed since the plan was shown; it stays", p)
+				}
+				continue
+			}
+			if err := os.Remove(path); err != nil {
+				h.layer.Warn("removing ~/%s: %v; it stays", p, err)
 			}
 		}
 	case plan.Rmdir:

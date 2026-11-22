@@ -9,6 +9,7 @@ import (
 	"fmt"
 	iofs "io/fs"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -116,17 +117,31 @@ func (s *Stacker) hostPathFor(tree, src string) (string, error) {
 }
 
 // OwnData reports whether host lies inside arcus's own data: the state
-// directory or a module directory.
+// directory or a module directory. Both spellings count, the configured one
+// and the one with symlinks resolved, since ~/.config/arcus is usually a
+// link into a checkout that $HOME also reaches directly.
 func (s *Stacker) OwnData(host string) bool {
-	if isWithin(host, s.StateDir) {
-		return true
-	}
-	for _, dir := range s.Dirs {
-		if isWithin(host, dir) {
+	// The parent only: a deployed file is itself a link into a module.
+	real := filepath.Join(resolved(filepath.Dir(host)), filepath.Base(host))
+	for _, dir := range append([]string{s.StateDir}, slices.Collect(maps.Values(s.Dirs))...) {
+		if isWithin(host, dir) || isWithin(real, resolved(dir)) {
 			return true
 		}
 	}
 	return false
+}
+
+// resolved returns path with the symlinks in its longest existing prefix
+// resolved, and the rest appended as it is.
+func resolved(path string) string {
+	for dir, rest := path, ""; ; dir, rest = filepath.Dir(dir), filepath.Join(filepath.Base(dir), rest) {
+		if real, err := filepath.EvalSymlinks(dir); err == nil {
+			return filepath.Join(real, rest)
+		}
+		if dir == filepath.Dir(dir) {
+			return path
+		}
+	}
 }
 
 func (s *Stacker) allowed(host string) bool {
@@ -568,17 +583,6 @@ func (s *Stacker) teardownEntry(l *Ledger, idx int, above []*Ledger) error {
 		}
 	}
 	return nil
-}
-
-// SetAside moves the file at host aside to <host>.arcus-foreign, at the next
-// free name, as teardown does with a file edited since deployment, and
-// returns where it went.
-func (s *Stacker) SetAside(host string) (string, error) {
-	aside := uniquePath(host + ".arcus-foreign")
-	if err := renameDurable(host, aside); err != nil {
-		return "", fmt.Errorf("moving %q aside: %w", host, err)
-	}
-	return aside, nil
 }
 
 // HoldLedger is the ledger that keeps the directories of the layers a

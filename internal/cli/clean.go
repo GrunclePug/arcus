@@ -36,7 +36,7 @@ func (a *app) cmdClean(args []string) (err error) {
 	if err != nil {
 		return err
 	}
-	pending, err := a.plan(in)
+	pending, err := a.plan(in, nil)
 	if err != nil {
 		return err
 	}

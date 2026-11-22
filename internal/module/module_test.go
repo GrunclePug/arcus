@@ -101,9 +101,9 @@ func TestLoadRejects(t *testing.T) {
 		{"appimage bad name", "p", "[appimages.\"a b\"]\nurl = \"https://x.org/a\"\nsha256 = \"" + digest + "\"", "invalid name"},
 		{"appimage unknown key", "p", appImage(`selfupdate = true`), "appimages.a.selfupdate"},
 		{"appimage path twice", "p", appImage(`path = "x"`) + "\n[appimages.b]\nurl = \"https://x.org/b\"\nsha256 = \"" + digest + "\"\npath = \"x\"", "used twice"},
-		{"appimage temp name", "p", appImage(`path = "Applications/.app.AppImage.123.tmp"`), "can't be named .<name>.<digits>.tmp or .swap"},
-		{"appimage swap name", "p", appImage(`path = ".x.7.swap"`), "can't be named .<name>.<digits>.tmp or .swap"},
-		{"appimage temp name with a newline", "p", appImage(`path = ".a\nb.AppImage.123.tmp"`), "can't be named .<name>.<digits>.tmp or .swap"},
+		{"appimage temp suffix", "p", appImage(`path = "Applications/a.AppImage.arcus-tmp"`), "can't end in .arcus-tmp"},
+		{"appimage below a temp suffix", "p", appImage(`path = "Applications/b.arcus-tmp/a.AppImage"`), "can't end in .arcus-tmp"},
+		{"appimage self_update", "p", appImage(`self_update = true`), "appimages.a.self_update"},
 		{"appimage inside another", "p", appImage(`path = "x"`) + "\n[appimages.b]\nurl = \"https://x.org/b\"\nsha256 = \"" + digest + "\"\npath = \"x/y\"", "inside another AppImage's"},
 	}
 	for _, tt := range tests {
@@ -113,16 +113,6 @@ func TestLoadRejects(t *testing.T) {
 				t.Fatalf("want error containing %q, got %v", tt.wantErr, err)
 			}
 		})
-	}
-}
-
-// Only the names of a download's temp files are refused: other hidden
-// .tmp or .swap names are ordinary paths.
-func TestLoadAcceptsHiddenNamesThatAreNotTempFiles(t *testing.T) {
-	for _, p := range []string{".demo.tmp", ".x.swap", "Applications/.app.AppImage.x1.tmp"} {
-		if _, err := Load(writeModule(t, t.TempDir(), "p", appImage(`path = "`+p+`"`))); err != nil {
-			t.Errorf("%s: %v", p, err)
-		}
 	}
 }
 
@@ -139,7 +129,6 @@ func TestLoadAppImages(t *testing.T) {
 url         = "https://github.com/pingdotgg/t3code/releases/download/v0.1.11/T3-Code-x86_64.AppImage"
 sha256      = "8BAA06A7BBAA3F729D69466FB211ED7006D6A6E4D800B9ECDACD831FD1686B14"
 path        = "Applications/T3-Code.AppImage"
-self_update = true
 
 [appimages.tool]
 url    = "https://example.org/tool.AppImage"
@@ -150,7 +139,7 @@ sha256 = "`+digest+`"
 		t.Fatal(err)
 	}
 	want := map[string]AppImage{
-		"t3code": {URL: "https://github.com/pingdotgg/t3code/releases/download/v0.1.11/T3-Code-x86_64.AppImage", SHA256: digest, Path: "Applications/T3-Code.AppImage", SelfUpdate: true},
+		"t3code": {URL: "https://github.com/pingdotgg/t3code/releases/download/v0.1.11/T3-Code-x86_64.AppImage", SHA256: digest, Path: "Applications/T3-Code.AppImage"},
 		"tool":   {URL: "https://example.org/tool.AppImage", SHA256: digest, Path: "Applications/tool.AppImage"},
 	}
 	if !maps.Equal(m.AppImages, want) {
@@ -159,84 +148,36 @@ sha256 = "`+digest+`"
 	if got := m.AppImagePaths(); !slices.Equal(got, []string{"Applications/T3-Code.AppImage", "Applications/tool.AppImage"}) {
 		t.Errorf("paths = %v", got)
 	}
-	if name, ai, ok := m.AppImageAt("Applications/tool.AppImage"); !ok || name != "tool" || ai != want["tool"] {
-		t.Errorf("AppImageAt = %q %+v %v", name, ai, ok)
+	if ai, ok := m.AppImageAt("Applications/tool.AppImage"); !ok || ai != want["tool"] {
+		t.Errorf("AppImageAt = %+v %v", ai, ok)
 	}
-	if _, _, ok := m.AppImageAt("Applications/none"); ok {
+	if _, ok := m.AppImageAt("Applications/none"); ok {
 		t.Error("AppImageAt found an undeclared path")
 	}
 }
 
-// Two modules that are on can't declare the same AppImage name or path.
-func TestResolveAppImageClashes(t *testing.T) {
-	ai := func(path string) map[string]AppImage {
-		return map[string]AppImage{"app": {URL: "https://x.org/a", SHA256: digest, Path: path}}
+// Deploys finds anything a module's home/ tree has at a path: an AppImage
+// there would collide with the module's own layer.
+func TestDeploys(t *testing.T) {
+	m := &Module{Dir: writeModule(t, t.TempDir(), "other", "")}
+	p := filepath.Join(m.Dir, "home", "Applications", "x.AppImage")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	s := graph(map[string][2][]string{"a": req(), "b": req(), "c": req()})
-	s["a"].AppImages = ai("Applications/app.AppImage")
-	s["b"].AppImages = ai("Applications/other.AppImage")
-	s["c"].AppImages = map[string]AppImage{"other": {URL: "https://x.org/a", SHA256: digest, Path: "Applications/app.AppImage"}}
-
-	if _, err := s.Resolve([]string{"a", "b"}); err == nil || !strings.Contains(err.Error(), `modules "a" and "b" both declare AppImage "app"`) {
-		t.Errorf("same name: %v", err)
+	if m.Deploys("Applications/x.AppImage") {
+		t.Error("nothing there yet")
 	}
-	if _, err := s.Resolve([]string{"a", "c"}); err == nil || !strings.Contains(err.Error(), "both put an AppImage at ~/Applications/app.AppImage") {
-		t.Errorf("same path: %v", err)
+	if err := os.WriteFile(p, nil, 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := s.Resolve([]string{"b", "c"}); err != nil {
-		t.Errorf("distinct names and paths: %v", err)
+	if !m.Deploys("Applications/x.AppImage") {
+		t.Error("a home file at the path")
 	}
-	s["c"].AppImages = map[string]AppImage{"other": {URL: "https://x.org/a", SHA256: digest, Path: "Applications/app.AppImage/inner"}}
-	if _, err := s.Resolve([]string{"a", "c"}); err == nil || !strings.Contains(err.Error(), "put AppImages at ~/Applications/app.AppImage and ~/Applications/app.AppImage/inner, one inside the other") {
-		t.Errorf("nested paths: %v", err)
+	if m.Deploys("Applications/y.AppImage") {
+		t.Error("another path")
 	}
-}
-
-// An AppImage can't go where a module that is on links, lists a
-// directory or deploys a home file, nor below such a file.
-func TestResolveAppImageOverlaps(t *testing.T) {
-	root := t.TempDir()
-	s := graph(map[string][2][]string{"app": req(), "other": req()})
-	s["app"].AppImages = map[string]AppImage{"x": {URL: "https://x.org/a", SHA256: digest, Path: "Applications/x.AppImage"}}
-	s["other"].Dir = writeModule(t, root, "other", "")
-	if _, err := s.Resolve([]string{"app", "other"}); err != nil {
-		t.Fatalf("no overlap: %v", err)
-	}
-	mkfile := func(rel string) {
-		t.Helper()
-		p := filepath.Join(s["other"].Dir, "home", rel)
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(p, nil, 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	mkfile("Applications/readme") // a directory above it is fine
-	if _, err := s.Resolve([]string{"app", "other"}); err != nil {
-		t.Fatalf("home files beside it: %v", err)
-	}
-
-	tests := []struct {
-		name  string
-		setup func()
-		want  string
-	}{
-		{"link above it", func() { s["other"].Links = map[string]string{"Applications": "Sync/apps"} }, "links ~/Applications"},
-		{"link at it", func() { s["other"].Links = map[string]string{"Applications/x.AppImage": "Sync/x"} }, "links ~/Applications/x.AppImage"},
-		{"dir at it", func() { s["other"].Dirs = []string{"Applications/x.AppImage"} }, "lists ~/Applications/x.AppImage in dirs"},
-		{"home file at it", func() { mkfile("Applications/x.AppImage") }, "deploys ~/Applications/x.AppImage from its home/"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s["other"].Links, s["other"].Dirs = nil, []string{"Applications"} // a dir above it is fine
-			_ = os.Remove(filepath.Join(s["other"].Dir, "home", "Applications", "x.AppImage"))
-			tt.setup()
-			_, err := s.Resolve([]string{"app", "other"})
-			if err == nil || !strings.Contains(err.Error(), `module "app" puts an AppImage at ~/Applications/x.AppImage, but module "other" `+tt.want) {
-				t.Fatalf("got %v", err)
-			}
-		})
+	if (&Module{}).Deploys("Applications/x.AppImage") {
+		t.Error("a module without a directory deploys nothing")
 	}
 }
 

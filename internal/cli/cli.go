@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	iofs "io/fs"
-	"net/http"
 	"os"
 	"os/exec"
 	"os/user"
@@ -65,8 +64,6 @@ type app struct {
 	hostname       func() (string, error)
 	// sudo runs "arcus exec-system <args>" as root.
 	sudo func(args []string) error
-	// client downloads AppImages; nil is appimage.Client.
-	client *http.Client
 	// exe returns the path of the running binary, which update replaces.
 	exe      func() (string, error)
 	version  string // the running version, "dev" unless built by make
@@ -270,8 +267,8 @@ func (a *app) userHalf() *half {
 		name:  "user",
 		dir:   a.paths.UserState,
 		layer: layer.NewHome(a.paths.Home, a.paths.UserState, a.dirs()),
-		// Not AppImages: one that changed isn't gone, so doctorAppImages
-		// checks them instead of Prune.
+		// Not AppImages: one that changed isn't gone, and its record is
+		// what tells arcus it may still act on it.
 		kinds: []string{state.AUR, state.UserUnits, state.HomeDirs, state.HomeLinks},
 	}
 }

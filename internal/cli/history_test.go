@@ -721,30 +721,3 @@ func TestCancelledDoctorFixRepairsNothing(t *testing.T) {
 		t.Error("a cancelled doctor -fix rolled the orphan back")
 	}
 }
-
-func TestDoctorRecordsAppImageCleanup(t *testing.T) {
-	e := histEnv(t)
-	r := e.serveAppImages(map[string]string{"/app": "app"})
-	e.appImageModule(r, "/app", "app", "")
-	must(t, e.run("on", "-y", "desk"))
-	leftover := filepath.Join(e.home, "Applications", ".app.AppImage.12345.tmp")
-	must(t, os.WriteFile(leftover, []byte("partial"), 0o600))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	e.ctx = ctx
-	if err := e.run("doctor", "-fix"); err == nil {
-		t.Error("a cancelled doctor -fix succeeded")
-	}
-	if _, err := os.Stat(leftover); err != nil {
-		t.Fatalf("a cancelled doctor -fix removed the download: %v", err)
-	}
-	e.wantSubjects("on -y desk")
-
-	e.ctx = context.Background()
-	must(t, e.run("doctor", "-fix"))
-	if _, err := os.Stat(leftover); !os.IsNotExist(err) {
-		t.Errorf("download leftover after repair: %v", err)
-	}
-	e.wantSubjects("doctor -fix", "on -y desk")
-}

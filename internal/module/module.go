@@ -34,9 +34,6 @@ var (
 	// AppImage names make the default file name, Applications/<name>.AppImage.
 	appImageNameRegex = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 	sha256Regex       = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	// A download's temp files; (?s) because a file name, and so <name> in
-	// .<name>.<digits>.tmp, may hold a newline.
-	tempNameRegex = regexp.MustCompile(`(?s)^\..+\.[0-9]+\.(tmp|swap)$`)
 )
 
 // reservedNames cannot be module names: "orig" is the backup tag for host
@@ -90,10 +87,11 @@ type AppImage struct {
 	SHA256 string `toml:"sha256"`
 	// Path is relative to $HOME; Load fills in Applications/<name>.AppImage.
 	Path string `toml:"path"`
-	// SelfUpdate: the app updates its own file, so after the first install
-	// arcus leaves its content alone.
-	SelfUpdate bool `toml:"self_update"`
 }
+
+// TempSuffix names the file a download is written to beside its AppImage,
+// <path>.arcus-tmp. No AppImage path may use it.
+const TempSuffix = ".arcus-tmp"
 
 // Module is a loaded module directory. Its name is the directory name.
 type Module struct {
@@ -219,12 +217,12 @@ func (m *Module) validateAppImages() error {
 		if !homeRelative(ai.Path) {
 			return fmt.Errorf("appimages.%s: path %q must be a relative path inside $HOME", name, ai.Path)
 		}
-		// The temp files of a download beside another AppImage are named
-		// .<name>.<digits>.tmp or .swap, and doctor -fix removes the former.
-		if tempNameRegex.MatchString(path.Base(ai.Path)) {
-			return fmt.Errorf("appimages.%s: path %q can't be named .<name>.<digits>.tmp or .swap, the names of a download's temp files", name, ai.Path)
+		// Not even as a directory: A.arcus-tmp/x would take the place of A's
+		// temp file.
+		if slices.ContainsFunc(strings.Split(ai.Path, "/"), func(c string) bool { return strings.HasSuffix(c, TempSuffix) }) {
+			return fmt.Errorf("appimages.%s: path %q can't end in %s, the suffix of a download's temp file", name, ai.Path, TempSuffix)
 		}
-		if slices.ContainsFunc(paths, func(p string) bool { return nested(p, ai.Path) }) {
+		if slices.ContainsFunc(paths, func(p string) bool { return Nested(p, ai.Path) }) {
 			return fmt.Errorf("appimages.%s: path %q is used twice, or inside another AppImage's", name, ai.Path)
 		}
 		paths = append(paths, ai.Path)
@@ -233,36 +231,20 @@ func (m *Module) validateAppImages() error {
 	return nil
 }
 
-// nested reports whether two paths below $HOME are the same or one is
+// Nested reports whether two paths below $HOME are the same or one is
 // inside the other.
-func nested(a, b string) bool {
+func Nested(a, b string) bool {
 	return a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
 }
 
-// claims describes what the module puts at p or around it in $HOME that an
-// AppImage at p would collide with: a file of its home/ tree at p or in
-// place of a directory above it, a link, or a listed directory at p or
-// inside it. It returns "" if there is nothing.
-func (m *Module) claims(p string) string {
-	for _, l := range slices.Sorted(maps.Keys(m.Links)) {
-		if nested(l, p) {
-			return "links ~/" + l
-		}
-	}
-	for _, d := range m.Dirs {
-		if d == p || strings.HasPrefix(d, p+"/") {
-			return "lists ~/" + d + " in dirs"
-		}
-	}
+// Deploys reports whether the module's home/ tree has anything at p, below
+// $HOME, so an AppImage there would collide with the module's own layer.
+func (m *Module) Deploys(p string) bool {
 	if m.Dir == "" {
-		return ""
+		return false
 	}
-	for a := p; a != "."; a = path.Dir(a) {
-		if info, err := os.Lstat(filepath.Join(m.Dir, "home", a)); err == nil && (a == p || !info.IsDir()) {
-			return "deploys ~/" + a + " from its home/"
-		}
-	}
-	return ""
+	_, err := os.Lstat(filepath.Join(m.Dir, "home", filepath.FromSlash(p)))
+	return err == nil
 }
 
 // AppImagePaths are the paths of the module's AppImages, sorted. Ownership
@@ -276,14 +258,14 @@ func (m *Manifest) AppImagePaths() []string {
 	return paths
 }
 
-// AppImageAt returns the name and declaration of the module's AppImage at p.
-func (m *Manifest) AppImageAt(p string) (string, AppImage, bool) {
-	for name, ai := range m.AppImages {
+// AppImageAt returns the declaration of the module's AppImage at p.
+func (m *Manifest) AppImageAt(p string) (AppImage, bool) {
+	for _, ai := range m.AppImages {
 		if ai.Path == p {
-			return name, ai, true
+			return ai, true
 		}
 	}
-	return "", AppImage{}, false
+	return AppImage{}, false
 }
 
 // RecipeDir returns the directory of the recipe for the own build pkg.

@@ -86,11 +86,9 @@ const (
 	Link     = "link" // home links
 	Unlink   = "unlink"
 
-	// AppImages, one per step but removals (see appimage.Action).
+	// AppImages: a download (an install or an update), one per file, and
+	// the removal of those arcus installed.
 	InstallAppImage = "install-appimage"
-	UpdateAppImage  = "update-appimage"
-	ReplaceAppImage = "replace-appimage"
-	RecordAppImage  = "record-appimage"
 	RemoveAppImage  = "remove-appimage"
 
 	// Packages taken over that were installed as dependencies become
@@ -142,7 +140,7 @@ func (s Step) Kind() string {
 		return state.HomeDirs
 	case s.Op == Link || s.Op == Unlink:
 		return state.HomeLinks
-	case s.Op == InstallAppImage || s.Op == UpdateAppImage || s.Op == ReplaceAppImage || s.Op == RecordAppImage || s.Op == RemoveAppImage:
+	case s.Op == InstallAppImage || s.Op == RemoveAppImage:
 		return state.HomeAppImages
 	}
 	return ""
@@ -221,10 +219,9 @@ type Half struct {
 	Groups     map[string]bool // system half: the main user's groups
 	Dirs       map[string]bool // user half: home directories that exist
 	Links      map[string]bool // user half: home links that point at their target
-	// User half: $HOME, and the recorded AppImages that off may remove
-	// (appimage.Removable).
-	Home      string
-	AppImages map[string]bool
+	// Note, if set, receives what planning leaves alone that a user would
+	// want to know about: an AppImage that changed since arcus installed it.
+	Note func(string)
 
 	// Conflicts checks need these, when the half installs packages: every
 	// installed package (Packages), and the packages to install (Incoming).
@@ -297,7 +294,7 @@ func User(in Input, h Half) ([]Step, error) {
 	steps = append(steps, additions(in, h.State, Install, AURInstall, state.AUR, h.Installed)...)
 	steps = append(steps, additions(in, h.State, Mkdir, UserSetup, state.HomeDirs, h.Dirs)...)
 	steps = append(steps, additions(in, h.State, Link, UserSetup, state.HomeLinks, h.Links)...)
-	images, err := appImageAdditions(in, h)
+	images, err := appImageAdditions(in, h, unlinked)
 	if err != nil {
 		return nil, err
 	}
@@ -307,75 +304,72 @@ func User(in Input, h Half) ([]Step, error) {
 	return steps, nil
 }
 
-// AppImageOps are the steps of the AppImage actions.
-var AppImageOps = map[appimage.Action]string{
-	appimage.Install: InstallAppImage, appimage.Update: UpdateAppImage, appimage.Replace: ReplaceAppImage,
-	appimage.Record: RecordAppImage, appimage.Adopt: Adopt,
-}
-
-// appImageRemovals plans what reconciling releases. The AppImages map
-// describes removable files, so a false value may mean a file that stays.
+// appImageRemovals plans the AppImages reconciling releases. Every recorded
+// path counts as present, so one that changed is still handed over to a
+// module that declares it. Of the rest, only a file still as arcus
+// recorded it is removed; any other is kept and forgotten.
 func appImageRemovals(in Input, h Half) []Step {
-	kind := state.HomeAppImages
-	after := h.State.Clone()
-	remove := in.Reconcile(after, kind, h.AppImages)
-	var moves, left []string
-	for _, owner := range slices.Sorted(maps.Keys(h.State.Owned[kind])) {
-		for _, p := range h.State.Owned[kind][owner] {
-			switch to := after.Owner(kind, p); {
-			case to == owner:
-				continue
-			case to != "":
-				moves = append(moves, fmt.Sprintf("%s: %s → %s", p, owner, to))
-				continue
-			case h.AppImages[p]:
-				continue // included in remove
-			}
-			path := filepath.Join(h.Home, p)
-			info, err := os.Lstat(path)
-			why := "changed since arcus installed it, so it stays"
-			switch dir := h.Layer.SymlinkedParent(path); {
-			case dir != "":
-				why = fmt.Sprintf("parent %s is a symlink, so it stays", dir)
-			case errors.Is(err, os.ErrNotExist):
-				why = "already gone"
-			case err != nil:
-				why = "could not inspect it, so it stays"
-			case !info.Mode().IsRegular():
-				why = "no longer a file, so it stays"
-			case h.State.AppImage(p) == nil:
-				why = "arcus has no record of its content, so it stays"
-			}
-			left = append(left, fmt.Sprintf("= %s: %s", p, why))
+	steps := removals(in, h.State, RemoveAppImage, UserTeardown, state.HomeAppImages, nil)
+	if len(steps) != 1 || steps[0].Op != RemoveAppImage {
+		return steps // nothing to remove, or only a hand-over
+	}
+	s := &steps[0]
+	var remove []string
+	for _, p := range s.Names {
+		path := filepath.Join(h.Layer.Target, p)
+		_, err := os.Lstat(path)
+		why := "changed since arcus installed it, so it stays"
+		switch dir := h.Layer.SymlinkedParent(path); {
+		case dir != "":
+			why = fmt.Sprintf("parent %s is a symlink, so it stays", dir)
+		case errors.Is(err, os.ErrNotExist):
+			why = "already gone"
+		case err == nil && appimage.Removable(path, h.State.AppImages[p]):
+			remove = append(remove, p)
+			continue
 		}
+		s.Kept = append(s.Kept, p)
+		s.Changes = append(s.Changes, fmt.Sprintf("= ~/%s: %s", p, why))
 	}
-
-	switch {
-	case len(remove) > 0:
-		return []Step{{Stage: UserTeardown, Op: RemoveAppImage, Names: remove, Changes: left}}
-	case len(left) > 0:
-		return []Step{{Stage: UserTeardown, Op: RemoveAppImage, Changes: append(moves, left...)}}
-	case len(moves) > 0:
-		return []Step{{Stage: UserTeardown, Op: HandOver, Of: kind, Changes: moves}}
-	default:
-		return nil
-	}
+	s.Names = remove
+	return steps
 }
 
 // appImageAdditions plans what brings each declared AppImage in line with
-// its module, against the records as the teardown leaves them: one step
-// per file to download, one take-over per module.
-func appImageAdditions(in Input, h Half) ([]Step, error) {
+// its pin, against the records as the teardown leaves them: a download per
+// file, one take-over per module. Paths in unlinked lose their home link in
+// the same run, so they count as free.
+func appImageAdditions(in Input, h Half, unlinked []string) ([]Step, error) {
 	kind := state.HomeAppImages
 	declares := in.Declares(kind)
 	after := h.State.Clone()
-	in.Reconcile(after, kind, h.AppImages)
+	in.Reconcile(after, kind, nil)
+
+	// The only clashes checked: the same or nested paths in two modules, and
+	// a path a module's home/ tree deploys.
+	owner := map[string]string{}
+	for _, name := range in.Desired {
+		for _, p := range declares[name] {
+			for q, other := range owner {
+				if other != name && module.Nested(p, q) {
+					return nil, fmt.Errorf("modules %s and %s both put an AppImage at ~/%s or inside it", other, name, min(p, q))
+				}
+			}
+			owner[p] = name
+			for _, m := range in.Desired {
+				if in.Modules[m].Deploys(p) {
+					return nil, fmt.Errorf("module %s puts an AppImage at ~/%s, but module %s deploys a file there from its home/", name, p, m)
+				}
+			}
+		}
+	}
+
 	var adopt, steps []Step
 	for _, name := range in.Desired {
 		taken := Step{Stage: UserSetup, Op: Adopt, Of: kind, Module: name}
 		for _, p := range declares[name] {
-			_, d, _ := in.Modules[name].AppImageAt(p)
-			path := filepath.Join(h.Home, p)
+			d, _ := in.Modules[name].AppImageAt(p)
+			path := filepath.Join(h.Layer.Target, p)
 			if h.Layer.OwnData(path) {
 				return nil, fmt.Errorf("module %s puts an AppImage at ~/%s, inside arcus's own data", name, p)
 			}
@@ -383,39 +377,23 @@ func appImageAdditions(in Input, h Half) ([]Step, error) {
 				target, _ := os.Readlink(dir)
 				return nil, fmt.Errorf("module %s puts an AppImage at %s: parent %s is a symlink (to %s); remove it first", name, path, dir, target)
 			}
-			act, f, err := appimage.Decide(path, d, after.AppImage(p))
+			act, err := appimage.Install, appimage.CheckTemp(path)
+			if !slices.Contains(unlinked, path) {
+				act, err = appimage.Decide(path, d.SHA256, after.AppImages[p])
+			}
 			if err != nil {
 				return nil, err
 			}
-			s := Step{Stage: UserSetup, Op: AppImageOps[act], Module: name, Names: []string{p}}
 			switch act {
-			case appimage.Keep:
-				continue
+			case appimage.Install, appimage.Update:
+				steps = append(steps, Step{Stage: UserSetup, Op: InstallAppImage, Module: name, Names: []string{p}, Changes: []string{"from " + d.URL}})
 			case appimage.Adopt:
 				taken.Names = append(taken.Names, p)
-				if f.SHA256 != d.SHA256 {
-					taken.Changes = append(taken.Changes, fmt.Sprintf("= %s: not the pinned version; self_update keeps it as it is", p))
-				}
-				continue
-			case appimage.Install, appimage.Update:
-				s.Changes = []string{"from " + d.URL}
-			case appimage.Replace:
-				s.Changes = []string{
-					fmt.Sprintf("! %s: not the pinned version nor the one arcus installed; it is moved aside to <path>.arcus-foreign", p),
-					"from " + d.URL,
-				}
-			case appimage.Record:
-				rec := after.AppImage(p)
-				switch {
-				case rec.SelfUpdate != d.SelfUpdate:
-					s.Changes = []string{fmt.Sprintf("self_update = %t", d.SelfUpdate)}
-				case rec.SHA256 != d.SHA256:
-					s.Changes = []string{fmt.Sprintf("= %s: already the pinned version", p)}
-				default:
-					s.Changes = []string{fmt.Sprintf("= %s: unchanged; its timestamps or mode changed", p)}
+			case appimage.Unchanged:
+				if h.Note != nil {
+					h.Note(fmt.Sprintf("~/%s: changed since arcus installed it, so it stays; remove it to get the pinned version", p))
 				}
 			}
-			steps = append(steps, s)
 		}
 		if len(taken.Names) > 0 {
 			adopt = append(adopt, taken)
