@@ -558,9 +558,9 @@ func Groups(user string) (map[string]bool, error) {
 		return nil, err
 	}
 	set := map[string]bool{}
-	for g := range strings.SplitSeq(out, "\x00") {
-		if g = strings.TrimSpace(g); g != "" {
-			set[g] = true
+	for g := range strings.SplitSeq(strings.TrimSuffix(out, "\n"), "\x00") {
+		if g != "" {
+			set[g] = true // as is: a name with odd spaces is refused, not changed
 		}
 	}
 	return set, nil
