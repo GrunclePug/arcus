@@ -233,6 +233,36 @@ func Explicit() (map[string]bool, error) {
 	return query(false, "pacman", "-Qqe")
 }
 
+// Foreign returns the installed packages that no sync repository has:
+// from the AUR or built by hand. pacman decides that from its sync
+// databases, and when one is missing, corrupt or unusable it still lists
+// packages, wrongly, and only says so on stderr, whatever its exit status.
+// So any error there, or the warning that a database is missing, fails
+// this; other warnings, such as an outdated pacman.conf directive, don't.
+// Exit 1 without output is no foreign package. pacman runs untranslated so
+// its messages can be recognised.
+func Foreign() (map[string]bool, error) {
+	var stdout, stderr bytes.Buffer
+	cmd := exec.Command("pacman", "-Qqm")
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
+	for line := range strings.Lines(stderr.String()) {
+		if !strings.HasPrefix(line, "warning:") || strings.Contains(line, "database file for") {
+			return nil, fmt.Errorf("pacman -Qqm: %s", strings.TrimSpace(line))
+		}
+	}
+	var exit *exec.ExitError
+	if err != nil && !(errors.As(err, &exit) && exit.ExitCode() == 1 && stdout.Len() == 0) {
+		return nil, fmt.Errorf("pacman -Qqm: %w", err)
+	}
+	set := map[string]bool{}
+	for _, f := range strings.Fields(stdout.String()) {
+		set[f] = true
+	}
+	return set, nil
+}
+
 // Unrequired returns the installed packages that no installed package
 // depends on.
 func Unrequired() (map[string]bool, error) {
@@ -459,12 +489,15 @@ func EnabledOffPreset(user bool) ([]string, error) {
 
 // UnitDirs are the directories systemd reads unit files from, most
 // important first: the system's under root, or the user's, with their own
-// in configHome (~/.config).
-func UnitDirs(root, configHome string, user bool) []string {
+// in configHome (~/.config) and dataHome (~/.local/share). /usr/local is
+// where modules deploy their own.
+func UnitDirs(root, configHome, dataHome string, user bool) []string {
 	if user {
-		return []string{filepath.Join(configHome, "systemd/user"), filepath.Join(root, "etc/systemd/user"), filepath.Join(root, "usr/lib/systemd/user")}
+		return []string{filepath.Join(configHome, "systemd/user"), filepath.Join(root, "etc/systemd/user"),
+			filepath.Join(dataHome, "systemd/user"), filepath.Join(root, "usr/local/lib/systemd/user"),
+			filepath.Join(root, "usr/lib/systemd/user")}
 	}
-	return []string{filepath.Join(root, "etc/systemd/system"), filepath.Join(root, "usr/lib/systemd/system")}
+	return []string{filepath.Join(root, "etc/systemd/system"), filepath.Join(root, "usr/local/lib/systemd/system"), filepath.Join(root, "usr/lib/systemd/system")}
 }
 
 // WithAlso returns units together with what their [Install] sections name
@@ -522,7 +555,27 @@ func installAlso(dirs []string, file string) []string {
 	return nil
 }
 
-// Groups returns the groups user belongs to.
+// Groups returns the groups user belongs to. Group names from a directory
+// service can hold spaces, so they are read NUL-separated.
 func Groups(user string) (map[string]bool, error) {
-	return query(false, "id", "-nG", user)
+	out, err := output("id", "-nGz", user)
+	if err != nil {
+		return nil, err
+	}
+	set := map[string]bool{}
+	for g := range strings.SplitSeq(strings.TrimSuffix(out, "\n"), "\x00") {
+		if g != "" {
+			set[g] = true // as is: a name with odd spaces is refused, not changed
+		}
+	}
+	return set, nil
+}
+
+// PrimaryGroup returns user's primary group.
+func PrimaryGroup(user string) (string, error) {
+	out, err := output("id", "-gn", user)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSuffix(out, "\n"), nil
 }

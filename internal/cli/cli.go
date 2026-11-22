@@ -30,7 +30,7 @@ const usage = `usage: arcus <command> [flags] [arguments]
   off [-f] <name>          turn a module or profile off; remove it from the host file
   apply [-f]               make the system match the host file
   doctor [-fix]            check state, ledgers and deployed files; -fix applies safe repairs
-  new <name>               create a user module
+  new [-unlisted] <name>   create a user module; -unlisted lists what no module that's on lists
   rm <name>                delete a user module that is off
   mv <old> <new>           rename a user module
   rebuild <package...>     build and reinstall own builds even if their recipes didn't change
