@@ -126,10 +126,11 @@ func Fetch(ctx context.Context, url, pin, path, old string) (placed bool, err er
 	if err != nil {
 		return false, err
 	}
-	// Only a temp file this run created is removed.
+	// Only a temp file this run created is removed, and only short of placing
+	// it: an update renamed it away, an install unlinks the name below.
 	defer func() {
 		tmp.Close()
-		if !placed || old == "" {
+		if !placed {
 			if rmErr := os.Remove(tmpPath); rmErr != nil && !errors.Is(rmErr, iofs.ErrNotExist) {
 				err = errors.Join(err, rmErr)
 			}
@@ -168,7 +169,7 @@ func Fetch(ctx context.Context, url, pin, path, old string) (placed bool, err er
 		}
 		return false, err
 	}
-	// The deferred removal drops the temp name; the sync after it covers both.
+	// One sync covers both the link and the removed temp name.
 	if err := os.Remove(tmpPath); err != nil {
 		return true, err
 	}

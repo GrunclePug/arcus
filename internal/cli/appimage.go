@@ -67,8 +67,9 @@ func (a *app) appImage(h *half, st *state.State, s plan.Step, in plan.Input, sav
 	return nil
 }
 
-// makeExecutable sets the owner's executable bit on path, unless it is set:
-// a pinned file someone else owns may be adopted but not changed.
+// makeExecutable adds the owner's executable bit to path, unless it is set
+// (a pinned file someone else owns may be adopted but not changed). The
+// other bits stay: a private file stays private.
 func makeExecutable(path string) error {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -77,5 +78,5 @@ func makeExecutable(path string) error {
 	if info.Mode()&0o100 != 0 {
 		return nil
 	}
-	return os.Chmod(path, 0o755)
+	return os.Chmod(path, info.Mode().Perm()|0o100)
 }

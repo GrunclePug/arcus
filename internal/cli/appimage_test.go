@@ -187,17 +187,18 @@ func TestAppImageAlreadyThere(t *testing.T) {
 
 	e.writeApp("app", 0o644) // as a browser saves it
 	must(t, e.run("on", "-y", "desk"))
-	if r.downloads() != 0 || e.appMode() != 0o755 {
+	if r.downloads() != 0 || e.appMode() != 0o744 {
 		t.Errorf("take-over: %d downloads, mode %v", r.downloads(), e.appMode())
 	}
 	if e.state(false).AppImages[appRel] != sha("app") {
 		t.Error("the taken-over file was not recorded")
 	}
 
-	// Made not executable again, it is fixed without a download.
-	must(t, os.Chmod(filepath.Join(e.root, appPath), 0o644))
+	// Made not executable again, it is fixed without a download, and a
+	// private file stays private.
+	must(t, os.Chmod(filepath.Join(e.root, appPath), 0o600))
 	must(t, e.run("apply", "-y"))
-	if r.downloads() != 0 || e.appMode() != 0o755 {
+	if r.downloads() != 0 || e.appMode() != 0o700 {
 		t.Errorf("re-take-over: %d downloads, mode %v", r.downloads(), e.appMode())
 	}
 }
@@ -280,15 +281,15 @@ func TestAppImageBelowASymlinkedParentIsLeftAlone(t *testing.T) {
 	}
 }
 
-// A home link that this run creates above the AppImage stops the download
-// at execution: it would land in the link's target.
+// A home link above the AppImage is refused at plan time, before the link
+// is made: the download would land in the link's target.
 func TestAppImageBelowALinkOfTheSameRun(t *testing.T) {
 	e := newEnv(t)
 	r := e.serveAppImages(map[string]string{"/app": "app"})
 	target := filepath.Join(e.home, "Sync", "apps")
 	must(t, os.MkdirAll(target, 0o755))
 	e.module("desk", fmt.Sprintf("links = { \"Applications\" = \"Sync/apps\" }\n[appimages.app]\nurl = %q\nsha256 = %q\n", r.URL+"/app", sha("app")), nil)
-	if err := e.run("on", "-y", "desk"); err == nil || !strings.Contains(err.Error(), "is a symlink") {
+	if err := e.run("on", "-y", "desk"); err == nil || !strings.Contains(err.Error(), "module desk links ~/Applications") {
 		t.Fatalf("on: %v", err)
 	}
 	if r.downloads() != 0 {

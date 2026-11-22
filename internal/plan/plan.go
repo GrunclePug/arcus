@@ -345,8 +345,8 @@ func appImageAdditions(in Input, h Half, unlinked []string) ([]Step, error) {
 	after := h.State.Clone()
 	in.Reconcile(after, kind, nil)
 
-	// The only clashes checked: the same or nested paths in two modules, and
-	// a path a module's home/ tree deploys.
+	// The only clashes checked: the same or nested paths in two modules, a
+	// home link at or above the path, and a path a module's home/ deploys.
 	owner := map[string]string{}
 	for _, name := range in.Desired {
 		for _, p := range declares[name] {
@@ -359,6 +359,11 @@ func appImageAdditions(in Input, h Half, unlinked []string) ([]Step, error) {
 			for _, m := range in.Desired {
 				if in.Modules[m].Deploys(p) {
 					return nil, fmt.Errorf("module %s puts an AppImage at ~/%s, but module %s deploys a file there from its home/", name, p, m)
+				}
+				for l := range in.Modules[m].Links {
+					if module.Nested(l, p) {
+						return nil, fmt.Errorf("module %s puts an AppImage at ~/%s, but module %s links ~/%s", name, p, m, l)
+					}
 				}
 			}
 		}

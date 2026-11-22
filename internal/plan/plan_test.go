@@ -995,6 +995,12 @@ func TestAppImagePlanRefuses(t *testing.T) {
 		f.in.Modules["old"].AppImages = map[string]module.AppImage{"x": {URL: "https://x.org/x", SHA256: sum("v1"), Path: "Applications/app/inner"}}
 		f.refused("both put an AppImage at ~/Applications/app or inside it")
 	})
+	t.Run("a home link above it", func(t *testing.T) {
+		f := newAppImageFixture(t)
+		f.declare("Applications/app", "v1")
+		f.in.Modules["desk"].Links = map[string]string{"Applications": "Sync/apps"}
+		f.refused("module desk links ~/Applications")
+	})
 	t.Run("a home file of a module", func(t *testing.T) {
 		f := newAppImageFixture(t)
 		f.declare("Applications/app", "v1")
