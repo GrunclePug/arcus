@@ -242,6 +242,7 @@ func TestNewUnlistedRefusals(t *testing.T) {
 			must(t, os.WriteFile(old, nil, 0o644))
 		}, nil, "host file moved"},
 		{"no sync databases", func(e *env) { e.sys.NoSync() }, nil, "database file"},
+		{"no repositories", func(e *env) { e.sys.NoRepos() }, nil, "no usable package repositories"},
 		{"mv to machine", func(e *env) { e.module("mine", "", nil) }, []string{"mv", "mine", "machine"}, "machine module's name"},
 		{"broken host file", func(e *env) { must(t, os.WriteFile(e.hostPath(), []byte("modules = [\"nope\"]\n"), 0o644)) }, nil, "nope"},
 	} {

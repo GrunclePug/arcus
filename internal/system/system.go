@@ -236,8 +236,11 @@ func Explicit() (map[string]bool, error) {
 // Foreign returns the installed packages that no sync repository has:
 // from the AUR or built by hand. Without a sync database pacman counts
 // every package as foreign and only warns, so that warning is an error
-// here; others, such as an outdated pacman.conf directive, aren't. pacman
-// runs untranslated so the warning can be recognised.
+// here; others, such as an outdated pacman.conf directive, aren't. Exit 1
+// with no output is no foreign package only when pacman printed nothing
+// but warnings: an error there (no repositories, a missing database
+// signature) would count every package as native. pacman runs untranslated
+// so its messages can be recognised.
 func Foreign() (map[string]bool, error) {
 	var stdout, stderr bytes.Buffer
 	cmd := exec.Command("pacman", "-Qqm")
@@ -250,7 +253,13 @@ func Foreign() (map[string]bool, error) {
 		}
 	}
 	var exit *exec.ExitError
-	if err != nil && !(errors.As(err, &exit) && exit.ExitCode() == 1 && stdout.Len() == 0) {
+	none := errors.As(err, &exit) && exit.ExitCode() == 1 && stdout.Len() == 0
+	for line := range strings.Lines(stderr.String()) {
+		if !strings.HasPrefix(line, "warning:") {
+			none = false
+		}
+	}
+	if err != nil && !none {
 		return nil, fmt.Errorf("pacman -Qqm: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
 	set := map[string]bool{}
@@ -572,5 +581,5 @@ func PrimaryGroup(user string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(out), nil
+	return strings.TrimSuffix(out, "\n"), nil
 }

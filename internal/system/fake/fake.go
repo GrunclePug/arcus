@@ -74,6 +74,7 @@ case $op in
   -Qqm)
     [ "$LC_ALL" = C ] || { echo "error: -Qqm must run with LC_ALL=C" >&2; exit 2; }
     echo "warning: config file /etc/pacman.conf, line 10: directive 'TotalDownload' in section 'options' not recognized." >&2
+    [ -f "$dir/norepos" ] && { echo "error: no usable package repositories configured." >&2; exit 1; }
     [ -f "$dir/nosync" ] && { echo "warning: database file for 'core' does not exist (use '-Sy' to download)" >&2; cat "$dir/pkgs"; exit 0; }
     out=$(grep -xF -f "$dir/foreign" "$dir/pkgs"); [ -n "$out" ] || exit 1; echo "$out"; exit 0 ;;
   -Qqt) required > "$dir/req"; out=$(grep -vxF -f "$dir/req" "$dir/pkgs"); [ -n "$out" ] || exit 1; echo "$out"; exit 0 ;;
@@ -280,6 +281,10 @@ func (s *System) SetForeign(pkgs ...string) { s.set("foreign", pkgs) }
 // NoSync makes -Qqm behave as without sync databases: it warns and lists
 // every installed package.
 func (s *System) NoSync() { s.set("nosync", []string{"1"}) }
+
+// NoRepos makes -Qqm fail as pacman does with no usable repository: an
+// error and exit 1, with no output.
+func (s *System) NoRepos() { s.set("norepos", []string{"1"}) }
 
 // SetMeta replaces what packages provide, conflict with and depend on:
 // "<package> <field> <name>" lines (see pkgScript).
