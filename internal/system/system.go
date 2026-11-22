@@ -489,11 +489,13 @@ func EnabledOffPreset(user bool) ([]string, error) {
 
 // UnitDirs are the directories systemd reads unit files from, most
 // important first: the system's under root, or the user's, with their own
-// in configHome (~/.config). /usr/local is where modules deploy their own.
-func UnitDirs(root, configHome string, user bool) []string {
+// in configHome (~/.config) and dataHome (~/.local/share). /usr/local is
+// where modules deploy their own.
+func UnitDirs(root, configHome, dataHome string, user bool) []string {
 	if user {
 		return []string{filepath.Join(configHome, "systemd/user"), filepath.Join(root, "etc/systemd/user"),
-			filepath.Join(root, "usr/local/lib/systemd/user"), filepath.Join(root, "usr/lib/systemd/user")}
+			filepath.Join(dataHome, "systemd/user"), filepath.Join(root, "usr/local/lib/systemd/user"),
+			filepath.Join(root, "usr/lib/systemd/user")}
 	}
 	return []string{filepath.Join(root, "etc/systemd/system"), filepath.Join(root, "usr/local/lib/systemd/system"), filepath.Join(root, "usr/lib/systemd/system")}
 }

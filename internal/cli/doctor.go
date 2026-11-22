@@ -360,7 +360,7 @@ func (a *app) unlistedUnits(in plan.Input, user bool) ([]string, error) {
 
 // unitDirs are the directories systemd reads system or user unit files from.
 func (a *app) unitDirs(user bool) []string {
-	return system.UnitDirs(a.root, a.xdg("XDG_CONFIG_HOME", ".config"), user)
+	return system.UnitDirs(a.root, a.xdg("XDG_CONFIG_HOME", ".config"), a.xdg("XDG_DATA_HOME", ".local/share"), user)
 }
 
 // doctorGroups reports the user's groups that no module that's on lists.
