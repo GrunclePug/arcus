@@ -358,7 +358,7 @@ func appImageAdditions(in Input, h Half, unlinked []string) ([]Step, error) {
 			owner[p] = name
 			for _, m := range in.Desired {
 				if in.Modules[m].Deploys(p) {
-					return nil, fmt.Errorf("module %s puts an AppImage at ~/%s, but module %s deploys a file there from its home/", name, p, m)
+					return nil, fmt.Errorf("module %s puts an AppImage at ~/%s, but module %s deploys a file at or above that path from its home/", name, p, m)
 				}
 				for l := range in.Modules[m].Links {
 					if module.Nested(l, p) {

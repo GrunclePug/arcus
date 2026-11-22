@@ -1024,6 +1024,6 @@ func TestAppImagePlanRefuses(t *testing.T) {
 		if err := os.MkdirAll(home, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		f.refused("module desk deploys a file there from its home/")
+		f.refused("module desk deploys a file at or above that path from its home/")
 	})
 }
