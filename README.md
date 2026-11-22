@@ -64,6 +64,7 @@ Without a clone, `arcus update` replaces the installed binary with the latest re
 
 ```sh
 arcus new shell            # create ~/.config/arcus/modules/shell/module.toml
+arcus new -unlisted mine   # a module of what this machine has that no module that's on lists
 arcus plan shell           # show what turning it on would do
 arcus on shell             # turn it on and record it in this machine's host file
 arcus ls                   # every profile and module, its status and stack rank
@@ -79,6 +80,17 @@ arcus rollback 3f2a91c     # put the host file back as of an entry and apply it
 ```
 
 When a module that's on changes, `apply` redeploys it and the modules above it, and keeps the directories their files live in, so programs watching them keep working. If a redeploy is cut short in a way that leaves its bookkeeping behind (a crash or power loss), `plan` and `apply` stop until you run `arcus doctor -fix`, then `arcus apply`.
+
+To start from an Arch system you already have, write its machine module and turn it on, then let arcus list the rest:
+
+```sh
+arcus machine && arcus on machine
+arcus new -unlisted mine   # explicitly installed packages, enabled units and groups no module lists
+arcus on mine              # takes over what is already there; installs and removes nothing
+arcus clean                # shows what's left: dependencies nothing needs any more
+```
+
+`-unlisted` lists packages installed explicitly (from the repositories in `pacman`, the rest in `aur`), units enabled against their vendor preset and groups, leaving out protected packages and whatever a module that's on lists. A unit that another listed unit enables through `Also=` isn't listed again, and names a module can't hold are left out and shown. It never touches files in `/etc` or `$HOME`. Turning the module off removes everything it lists, so split it into real modules as you go. A package in `aur` that isn't on the AUR, or a unit you wrote yourself, works on this machine but needs its recipe or unit file in the module before it works on another. Units enabled by hand that their vendor preset also enables, such as `systemd-networkd.service`, and template instances enabled by hand, such as `wg-quick@wg0.service`, aren't listed yet; add them yourself.
 
 `arcus doctor` also reports what the modules don't account for: a machine module older than what `arcus machine` would write, units enabled against their vendor preset and groups that no module that's on lists (following `Also=` in the unit files), and, with aurlock, approvals no module lists. It only reports these; `-fix` never disables a unit, leaves a group or rewrites the machine module.
 
@@ -144,6 +156,7 @@ modules  = ["aurora"]
 | | `-n` | off | Only show the plan |
 | | `-f` | off | `off`: also turn off modules that require it; `off`, `apply`: move files edited since deployment aside to `<path>.arcus-foreign` |
 | | `-fix` | off | `doctor`: apply the safe repairs |
+| | `-unlisted` | off | `new`: list what this machine has that no module that's on lists |
 | | `-yes` | off | `arcus-install run`: don't ask to type the device name |
 | | `-version` | | Print the version (both binaries) |
 | `XDG_CONFIG_HOME` | | `~/.config` | Holds `arcus/config.toml`, `arcus/profiles/` and `arcus/modules/` |

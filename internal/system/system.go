@@ -233,6 +233,12 @@ func Explicit() (map[string]bool, error) {
 	return query(false, "pacman", "-Qqe")
 }
 
+// Foreign returns the installed packages that no sync repository has:
+// from the AUR or built by hand.
+func Foreign() (map[string]bool, error) {
+	return query(false, "pacman", "-Qqm")
+}
+
 // Unrequired returns the installed packages that no installed package
 // depends on.
 func Unrequired() (map[string]bool, error) {
@@ -459,12 +465,13 @@ func EnabledOffPreset(user bool) ([]string, error) {
 
 // UnitDirs are the directories systemd reads unit files from, most
 // important first: the system's under root, or the user's, with their own
-// in configHome (~/.config).
+// in configHome (~/.config). /usr/local is where modules deploy their own.
 func UnitDirs(root, configHome string, user bool) []string {
 	if user {
-		return []string{filepath.Join(configHome, "systemd/user"), filepath.Join(root, "etc/systemd/user"), filepath.Join(root, "usr/lib/systemd/user")}
+		return []string{filepath.Join(configHome, "systemd/user"), filepath.Join(root, "etc/systemd/user"),
+			filepath.Join(root, "usr/local/lib/systemd/user"), filepath.Join(root, "usr/lib/systemd/user")}
 	}
-	return []string{filepath.Join(root, "etc/systemd/system"), filepath.Join(root, "usr/lib/systemd/system")}
+	return []string{filepath.Join(root, "etc/systemd/system"), filepath.Join(root, "usr/local/lib/systemd/system"), filepath.Join(root, "usr/lib/systemd/system")}
 }
 
 // WithAlso returns units together with what their [Install] sections name
@@ -525,4 +532,13 @@ func installAlso(dirs []string, file string) []string {
 // Groups returns the groups user belongs to.
 func Groups(user string) (map[string]bool, error) {
 	return query(false, "id", "-nG", user)
+}
+
+// PrimaryGroup returns user's primary group.
+func PrimaryGroup(user string) (string, error) {
+	out, err := output("id", "-gn", user)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
 }

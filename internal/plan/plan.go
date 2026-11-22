@@ -1255,6 +1255,23 @@ func layerSteps(in Input, h Half, teardown, setup Stage, unlinked []string) (lay
 	return p, nil
 }
 
+// Listed returns the packages that a desired module lists, as a pacman,
+// AUR or own-build package, and the protected ones: what clean keeps.
+func (in Input) Listed() map[string]bool {
+	listed := map[string]bool{}
+	for _, kind := range []string{state.Pacman, state.AUR, state.Local} {
+		for _, names := range in.Declares(kind) {
+			for _, n := range names {
+				listed[n] = true
+			}
+		}
+	}
+	for _, n := range in.Protected {
+		listed[n] = true
+	}
+	return listed
+}
+
 // Installed is what pacman reports about the installed packages.
 type Installed struct {
 	All, Explicit, Unrequired map[string]bool
@@ -1265,18 +1282,7 @@ type Installed struct {
 // package needs become dependencies; the rest is removed, with the
 // dependencies nothing needs any more.
 func Clean(in Input, p Installed) []Step {
-	keep := map[string]bool{}
-	for _, kind := range []string{state.Pacman, state.AUR, state.Local} {
-		for _, names := range in.Declares(kind) {
-			for _, n := range names {
-				keep[n] = true
-			}
-		}
-	}
-	for _, n := range in.Protected {
-		keep[n] = true
-	}
-
+	keep := in.Listed()
 	var explicit, deps, remove []string
 	for _, n := range slices.Sorted(maps.Keys(p.All)) {
 		switch {

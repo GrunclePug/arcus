@@ -320,21 +320,11 @@ func (a *app) doctorMachineModule(r *report) {
 func (a *app) doctorUnits(in plan.Input, r *report) {
 	found := false
 	for _, kind := range []string{state.SystemUnits, state.UserUnits} {
-		user := kind == state.UserUnits
-		enabled, err := system.EnabledOffPreset(user)
+		extra, err := a.unlistedUnits(in, kind == state.UserUnits)
 		if err != nil {
 			r.problem("querying %s: %v", kindNames[kind], err)
 			continue
 		}
-		var declared []string
-		for _, names := range in.Declares(kind) {
-			declared = append(declared, names...)
-		}
-		listed := map[string]bool{}
-		for _, u := range system.WithAlso(system.UnitDirs(a.root, a.xdg("XDG_CONFIG_HOME", ".config"), user), declared) {
-			listed[u], listed[system.Template(u)] = true, true
-		}
-		extra := slices.DeleteFunc(enabled, func(u string) bool { return listed[u] })
 		if len(extra) > 0 {
 			r.problem("%s enabled that no module lists: %s", kindNames[kind], strings.Join(extra, " "))
 			found = true
@@ -345,16 +335,60 @@ func (a *app) doctorUnits(in plan.Input, r *report) {
 	}
 }
 
-// doctorGroups reports the user's groups that no module that's on lists,
-// apart from those the user has from the start: their own group, wheel
-// (the installer's) and users (Arch's default).
+// unlistedUnits returns the system or user units enabled outside their
+// vendor preset that no module that's on lists, nor pulls in through Also=
+// in its unit files, sorted.
+func (a *app) unlistedUnits(in plan.Input, user bool) ([]string, error) {
+	enabled, err := system.EnabledOffPreset(user)
+	if err != nil {
+		return nil, err
+	}
+	kind := state.SystemUnits
+	if user {
+		kind = state.UserUnits
+	}
+	var declared []string
+	for _, names := range in.Declares(kind) {
+		declared = append(declared, names...)
+	}
+	listed := map[string]bool{}
+	for _, u := range system.WithAlso(a.unitDirs(user), declared) {
+		listed[u], listed[system.Template(u)] = true, true
+	}
+	return slices.DeleteFunc(enabled, func(u string) bool { return listed[u] }), nil
+}
+
+// unitDirs are the directories systemd reads system or user unit files from.
+func (a *app) unitDirs(user bool) []string {
+	return system.UnitDirs(a.root, a.xdg("XDG_CONFIG_HOME", ".config"), user)
+}
+
+// doctorGroups reports the user's groups that no module that's on lists.
 func (a *app) doctorGroups(in plan.Input, r *report) {
-	groups, err := system.Groups(a.user)
+	extra, err := a.unlistedGroups(in)
 	if err != nil {
 		r.problem("querying groups: %v", err)
 		return
 	}
-	listed := map[string]bool{a.user: true, "wheel": true, "users": true}
+	if len(extra) > 0 {
+		r.problem("groups no module lists: %s", strings.Join(extra, " "))
+		fmt.Fprintln(r.w, "    → list the ones to keep in a module's groups")
+	}
+}
+
+// unlistedGroups returns the user's groups that no module that's on lists,
+// sorted, apart from those the user has from the start: their own group,
+// their primary group, wheel (the installer's) and users (Arch's default).
+func (a *app) unlistedGroups(in plan.Input) ([]string, error) {
+	groups, err := system.Groups(a.user)
+	if err != nil {
+		return nil, err
+	}
+	primary, err := system.PrimaryGroup(a.user)
+	if err != nil {
+		return nil, err
+	}
+	listed := map[string]bool{a.user: true, primary: true, "wheel": true, "users": true}
 	for _, names := range in.Declares(state.Groups) {
 		for _, g := range names {
 			listed[g] = true
@@ -366,11 +400,8 @@ func (a *app) doctorGroups(in plan.Input, r *report) {
 			extra = append(extra, g)
 		}
 	}
-	if len(extra) > 0 {
-		slices.Sort(extra)
-		r.problem("groups no module lists: %s", strings.Join(extra, " "))
-		fmt.Fprintln(r.w, "    → list the ones to keep in a module's groups")
-	}
+	slices.Sort(extra)
+	return extra, nil
 }
 
 // doctorApprovals reports aurlock approvals for packages no module lists,

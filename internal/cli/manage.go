@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/grunclepug/arcus/internal/host"
+	"github.com/grunclepug/arcus/internal/machine"
 	"github.com/grunclepug/arcus/internal/module"
 )
 
@@ -40,19 +41,24 @@ now    = false
 # path   = "Applications/name.AppImage"
 `
 
-// cmdNew creates a module skeleton in ~/.config/arcus/modules.
+// cmdNew creates a module skeleton in ~/.config/arcus/modules, or with
+// -unlisted a module listing what no module that's on lists.
 func (a *app) cmdNew(args []string) error {
 	var o opts
 	fs := a.flags("new", &o, false, false)
+	capture := fs.Bool("unlisted", false, "list what this machine has that no module that's on lists")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: arcus new <name>")
+		return errors.New("usage: arcus new [-unlisted] <name>")
 	}
 	name := fs.Arg(0)
 	if err := module.ValidateName(name); err != nil {
 		return err
+	}
+	if name == machine.Name {
+		return fmt.Errorf("%q is the machine module's name; 'arcus machine' writes it", name)
 	}
 	if err := a.load(&o); err != nil {
 		return err
@@ -65,21 +71,63 @@ func (a *app) cmdNew(args []string) error {
 	}
 
 	dir := filepath.Join(a.paths.Config, "modules", name)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	content := moduleTemplate
+	var u *unlisted
+	if *capture {
+		var err error
+		if u, err = a.unlisted(); err != nil {
+			return err
+		}
+		if len(u.leftOut) > 0 {
+			fmt.Fprintf(a.stdout, "Left out (arcus can't manage these names): %s\n", strings.Join(u.leftOut, " "))
+		}
+		if u.empty() {
+			fmt.Fprintln(a.stdout, "Nothing arcus can manage is unlisted; no module written.")
+			return nil
+		}
+		content = u.manifest()
+		if _, err := module.Parse(name, dir, content); err != nil {
+			return fmt.Errorf("the module would not load: %w", err)
+		}
+	}
+
+	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
+		return err
+	}
+	// A directory without a module.toml isn't a module yet, but the files
+	// in it would be deployed with the listing; -unlisted starts empty.
+	mkdir := os.Mkdir
+	if u == nil {
+		mkdir = os.MkdirAll
+	}
+	if err := mkdir(dir, 0o755); err != nil {
+		if errors.Is(err, iofs.ErrExist) {
+			return fmt.Errorf("%s already exists; move it away or pick another name", dir)
+		}
 		return err
 	}
 	f, err := os.OpenFile(filepath.Join(dir, module.ManifestFile), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return fmt.Errorf("creating module %q: %w", name, err)
 	}
-	if _, err := f.WriteString(moduleTemplate); err != nil {
+	if _, err := f.WriteString(content); err != nil {
 		f.Close()
 		return err
 	}
 	if err := f.Close(); err != nil {
 		return err
 	}
-	fmt.Fprintf(a.stdout, "Created %s.\n", dir)
+	if u == nil {
+		fmt.Fprintf(a.stdout, "Created %s.\n", dir)
+		return nil
+	}
+	fmt.Fprintf(a.stdout, "Created %s: %d pacman, %d aur, %d units, %d groups.\n",
+		dir, len(u.pacman), len(u.aur), len(u.system)+len(u.user), len(u.groups))
+	fmt.Fprintf(a.stdout, "Review it, then 'arcus on %s'.\n", name)
+	if !u.machineOn {
+		fmt.Fprintf(a.stdout, "The machine module isn't on, so the kernel, bootloader and drivers ended up in this module. "+
+			"To keep them apart, remove it with 'arcus rm %s', run 'arcus machine' and 'arcus on machine', then run this again.\n", name)
+	}
 	return nil
 }
 

@@ -20,7 +20,8 @@ type System struct {
 
 // The fakes share one package database, so the AUR helper sees what pacman
 // installed: $dir/pkgs lists the installed packages, $dir/deps those
-// installed as a dependency, and $dir/requires "<package> <dependency>"
+// installed as a dependency, $dir/foreign those no sync repository has
+// (-Qqm lists the installed ones), and $dir/requires "<package> <dependency>"
 // lines, and $dir/meta "<package> <field> <name>" lines, which -Qi, -Si,
 // -Qip and makepkg report: provides and conflicts, and for own builds
 // depends, makedepends and checkdepends (of the PKGBUILD, which makepkg
@@ -45,7 +46,7 @@ for a in "$@"; do
     *) names="$names $a" ;;
   esac
 done
-touch "$dir/pkgs" "$dir/deps" "$dir/requires" "$dir/meta"
+touch "$dir/pkgs" "$dir/deps" "$dir/foreign" "$dir/requires" "$dir/meta"
 meta() {
   awk -v p="$1" -v f="$2" '$1 == p && $2 == f { printf "%s  ", $3 }' "$dir/meta"
 }
@@ -70,6 +71,7 @@ drop() {
 case $op in
   -Qq) cat "$dir/pkgs"; exit 0 ;;
   -Qqe) out=$(grep -vxF -f "$dir/deps" "$dir/pkgs"); [ -n "$out" ] || exit 1; echo "$out"; exit 0 ;;
+  -Qqm) out=$(grep -xF -f "$dir/foreign" "$dir/pkgs"); [ -n "$out" ] || exit 1; echo "$out"; exit 0 ;;
   -Qqt) required > "$dir/req"; out=$(grep -vxF -f "$dir/req" "$dir/pkgs"); [ -n "$out" ] || exit 1; echo "$out"; exit 0 ;;
   -Qi)
     [ -n "$names" ] || names=$(cat "$dir/pkgs")
@@ -180,8 +182,14 @@ for u in "$@"; do
 done
 `
 
+// idScript answers -nG from $dir/groups and -gn from $dir/primary, or with
+// the user's own name, the group Arch gives a new user.
 const idScript = `#!/bin/sh
 dir=%DIR%
+if [ "$1" = -gn ]; then
+  if [ -s "$dir/primary" ]; then cat "$dir/primary"; else echo "$2"; fi
+  exit 0
+fi
 touch "$dir/groups"
 tr '\n' ' ' < "$dir/groups"; echo
 `
@@ -260,6 +268,10 @@ func (s *System) Deps() []string { return sorted(s.lines("deps")) }
 // SetDeps marks installed packages as installed as a dependency.
 func (s *System) SetDeps(pkgs ...string) { s.set("deps", pkgs) }
 
+// SetForeign replaces the packages no sync repository has; -Qqm lists
+// those that are installed.
+func (s *System) SetForeign(pkgs ...string) { s.set("foreign", pkgs) }
+
 // SetMeta replaces what packages provide, conflict with and depend on:
 // "<package> <field> <name>" lines (see pkgScript).
 func (s *System) SetMeta(lines ...string) { s.set("meta", lines) }
@@ -299,6 +311,10 @@ func (s *System) Groups() []string { return sorted(s.lines("groups")) }
 
 // SetGroups replaces the main user's groups.
 func (s *System) SetGroups(groups ...string) { s.set("groups", groups) }
+
+// SetPrimaryGroup sets the main user's primary group, which is otherwise
+// named after the user.
+func (s *System) SetPrimaryGroup(group string) { s.set("primary", []string{group}) }
 
 // Log returns every changing or querying call made so far, in order.
 func (s *System) Log() []string { return s.lines("log") }

@@ -276,15 +276,17 @@ func TestWithAlso(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write(dirs[1], "nm.service", "[Unit]\nAlso=not-install.service\n[Install]\nWantedBy=multi-user.target\nAlso=nm-dispatcher.service\nAlso = nm-wait.service other.socket\n")
-	write(dirs[1], "other.socket", "[Install]\nAlso=nm.service\n")
-	write(dirs[1], "tpl@.service", "[Install]\nAlso=tpl-helper.service\n")
+	write(dirs[2], "nm.service", "[Unit]\nAlso=not-install.service\n[Install]\nWantedBy=multi-user.target\nAlso=nm-dispatcher.service\nAlso = nm-wait.service other.socket\n")
+	write(dirs[2], "other.socket", "[Install]\nAlso=nm.service\n")
+	write(dirs[2], "tpl@.service", "[Install]\nAlso=tpl-helper.service\n")
 	// The copy in /etc wins over the vendor's.
-	write(dirs[1], "over.service", "[Install]\nAlso=vendor.service\n")
+	write(dirs[2], "over.service", "[Install]\nAlso=vendor.service\n")
 	write(dirs[0], "over.service", "[Install]\n")
+	// Modules deploy their own units to /usr/local.
+	write(dirs[1], "local.service", "[Install]\nAlso=local.timer\n")
 
-	got := WithAlso(dirs, []string{"nm.service", "tpl@a.service", "over.service", "nofile.timer"})
-	want := []string{"nm.service", "tpl@a.service", "over.service", "nofile.timer", "nm-dispatcher.service", "nm-wait.service", "other.socket", "tpl-helper.service"}
+	got := WithAlso(dirs, []string{"nm.service", "tpl@a.service", "over.service", "nofile.timer", "local.service"})
+	want := []string{"nm.service", "tpl@a.service", "over.service", "nofile.timer", "local.service", "nm-dispatcher.service", "nm-wait.service", "other.socket", "tpl-helper.service", "local.timer"}
 	if !slices.Equal(got, want) {
 		t.Errorf("got %v\nwant %v", got, want)
 	}

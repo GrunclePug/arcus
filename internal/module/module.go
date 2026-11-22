@@ -36,6 +36,33 @@ var (
 	sha256Regex       = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
+// namePatterns are what the names in each of a manifest's lists must match.
+var namePatterns = map[string]*regexp.Regexp{
+	"requires":        moduleNameRegex,
+	"conflicts":       moduleNameRegex,
+	"groups":          groupNameRegex,
+	"packages.pacman": packageNameRegex,
+	"packages.aur":    packageNameRegex,
+	"packages.local":  packageNameRegex,
+	"units.system":    unitNameRegex,
+	"units.user":      unitNameRegex,
+}
+
+// ValidNames splits names into those the manifest list field (such as
+// "units.system") accepts and those it refuses, keeping their order. A
+// field without names refuses everything.
+func ValidNames(field string, names []string) (ok, bad []string) {
+	re := namePatterns[field]
+	for _, n := range names {
+		if re != nil && re.MatchString(n) {
+			ok = append(ok, n)
+		} else {
+			bad = append(bad, n)
+		}
+	}
+	return ok, bad
+}
+
 // reservedNames cannot be module names: "orig" is the backup tag for host
 // originals, and the others are suffixes arcus itself puts next to host files.
 var reservedNames = map[string]bool{"orig": true, "arcus-foreign": true, "arcus-tmp": true}
@@ -108,8 +135,26 @@ func Load(dir string) (*Module, error) {
 	}
 
 	path := filepath.Join(dir, ManifestFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("loading module %q: %w", name, err)
+	}
+	return parse(name, dir, path, string(data))
+}
+
+// Parse reads manifest as the module.toml of the module called name in dir,
+// with the same checks as Load, so a manifest can be checked before it is
+// written. Own builds' recipes are looked for in dir.
+func Parse(name, dir, manifest string) (*Module, error) {
+	if err := ValidateName(name); err != nil {
+		return nil, err
+	}
+	return parse(name, dir, filepath.Join(dir, ManifestFile), manifest)
+}
+
+func parse(name, dir, path, manifest string) (*Module, error) {
 	m := &Module{Name: name, Dir: dir}
-	md, err := toml.DecodeFile(path, &m.Manifest)
+	md, err := toml.Decode(manifest, &m.Manifest)
 	if err != nil {
 		return nil, fmt.Errorf("loading module %q: %w", name, err)
 	}
@@ -130,16 +175,15 @@ func (m *Module) validate() error {
 	lists := []struct {
 		field string
 		names []string
-		re    *regexp.Regexp
 	}{
-		{"requires", m.Requires, moduleNameRegex},
-		{"conflicts", m.Conflicts, moduleNameRegex},
-		{"groups", m.Groups, groupNameRegex},
-		{"packages.pacman", m.Packages.Pacman, packageNameRegex},
-		{"packages.aur", m.Packages.AUR, packageNameRegex},
-		{"packages.local", m.Packages.Local, packageNameRegex},
-		{"units.system", m.Units.System, unitNameRegex},
-		{"units.user", m.Units.User, unitNameRegex},
+		{"requires", m.Requires},
+		{"conflicts", m.Conflicts},
+		{"groups", m.Groups},
+		{"packages.pacman", m.Packages.Pacman},
+		{"packages.aur", m.Packages.AUR},
+		{"packages.local", m.Packages.Local},
+		{"units.system", m.Units.System},
+		{"units.user", m.Units.User},
 	}
 	for i, d := range m.Dirs {
 		if !homeRelative(d) {
@@ -167,7 +211,7 @@ func (m *Module) validate() error {
 	}
 	for _, l := range lists {
 		for i, n := range l.names {
-			if !l.re.MatchString(n) {
+			if !namePatterns[l.field].MatchString(n) {
 				return fmt.Errorf("%s: invalid name %q", l.field, n)
 			}
 			if slices.Contains(l.names[:i], n) {
