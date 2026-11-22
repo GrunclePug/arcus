@@ -238,13 +238,19 @@ func Nested(a, b string) bool {
 }
 
 // Deploys reports whether the module's home/ tree has anything at p, below
-// $HOME, so an AppImage there would collide with the module's own layer.
+// $HOME, or a file where one of p's directories would go, so an AppImage
+// there would collide with the module's own layer.
 func (m *Module) Deploys(p string) bool {
 	if m.Dir == "" {
 		return false
 	}
-	_, err := os.Lstat(filepath.Join(m.Dir, "home", filepath.FromSlash(p)))
-	return err == nil
+	for a := p; a != "."; a = path.Dir(a) {
+		info, err := os.Lstat(filepath.Join(m.Dir, "home", filepath.FromSlash(a)))
+		if err == nil && (a == p || !info.IsDir()) {
+			return true
+		}
+	}
+	return false
 }
 
 // AppImagePaths are the paths of the module's AppImages, sorted. Ownership

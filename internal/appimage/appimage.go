@@ -24,11 +24,11 @@ import (
 type Action int
 
 const (
-	Keep      Action = iota // the recorded pin is there: nothing to do
-	Install                 // nothing there: download the pin
-	Update                  // the file arcus recorded, but the pin moved: download over it
-	Adopt                   // the pinned file, unrecorded or not executable: record it, make it executable
-	Unchanged               // recorded, but it changed since: it is the app's or the user's now
+	Keep    Action = iota // the recorded pin is there: nothing to do
+	Install               // nothing there: download the pin
+	Update                // the file arcus recorded, but the pin moved: download over it
+	Adopt                 // the pinned file, unrecorded or not executable: record it, make it executable
+	Theirs                // recorded, but it changed since: it is the app's or the user's now
 )
 
 // Client downloads AppImages. Tests swap it for their server's client.
@@ -67,7 +67,7 @@ func Decide(path, pin, rec string) (Action, error) {
 	case sum == rec:
 		return Update, nil
 	}
-	return Unchanged, nil
+	return Theirs, nil
 }
 
 // CheckTemp refuses a temp file an interrupted download left beside path.

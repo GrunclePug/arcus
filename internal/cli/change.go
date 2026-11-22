@@ -989,12 +989,12 @@ func (a *app) remove(st *state.State, steps []plan.Step, in plan.Input, r *syste
 			path := filepath.Join(a.paths.Home, p)
 			if h.layer.SymlinkedParent(path) != "" || !appimage.Removable(path, st.AppImages[p]) {
 				if _, err := os.Lstat(path); err == nil {
-					h.layer.Warn("~/%s changed since the plan was shown; it stays", p)
+					fmt.Fprintf(a.stderr, "warning: ~/%s changed since the plan was shown; it stays\n", p)
 				}
 				continue
 			}
 			if err := os.Remove(path); err != nil {
-				h.layer.Warn("removing ~/%s: %v; it stays", p, err)
+				fmt.Fprintf(a.stderr, "warning: removing ~/%s: %v; it stays\n", p, err)
 			}
 		}
 	case plan.Rmdir:

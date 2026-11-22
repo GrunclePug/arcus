@@ -52,9 +52,9 @@ func TestDecide(t *testing.T) {
 		{"the pin, recorded as another", func(p string) { write(t, p, "v2", 0o755) }, old, Adopt, ""},
 		{"the recorded pin, executable", func(p string) { write(t, p, "anything", 0o755) }, pin, Keep, ""},
 		{"the recorded pin, not executable", func(p string) { write(t, p, "v2", 0o644) }, pin, Adopt, ""},
-		{"recorded as the pin, changed, not executable", func(p string) { write(t, p, "mine", 0o644) }, pin, Unchanged, ""},
+		{"recorded as the pin, changed, not executable", func(p string) { write(t, p, "mine", 0o644) }, pin, Theirs, ""},
 		{"the recorded file, pin moved", func(p string) { write(t, p, "v1", 0o755) }, old, Update, ""},
-		{"changed since recorded", func(p string) { write(t, p, "v3", 0o755) }, old, Unchanged, ""},
+		{"changed since recorded", func(p string) { write(t, p, "v3", 0o755) }, old, Theirs, ""},
 		{"another file, unrecorded", func(p string) { write(t, p, "mine", 0o755) }, "", 0, "isn't the pinned AppImage"},
 		{"a directory", func(p string) { os.MkdirAll(p, 0o755) }, old, 0, "isn't a regular file"},
 		{"a symlink", func(p string) { write(t, p+".real", "v2", 0o755); os.Symlink(p+".real", p) }, "", 0, "isn't a regular file"},
@@ -85,8 +85,8 @@ func TestDecideUnreadable(t *testing.T) {
 	pin := sum("v2")
 	path := filepath.Join(t.TempDir(), "a.AppImage")
 	write(t, path, "v2", 0o000)
-	if got, err := Decide(path, pin, pin); err != nil || got != Unchanged {
-		t.Errorf("recorded: %v, %v; want Unchanged", got, err)
+	if got, err := Decide(path, pin, pin); err != nil || got != Theirs {
+		t.Errorf("recorded: %v, %v; want Theirs", got, err)
 	}
 	if _, err := Decide(path, pin, ""); err == nil || !strings.Contains(err.Error(), "isn't the pinned AppImage") {
 		t.Errorf("unrecorded: %v", err)

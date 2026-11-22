@@ -334,6 +334,9 @@ func TestAppImageOffWhenTheRemoveFails(t *testing.T) {
 	if e.read(appPath) != "app" {
 		t.Error("the file should still be there")
 	}
+	if !strings.Contains(e.out.String(), "warning: removing ~/"+appRel) {
+		t.Errorf("no warning:\n%s", e.out.String())
+	}
 	if st := e.state(false); len(st.AppImages) != 0 || len(st.Owned) != 0 {
 		t.Errorf("records left: %+v", st)
 	}

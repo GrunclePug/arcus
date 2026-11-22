@@ -176,6 +176,9 @@ func TestDeploys(t *testing.T) {
 	if m.Deploys("Applications/y.AppImage") {
 		t.Error("another path")
 	}
+	if !m.Deploys("Applications/x.AppImage/inner") {
+		t.Error("a home file where a directory of the path would go")
+	}
 	if (&Module{}).Deploys("Applications/x.AppImage") {
 		t.Error("a module without a directory deploys nothing")
 	}

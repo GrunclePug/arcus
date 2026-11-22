@@ -25,7 +25,7 @@ func (a *app) appImage(h *half, st *state.State, s plan.Step, in plan.Input, sav
 			return fmt.Errorf("module %s declares no AppImage at ~/%s", s.Module, p)
 		}
 		path := filepath.Join(a.paths.Home, p)
-		// A home link earlier in this run may have put one there.
+		// Checked at plan time too; the file system may have changed since.
 		if dir := h.layer.SymlinkedParent(path); dir != "" {
 			target, _ := os.Readlink(dir)
 			return fmt.Errorf("%s: parent %s is a symlink (to %s); remove it first", path, dir, target)

@@ -976,6 +976,22 @@ func TestAppImagePlanRefuses(t *testing.T) {
 		f.declare(".state/state.json", "v1")
 		f.refused("inside arcus's own data")
 	})
+	t.Run("arcus's own data through a link", func(t *testing.T) {
+		f := newAppImageFixture(t)
+		state := filepath.Join(f.home, ".state")
+		if err := os.MkdirAll(state, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// $HOME reaches the state directory under another name too.
+		if err := os.Symlink(state, filepath.Join(filepath.Dir(f.home), "elsewhere")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(filepath.Dir(f.home), "elsewhere"), filepath.Join(f.home, "s")); err != nil {
+			t.Fatal(err)
+		}
+		f.declare("s/state.json", "v1")
+		f.refused("inside arcus's own data")
+	})
 	t.Run("a symlinked parent", func(t *testing.T) {
 		f := newAppImageFixture(t)
 		checkout := filepath.Join(filepath.Dir(f.home), "checkout")

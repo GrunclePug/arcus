@@ -110,7 +110,7 @@ func TestCommitHoldsExactlyTheFiles(t *testing.T) {
 		t.Errorf("mode = %v, want 0700", info.Mode().Perm())
 	}
 
-	// Unchanged: nothing, unless asked.
+	// Theirs: nothing, unless asked.
 	if made, err := r.Commit(files, "same", false); err != nil || made {
 		t.Errorf("unchanged commit = %v, %v; want none", made, err)
 	}

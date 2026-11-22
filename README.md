@@ -118,10 +118,10 @@ An AppImage is downloaded as your user into `<path>.arcus-tmp` beside its destin
 | nothing | downloads the pin |
 | the pinned file, which arcus didn't install or which isn't executable | takes it over and makes it executable |
 | what arcus installed, and the pin moved | downloads the new pin over it |
-| what arcus installed, changed since (the app updated itself, or you replaced it) | leaves it alone and says so; remove it to get the pin |
+| what arcus installed, changed since (the app updated itself, or you replaced it) | leaves it alone, and says so once the pin moves; remove it to get the pin |
 | any other file, or a directory | refuses: move it away, then apply again |
 
-Turning the module off, or dropping the table, removes the file while it is what arcus installed; a changed one stays, is named, and is forgotten. arcus never deletes a `<path>.arcus-tmp` left by an interrupted download: the next run refuses until you remove it. As with home files, an AppImage can't go below a directory in `$HOME` that is a symlink, nor where two modules that are on both put one, nor where a module deploys a home file; a module's home file turning into an AppImage at the same path takes two applies (remove the file, apply, then add the AppImage).
+Turning the module off, or dropping the table, removes the file while it is what arcus installed; a changed one stays, is named, and is forgotten. arcus never deletes a `<path>.arcus-tmp` left by an interrupted download: the next run refuses until you remove it. As with home files, an AppImage can't go below a directory in `$HOME` that is a symlink, nor inside arcus's own data; nor where two modules that are on both put one, nor at or below a home file or home link of a module that is on; a module's home file turning into an AppImage at the same path takes two applies (remove the file, apply, then add the AppImage).
 
 A profile is a file that lists modules in stacking order, and the host file `~/.local/state/arcus/host.toml` picks profiles and adds the machine's own modules:
 

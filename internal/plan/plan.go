@@ -394,7 +394,7 @@ func appImageAdditions(in Input, h Half, unlinked []string) ([]Step, error) {
 				steps = append(steps, Step{Stage: UserSetup, Op: InstallAppImage, Module: name, Names: []string{p}, Changes: []string{"from " + d.URL}})
 			case appimage.Adopt:
 				taken.Names = append(taken.Names, p)
-			case appimage.Unchanged:
+			case appimage.Theirs:
 				if h.Note != nil {
 					h.Note(fmt.Sprintf("~/%s: changed since arcus installed it, so it stays; remove it to get the pinned version", p))
 				}
