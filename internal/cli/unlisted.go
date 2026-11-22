@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"io"
 	iofs "io/fs"
 	"maps"
 	"slices"
@@ -91,6 +92,13 @@ func (u *unlisted) valid(field string, names []string) []string {
 	ok, bad := module.ValidNames(field, names)
 	u.leftOut = append(u.leftOut, bad...)
 	return ok
+}
+
+// printLeftOut says which names the module couldn't hold.
+func (u *unlisted) printLeftOut(w io.Writer) {
+	if len(u.leftOut) > 0 {
+		fmt.Fprintf(w, "Left out (arcus can't manage these names): %s\n", strings.Join(u.leftOut, " "))
+	}
 }
 
 func (u *unlisted) empty() bool {

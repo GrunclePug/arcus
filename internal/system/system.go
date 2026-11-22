@@ -189,17 +189,24 @@ func (r *Runner) LeaveGroup(user, group string) error {
 // output runs a read-only command and returns what it prints. pacman and
 // systemctl exit 1 when nothing matches, which is no output, not an error.
 func output(name string, args ...string) (string, error) {
+	out, _, err := run(name, args...)
+	return out, err
+}
+
+// run is output that also returns what the command printed on stderr when
+// it succeeded, trimmed.
+func run(name string, args ...string) (string, string, error) {
 	var stdout, stderr bytes.Buffer
 	cmd := exec.Command(name, args...)
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
 		var exit *exec.ExitError
 		if errors.As(err, &exit) && exit.ExitCode() == 1 && stdout.Len() == 0 && stderr.Len() == 0 {
-			return "", nil
+			return "", "", nil
 		}
-		return "", fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return "", "", fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
-	return stdout.String(), nil
+	return stdout.String(), strings.TrimSpace(stderr.String()), nil
 }
 
 // query runs a read-only command and returns the whitespace-separated
@@ -234,9 +241,21 @@ func Explicit() (map[string]bool, error) {
 }
 
 // Foreign returns the installed packages that no sync repository has:
-// from the AUR or built by hand.
+// from the AUR or built by hand. Without a sync database pacman counts
+// every package as foreign and only warns, so a warning is an error here.
 func Foreign() (map[string]bool, error) {
-	return query(false, "pacman", "-Qqm")
+	out, stderr, err := run("pacman", "-Qqm")
+	if err != nil {
+		return nil, err
+	}
+	if stderr != "" {
+		return nil, fmt.Errorf("pacman -Qqm: %s", stderr)
+	}
+	set := map[string]bool{}
+	for _, f := range strings.Fields(out) {
+		set[f] = true
+	}
+	return set, nil
 }
 
 // Unrequired returns the installed packages that no installed package
@@ -529,9 +548,20 @@ func installAlso(dirs []string, file string) []string {
 	return nil
 }
 
-// Groups returns the groups user belongs to.
+// Groups returns the groups user belongs to. Group names from a directory
+// service can hold spaces, so they are read NUL-separated.
 func Groups(user string) (map[string]bool, error) {
-	return query(false, "id", "-nG", user)
+	out, err := output("id", "-nGz", user)
+	if err != nil {
+		return nil, err
+	}
+	set := map[string]bool{}
+	for g := range strings.SplitSeq(out, "\x00") {
+		if g = strings.TrimSpace(g); g != "" {
+			set[g] = true
+		}
+	}
+	return set, nil
 }
 
 // PrimaryGroup returns user's primary group.

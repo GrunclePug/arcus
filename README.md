@@ -86,8 +86,9 @@ To start from an Arch system you already have, write its machine module and turn
 ```sh
 arcus machine && arcus on machine
 arcus new -unlisted mine   # explicitly installed packages, enabled units and groups no module lists
-arcus on mine              # takes over what is already there; installs and removes nothing
-arcus clean                # shows what's left: dependencies nothing needs any more
+$EDITOR ~/.config/arcus/modules/mine/module.toml   # review it; delete what you don't want kept
+arcus on mine              # takes over what is already there
+arcus clean -n             # shows what's left: dependencies nothing needs any more
 ```
 
 `-unlisted` lists packages installed explicitly (from the repositories in `pacman`, the rest in `aur`), units enabled against their vendor preset and groups, leaving out protected packages and whatever a module that's on lists. A unit that another listed unit enables through `Also=` isn't listed again, and names a module can't hold are left out and shown. It never touches files in `/etc` or `$HOME`. Turning the module off removes everything it lists, so split it into real modules as you go. A package in `aur` that isn't on the AUR, or a unit you wrote yourself, works on this machine but needs its recipe or unit file in the module before it works on another. Units enabled by hand that their vendor preset also enables, such as `systemd-networkd.service`, and template instances enabled by hand, such as `wg-quick@wg0.service`, aren't listed yet; add them yourself.

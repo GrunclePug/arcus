@@ -35,7 +35,7 @@ func mutations(log []string) []string {
 				out = append(out, l)
 			}
 		case "systemctl":
-			if slices.Contains(f, "enable") || slices.Contains(f, "disable") {
+			if !slices.Contains(f, "list-unit-files") {
 				out = append(out, l)
 			}
 		case "makepkg", "gpasswd":
@@ -115,6 +115,10 @@ func TestNewUnlisted(t *testing.T) {
 	}
 	contains(t, e.state(true).Owned[state.Pacman]["mine"], "htop", "lib-needed")
 	contains(t, e.state(false).Owned[state.AUR]["mine"], "hand-built", "my-aur") // the user half's
+	contains(t, e.state(true).Owned[state.SystemUnits]["mine"], "NetworkManager.service", "a.service", "helper.service", `mnt-my\x2dshare.mount`, "sshd.service")
+	lacks(t, e.state(true).Owned[state.SystemUnits]["mine"], "NetworkManager-dispatcher.service", "b.service")
+	contains(t, e.state(false).Owned[state.UserUnits]["mine"], "syncthing.service")
+	contains(t, e.state(true).Owned[state.Groups]["mine"], "audio")
 
 	// Doctor reports only the orphan and the names arcus can't list.
 	err = e.run("doctor")
@@ -128,7 +132,10 @@ func TestNewUnlisted(t *testing.T) {
 			t.Errorf("doctor lacks %q (%v):\n%s", want, err, out)
 		}
 	}
-	for _, unwanted := range []string{"user units enabled", "NetworkManager-", "staff", "audio", "htop"} {
+	if n := strings.Count(out, "✗"); n != 2 {
+		t.Errorf("doctor found %d problems, want 2 (foo.slice, DomainUsers):\n%s", n, out)
+	}
+	for _, unwanted := range []string{"user units enabled", "NetworkManager-", "staff", "audio", "htop", "other packages need them", "doesn't match"} {
 		if strings.Contains(out, unwanted) {
 			t.Errorf("doctor mentions %q:\n%s", unwanted, out)
 		}
@@ -169,6 +176,35 @@ func TestNewUnlistedRefusals(t *testing.T) {
 			t.Errorf("a directory was created: %v", err)
 		}
 	})
+	t.Run("no host file", func(t *testing.T) {
+		e := setup(t)
+		e.sys.SetPackages("base", "linux", "yay", "htop", "my-aur")
+		e.sys.SetForeign("yay", "my-aur")
+		must(t, e.run("new", "-unlisted", "mine"))
+		if !strings.Contains(e.out.String(), "The machine module isn't on") {
+			t.Errorf("no machine hint:\n%s", e.out.String())
+		}
+		m, err := module.Load(dir(e))
+		must(t, err)
+		if !slices.Equal(m.Packages.Pacman, []string{"htop"}) || !slices.Equal(m.Packages.AUR, []string{"my-aur"}) {
+			t.Errorf("pacman = %v, aur = %v; want [htop], [my-aur]", m.Packages.Pacman, m.Packages.AUR)
+		}
+	})
+	t.Run("group names with spaces", func(t *testing.T) {
+		e := setup(t)
+		me, err := user.Current()
+		must(t, err)
+		e.sys.SetGroups(me.Username, "domain users", "audio")
+		must(t, e.run("new", "-unlisted", "mine"))
+		if !strings.Contains(e.out.String(), "Left out (arcus can't manage these names): domain users\n") {
+			t.Errorf("output:\n%s", e.out.String())
+		}
+		m, err := module.Load(dir(e))
+		must(t, err)
+		if !slices.Equal(m.Groups, []string{"audio"}) {
+			t.Errorf("groups = %v, want [audio]", m.Groups)
+		}
+	})
 	t.Run("machine module on", func(t *testing.T) {
 		e := setup(t)
 		mdir := filepath.Join(e.root, "etc/arcus/modules/machine")
@@ -205,6 +241,8 @@ func TestNewUnlistedRefusals(t *testing.T) {
 			must(t, os.MkdirAll(filepath.Dir(old), 0o755))
 			must(t, os.WriteFile(old, nil, 0o644))
 		}, nil, "host file moved"},
+		{"no sync databases", func(e *env) { e.sys.NoSync() }, nil, "database file"},
+		{"mv to machine", func(e *env) { e.module("mine", "", nil) }, []string{"mv", "mine", "machine"}, "machine module's name"},
 		{"broken host file", func(e *env) { must(t, os.WriteFile(e.hostPath(), []byte("modules = [\"nope\"]\n"), 0o644)) }, nil, "nope"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -220,7 +258,7 @@ func TestNewUnlistedRefusals(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), c.want) {
 				t.Fatalf("%v: got %v, want an error with %q", args, err, c.want)
 			}
-			if _, err := os.Stat(filepath.Join(dir(e), "module.toml")); c.name != "existing module" && !os.IsNotExist(err) {
+			if _, err := os.Stat(filepath.Join(dir(e), "module.toml")); c.name != "existing module" && c.name != "mv to machine" && !os.IsNotExist(err) {
 				t.Errorf("a module was written: %v", err)
 			}
 		})

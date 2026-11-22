@@ -71,7 +71,9 @@ drop() {
 case $op in
   -Qq) cat "$dir/pkgs"; exit 0 ;;
   -Qqe) out=$(grep -vxF -f "$dir/deps" "$dir/pkgs"); [ -n "$out" ] || exit 1; echo "$out"; exit 0 ;;
-  -Qqm) out=$(grep -xF -f "$dir/foreign" "$dir/pkgs"); [ -n "$out" ] || exit 1; echo "$out"; exit 0 ;;
+  -Qqm)
+    [ -f "$dir/nosync" ] && { echo "warning: database file for 'core' does not exist (use '-Sy' to download)" >&2; cat "$dir/pkgs"; exit 0; }
+    out=$(grep -xF -f "$dir/foreign" "$dir/pkgs"); [ -n "$out" ] || exit 1; echo "$out"; exit 0 ;;
   -Qqt) required > "$dir/req"; out=$(grep -vxF -f "$dir/req" "$dir/pkgs"); [ -n "$out" ] || exit 1; echo "$out"; exit 0 ;;
   -Qi)
     [ -n "$names" ] || names=$(cat "$dir/pkgs")
@@ -182,7 +184,7 @@ for u in "$@"; do
 done
 `
 
-// idScript answers -nG from $dir/groups and -gn from $dir/primary, or with
+// idScript answers -nG and -nGz from $dir/groups and -gn from $dir/primary, or with
 // the user's own name, the group Arch gives a new user.
 const idScript = `#!/bin/sh
 dir=%DIR%
@@ -191,6 +193,7 @@ if [ "$1" = -gn ]; then
   exit 0
 fi
 touch "$dir/groups"
+if [ "$1" = -nGz ]; then tr '\n' '\0' < "$dir/groups"; exit 0; fi
 tr '\n' ' ' < "$dir/groups"; echo
 `
 
@@ -271,6 +274,10 @@ func (s *System) SetDeps(pkgs ...string) { s.set("deps", pkgs) }
 // SetForeign replaces the packages no sync repository has; -Qqm lists
 // those that are installed.
 func (s *System) SetForeign(pkgs ...string) { s.set("foreign", pkgs) }
+
+// NoSync makes -Qqm behave as without sync databases: it warns and lists
+// every installed package.
+func (s *System) NoSync() { s.set("nosync", []string{"1"}) }
 
 // SetMeta replaces what packages provide, conflict with and depend on:
 // "<package> <field> <name>" lines (see pkgScript).

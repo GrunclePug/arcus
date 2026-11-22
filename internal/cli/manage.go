@@ -78,10 +78,8 @@ func (a *app) cmdNew(args []string) error {
 		if u, err = a.unlisted(); err != nil {
 			return err
 		}
-		if len(u.leftOut) > 0 {
-			fmt.Fprintf(a.stdout, "Left out (arcus can't manage these names): %s\n", strings.Join(u.leftOut, " "))
-		}
 		if u.empty() {
+			u.printLeftOut(a.stdout)
 			fmt.Fprintln(a.stdout, "Nothing arcus can manage is unlisted; no module written.")
 			return nil
 		}
@@ -123,6 +121,7 @@ func (a *app) cmdNew(args []string) error {
 	}
 	fmt.Fprintf(a.stdout, "Created %s: %d pacman, %d aur, %d units, %d groups.\n",
 		dir, len(u.pacman), len(u.aur), len(u.system)+len(u.user), len(u.groups))
+	u.printLeftOut(a.stdout)
 	fmt.Fprintf(a.stdout, "Review it, then 'arcus on %s'.\n", name)
 	if !u.machineOn {
 		fmt.Fprintf(a.stdout, "The machine module isn't on, so the kernel, bootloader and drivers ended up in this module. "+
@@ -257,6 +256,9 @@ func (a *app) cmdMv(args []string) (err error) {
 	oldName, newName := fs.Arg(0), fs.Arg(1)
 	if err := module.ValidateName(newName); err != nil {
 		return err
+	}
+	if newName == machine.Name {
+		return fmt.Errorf("%q is the machine module's name; 'arcus machine' writes it", newName)
 	}
 	if err := a.load(&o); err != nil {
 		return err
