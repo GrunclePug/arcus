@@ -78,5 +78,5 @@ func makeExecutable(path string) error {
 	if info.Mode()&0o100 != 0 {
 		return nil
 	}
-	return os.Chmod(path, info.Mode().Perm()|0o100)
+	return os.Chmod(path, info.Mode()|0o100)
 }
