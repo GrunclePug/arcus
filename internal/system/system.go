@@ -189,24 +189,17 @@ func (r *Runner) LeaveGroup(user, group string) error {
 // output runs a read-only command and returns what it prints. pacman and
 // systemctl exit 1 when nothing matches, which is no output, not an error.
 func output(name string, args ...string) (string, error) {
-	out, _, err := run(name, args...)
-	return out, err
-}
-
-// run is output that also returns what the command printed on stderr when
-// it succeeded, trimmed.
-func run(name string, args ...string) (string, string, error) {
 	var stdout, stderr bytes.Buffer
 	cmd := exec.Command(name, args...)
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
 		var exit *exec.ExitError
 		if errors.As(err, &exit) && exit.ExitCode() == 1 && stdout.Len() == 0 && stderr.Len() == 0 {
-			return "", "", nil
+			return "", nil
 		}
-		return "", "", fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return "", fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
-	return stdout.String(), strings.TrimSpace(stderr.String()), nil
+	return stdout.String(), nil
 }
 
 // query runs a read-only command and returns the whitespace-separated
@@ -242,17 +235,26 @@ func Explicit() (map[string]bool, error) {
 
 // Foreign returns the installed packages that no sync repository has:
 // from the AUR or built by hand. Without a sync database pacman counts
-// every package as foreign and only warns, so a warning is an error here.
+// every package as foreign and only warns, so that warning is an error
+// here; others, such as an outdated pacman.conf directive, aren't. pacman
+// runs untranslated so the warning can be recognised.
 func Foreign() (map[string]bool, error) {
-	out, stderr, err := run("pacman", "-Qqm")
-	if err != nil {
-		return nil, err
+	var stdout, stderr bytes.Buffer
+	cmd := exec.Command("pacman", "-Qqm")
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
+	for line := range strings.Lines(stderr.String()) {
+		if strings.Contains(line, "database file for") {
+			return nil, fmt.Errorf("pacman -Qqm: %s", strings.TrimSpace(line))
+		}
 	}
-	if stderr != "" {
-		return nil, fmt.Errorf("pacman -Qqm: %s", stderr)
+	var exit *exec.ExitError
+	if err != nil && !(errors.As(err, &exit) && exit.ExitCode() == 1 && stdout.Len() == 0) {
+		return nil, fmt.Errorf("pacman -Qqm: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
 	set := map[string]bool{}
-	for _, f := range strings.Fields(out) {
+	for _, f := range strings.Fields(stdout.String()) {
 		set[f] = true
 	}
 	return set, nil

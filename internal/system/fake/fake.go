@@ -72,6 +72,8 @@ case $op in
   -Qq) cat "$dir/pkgs"; exit 0 ;;
   -Qqe) out=$(grep -vxF -f "$dir/deps" "$dir/pkgs"); [ -n "$out" ] || exit 1; echo "$out"; exit 0 ;;
   -Qqm)
+    [ "$LC_ALL" = C ] || { echo "error: -Qqm must run with LC_ALL=C" >&2; exit 2; }
+    echo "warning: config file /etc/pacman.conf, line 10: directive 'TotalDownload' in section 'options' not recognized." >&2
     [ -f "$dir/nosync" ] && { echo "warning: database file for 'core' does not exist (use '-Sy' to download)" >&2; cat "$dir/pkgs"; exit 0; }
     out=$(grep -xF -f "$dir/foreign" "$dir/pkgs"); [ -n "$out" ] || exit 1; echo "$out"; exit 0 ;;
   -Qqt) required > "$dir/req"; out=$(grep -vxF -f "$dir/req" "$dir/pkgs"); [ -n "$out" ] || exit 1; echo "$out"; exit 0 ;;
