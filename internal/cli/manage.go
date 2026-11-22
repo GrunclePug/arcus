@@ -33,6 +33,11 @@ local  = []
 system = []
 user   = []
 now    = false
+
+# [appimages.name]
+# url    = "https://..."
+# sha256 = ""
+# path   = "Applications/name.AppImage"
 `
 
 // cmdNew creates a module skeleton in ~/.config/arcus/modules.

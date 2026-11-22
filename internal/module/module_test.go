@@ -1,6 +1,7 @@
 package module
 
 import (
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -90,6 +91,20 @@ func TestLoadRejects(t *testing.T) {
 		{"link outside home", "p", `links = { "a" = "../etc/passwd" }`, "links: \"../etc/passwd\""},
 		{"absolute link", "p", `links = { "/etc/x" = "a" }`, "links: \"/etc/x\""},
 		{"link to itself", "p", `links = { "a" = "a" }`, "points at itself"},
+		{"appimage over http", "p", "[appimages.a]\nurl = \"http://x.org/a\"\nsha256 = \"" + digest + "\"", "must be an https URL"},
+		{"appimage without url", "p", "[appimages.a]\nsha256 = \"" + digest + "\"", "must be an https URL"},
+		{"appimage short digest", "p", "[appimages.a]\nurl = \"https://x.org/a\"\nsha256 = \"abc\"", "64 hex digits"},
+		{"appimage non-hex digest", "p", "[appimages.a]\nurl = \"https://x.org/a\"\nsha256 = \"" + strings.Repeat("g", 64) + "\"", "64 hex digits"},
+		{"appimage absolute path", "p", appImage(`path = "/opt/a.AppImage"`), `path "/opt/a.AppImage"`},
+		{"appimage path out of home", "p", appImage(`path = "../a.AppImage"`), `path "../a.AppImage"`},
+		{"appimage path through ..", "p", appImage(`path = "Applications/../../a"`), "inside $HOME"},
+		{"appimage bad name", "p", "[appimages.\"a b\"]\nurl = \"https://x.org/a\"\nsha256 = \"" + digest + "\"", "invalid name"},
+		{"appimage unknown key", "p", appImage(`selfupdate = true`), "appimages.a.selfupdate"},
+		{"appimage path twice", "p", appImage(`path = "x"`) + "\n[appimages.b]\nurl = \"https://x.org/b\"\nsha256 = \"" + digest + "\"\npath = \"x\"", "used twice"},
+		{"appimage temp suffix", "p", appImage(`path = "Applications/a.AppImage.arcus-tmp"`), "can't end in .arcus-tmp"},
+		{"appimage below a temp suffix", "p", appImage(`path = "Applications/b.arcus-tmp/a.AppImage"`), "can't end in .arcus-tmp"},
+		{"appimage self_update", "p", appImage(`self_update = true`), "appimages.a.self_update"},
+		{"appimage inside another", "p", appImage(`path = "x"`) + "\n[appimages.b]\nurl = \"https://x.org/b\"\nsha256 = \"" + digest + "\"\npath = \"x/y\"", "inside another AppImage's"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -98,6 +113,74 @@ func TestLoadRejects(t *testing.T) {
 				t.Fatalf("want error containing %q, got %v", tt.wantErr, err)
 			}
 		})
+	}
+}
+
+const digest = "8baa06a7bbaa3f729d69466fb211ed7006d6a6e4d800b9ecdacd831fd1686b14"
+
+// appImage is a valid [appimages.a] table plus extra keys.
+func appImage(extra string) string {
+	return "[appimages.a]\nurl = \"https://x.org/a.AppImage\"\nsha256 = \"" + digest + "\"\n" + extra + "\n"
+}
+
+func TestLoadAppImages(t *testing.T) {
+	dir := writeModule(t, t.TempDir(), "desk", `
+[appimages.t3code]
+url         = "https://github.com/pingdotgg/t3code/releases/download/v0.1.11/T3-Code-x86_64.AppImage"
+sha256      = "8BAA06A7BBAA3F729D69466FB211ED7006D6A6E4D800B9ECDACD831FD1686B14"
+path        = "Applications/T3-Code.AppImage"
+
+[appimages.tool]
+url    = "https://example.org/tool.AppImage"
+sha256 = "`+digest+`"
+`)
+	m, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]AppImage{
+		"t3code": {URL: "https://github.com/pingdotgg/t3code/releases/download/v0.1.11/T3-Code-x86_64.AppImage", SHA256: digest, Path: "Applications/T3-Code.AppImage"},
+		"tool":   {URL: "https://example.org/tool.AppImage", SHA256: digest, Path: "Applications/tool.AppImage"},
+	}
+	if !maps.Equal(m.AppImages, want) {
+		t.Errorf("appimages = %+v", m.AppImages)
+	}
+	if got := m.AppImagePaths(); !slices.Equal(got, []string{"Applications/T3-Code.AppImage", "Applications/tool.AppImage"}) {
+		t.Errorf("paths = %v", got)
+	}
+	if ai, ok := m.AppImageAt("Applications/tool.AppImage"); !ok || ai != want["tool"] {
+		t.Errorf("AppImageAt = %+v %v", ai, ok)
+	}
+	if _, ok := m.AppImageAt("Applications/none"); ok {
+		t.Error("AppImageAt found an undeclared path")
+	}
+}
+
+// Deploys finds anything a module's home/ tree has at a path: an AppImage
+// there would collide with the module's own layer.
+func TestDeploys(t *testing.T) {
+	m := &Module{Dir: writeModule(t, t.TempDir(), "other", "")}
+	p := filepath.Join(m.Dir, "home", "Applications", "x.AppImage")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if m.Deploys("Applications/x.AppImage") {
+		t.Error("nothing there yet")
+	}
+	if err := os.WriteFile(p, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !m.Deploys("Applications/x.AppImage") {
+		t.Error("a home file at the path")
+	}
+	if m.Deploys("Applications/y.AppImage") {
+		t.Error("another path")
+	}
+	if !m.Deploys("Applications/x.AppImage/inner") {
+		t.Error("a home file where a directory of the path would go")
+	}
+	if (&Module{}).Deploys("Applications/x.AppImage") {
+		t.Error("a module without a directory deploys nothing")
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/grunclepug/arcus/internal/appimage"
 	"github.com/grunclepug/arcus/internal/host"
 	"github.com/grunclepug/arcus/internal/machine"
 	"github.com/grunclepug/arcus/internal/module"
@@ -214,11 +215,15 @@ func (a *app) change(o *opts, create bool, edit func(*host.File) error) (err err
 	if err != nil {
 		return err
 	}
-	steps, err := a.plan(in)
+	var notes []string
+	steps, err := a.plan(in, func(n string) { notes = append(notes, n) })
 	if err != nil {
 		return err
 	}
 	a.printPlan(steps)
+	for _, n := range notes {
+		fmt.Fprintf(a.stdout, "  = %s\n", n)
+	}
 	if o.dry {
 		return nil
 	}
@@ -319,6 +324,10 @@ func (a *app) present(kind string) (map[string]bool, error) {
 		return a.homeDirs()
 	case state.HomeLinks:
 		return a.homeLinks()
+	case state.HomeAppImages:
+		// Every recorded AppImage counts as present, so one that changed is
+		// handed over rather than dropped; the plan sorts out which go.
+		return nil, nil
 	}
 	return nil, fmt.Errorf("unknown kind %q", kind)
 }
@@ -531,8 +540,10 @@ func (a *app) localInfo(s plan.Step) (system.Package, bool, error) {
 }
 
 // plan computes the steps of both halves. The system half is read under a
-// shared lock, which is released again before any root step runs.
-func (a *app) plan(in plan.Input) ([]plan.Step, error) {
+// shared lock, which is released again before any root step runs. note, if
+// not nil, receives what the user plan leaves alone that is worth saying,
+// as plan.Half.Note describes.
+func (a *app) plan(in plan.Input, note func(string)) ([]plan.Step, error) {
 	sh := a.systemHalf()
 	lock, err := sh.lock(false)
 	if err != nil {
@@ -548,6 +559,7 @@ func (a *app) plan(in plan.Input) ([]plan.Step, error) {
 	if err != nil {
 		return nil, err
 	}
+	us.Note = note
 	usr, err := plan.User(in, us)
 	if err != nil {
 		return nil, err
@@ -578,6 +590,7 @@ func (a *app) printPlan(steps []plan.Step) {
 var kindNames = map[string]string{
 	state.Pacman: "packages", state.AUR: "AUR packages", state.Local: "own builds",
 	state.SystemUnits: "system units", state.UserUnits: "user units", state.Groups: "groups", state.HomeDirs: "home directories", state.HomeLinks: "home links",
+	state.HomeAppImages: "AppImages",
 }
 
 func describe(s plan.Step) string {
@@ -636,6 +649,13 @@ func describe(s plan.Step) string {
 		return fmt.Sprintf("create home links for %s: %s", s.Module, strings.Join(s.Names, ", "))
 	case plan.Unlink:
 		return fmt.Sprintf("remove home links that still point at their target: %s", strings.Join(s.Names, ", "))
+	case plan.InstallAppImage:
+		return fmt.Sprintf("download the pinned AppImage for %s: %s", s.Module, names)
+	case plan.RemoveAppImage:
+		if len(s.Names) == 0 {
+			return "update the records of AppImages:"
+		}
+		return fmt.Sprintf("remove AppImages that arcus installed: %s", names)
 	case plan.BuildLocal:
 		return fmt.Sprintf("build %s from %s/pkg/%s", names, s.Module, names)
 	case plan.InstallLocal:
@@ -794,12 +814,22 @@ func (a *app) runSteps(h *half, st *state.State, steps []plan.Step, in plan.Inpu
 				return err
 			}
 			i = j - 1
-		case plan.Remove, plan.RemoveLocal, plan.Disable, plan.Leave, plan.Rmdir, plan.Unlink:
+		case plan.InstallAppImage:
+			if err := a.appImage(h, st, s, in, save); err != nil {
+				return err
+			}
+		case plan.Remove, plan.RemoveLocal, plan.Disable, plan.Leave, plan.Rmdir, plan.Unlink, plan.RemoveAppImage:
 			if err := a.remove(st, steps[i:j], in, r, save); err != nil {
 				return err
 			}
 			i = j - 1
 		case plan.Adopt:
+			if s.Of == state.HomeAppImages {
+				if err := a.appImage(h, st, s, in, save); err != nil {
+					return err
+				}
+				continue
+			}
 			present, err := a.present(s.Kind())
 			if err != nil {
 				return err
@@ -948,6 +978,23 @@ func (a *app) remove(st *state.State, steps []plan.Step, in plan.Input, r *syste
 				if err = os.Remove(host); err != nil {
 					break
 				}
+			}
+		}
+	case plan.RemoveAppImage:
+		// Only the names the plan removes, each once more as arcus
+		// recorded it; anything else stays. Turning off never stops here:
+		// the records go either way.
+		h := a.userHalf()
+		for _, p := range steps[0].Names {
+			path := filepath.Join(a.paths.Home, p)
+			if h.layer.SymlinkedParent(path) != "" || !appimage.Removable(path, st.AppImages[p]) {
+				if _, err := os.Lstat(path); err == nil {
+					fmt.Fprintf(a.stderr, "warning: ~/%s changed since the plan was shown; it stays\n", p)
+				}
+				continue
+			}
+			if err := os.Remove(path); err != nil {
+				fmt.Fprintf(a.stderr, "warning: removing ~/%s: %v; it stays\n", p, err)
 			}
 		}
 	case plan.Rmdir:

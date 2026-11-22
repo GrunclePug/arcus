@@ -16,8 +16,8 @@ import (
 
 // Resource kinds whose ownership is recorded. Each half records only its own
 // kinds: the system half pacman packages, own builds, system units and
-// groups; the user half AUR packages, user units, home directories and
-// home links.
+// groups; the user half AUR packages, user units, home directories, home
+// links and AppImages.
 const (
 	Pacman      = "pacman"
 	Local       = "local" // own builds from recipes
@@ -27,6 +27,8 @@ const (
 	Groups      = "groups"
 	HomeDirs    = "home-dirs"  // directories in $HOME, removed only when empty
 	HomeLinks   = "home-links" // symlinks in $HOME, removed only while they still point at their target
+	// AppImages in $HOME, by path. Each also has a record in State.AppImages.
+	HomeAppImages = "home-appimages"
 )
 
 // Version is the state file format. Load refuses any other, so an older
@@ -49,6 +51,11 @@ type State struct {
 	// Built records, per own build installed by arcus, the hash of the recipe
 	// it was built from, so apply rebuilds only when the recipe changes.
 	Built map[string]string `json:"built,omitempty"`
+
+	// AppImages records, per AppImage path below $HOME that is owned as
+	// HomeAppImages, the sha256 of the file arcus installed or took over
+	// there. arcus acts on the file only while it still has that content.
+	AppImages map[string]string `json:"appimages,omitempty"`
 }
 
 // Load reads the state file. A missing file is an empty state.
@@ -138,7 +145,7 @@ func (s *State) Release(kind, module string, r Removal) {
 
 // Clone returns a deep copy, for planning against a state without changing it.
 func (s *State) Clone() *State {
-	c := &State{Version: s.Version, Modules: slices.Clone(s.Modules), Built: maps.Clone(s.Built)}
+	c := &State{Version: s.Version, Modules: slices.Clone(s.Modules), Built: maps.Clone(s.Built), AppImages: maps.Clone(s.AppImages)}
 	for kind, byModule := range s.Owned {
 		for module, names := range byModule {
 			c.Own(kind, module, names)
@@ -181,6 +188,7 @@ func (s *State) Reconcile(kind string, order []string, declares map[string][]str
 			}
 		}
 	}
+	s.dropUnownedAppImages(kind)
 	return remove
 }
 
@@ -206,6 +214,33 @@ func (s *State) Prune(kind string, present map[string]bool) []string {
 	}
 	slices.Sort(pruned)
 	return pruned
+}
+
+// SetAppImage records that module owns the AppImage at path, with sum.
+func (s *State) SetAppImage(module, path, sum string) {
+	s.Own(HomeAppImages, module, []string{path})
+	if s.AppImages == nil {
+		s.AppImages = map[string]string{}
+	}
+	s.AppImages[path] = sum
+}
+
+// dropUnownedAppImages forgets the records of AppImages that reconciling
+// left without an owner.
+func (s *State) dropUnownedAppImages(kind string) {
+	if kind != HomeAppImages {
+		return
+	}
+	owned := map[string]bool{}
+	for _, paths := range s.Owned[HomeAppImages] {
+		for _, p := range paths {
+			owned[p] = true
+		}
+	}
+	maps.DeleteFunc(s.AppImages, func(path, _ string) bool { return !owned[path] })
+	if len(s.AppImages) == 0 {
+		s.AppImages = nil
+	}
 }
 
 // Rename moves every record of module oldName to newName.

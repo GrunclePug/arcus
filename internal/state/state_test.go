@@ -1,6 +1,7 @@
 package state
 
 import (
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -270,5 +271,33 @@ func TestStateRejectsOtherFormats(t *testing.T) {
 		if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "format") {
 			t.Errorf("%s: got %v", src, err)
 		}
+	}
+}
+
+// AppImage records follow their ownership: a record moves with a transfer
+// and goes when nothing owns its path any more.
+func TestAppImageRecords(t *testing.T) {
+	s := &State{}
+	s.SetAppImage("desk", "Applications/a.AppImage", "aa")
+	s.SetAppImage("desk", "Applications/b.AppImage", "bb")
+	s.SetAppImage("old", "Applications/c.AppImage", "cc")
+
+	c := s.Clone()
+	c.AppImages["Applications/a.AppImage"] = ""
+	if s.AppImages["Applications/a.AppImage"] != "aa" {
+		t.Error("Clone must not share records with the original")
+	}
+
+	// desk drops b, old goes off and its c moves to desk. Every recorded
+	// path counts as present (nil), as the planner reconciles them.
+	declares := map[string][]string{"desk": {"Applications/a.AppImage", "Applications/c.AppImage"}}
+	if remove := s.Reconcile(HomeAppImages, []string{"desk"}, declares, nil, nil); !slices.Equal(remove, []string{"Applications/b.AppImage"}) {
+		t.Errorf("remove = %v", remove)
+	}
+	if !maps.Equal(s.AppImages, map[string]string{"Applications/a.AppImage": "aa", "Applications/c.AppImage": "cc"}) {
+		t.Errorf("records = %v", s.AppImages)
+	}
+	if !slices.Equal(s.Owned[HomeAppImages]["desk"], []string{"Applications/a.AppImage", "Applications/c.AppImage"}) {
+		t.Errorf("owned = %v", s.Owned[HomeAppImages])
 	}
 }

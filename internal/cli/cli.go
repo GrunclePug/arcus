@@ -237,7 +237,7 @@ type half struct {
 	name  string
 	dir   string
 	layer *layer.Stacker
-	kinds []string // ownership kinds recorded in this half
+	kinds []string // ownership kinds of this half that doctor prunes
 }
 
 func (h *half) statePath() string { return filepath.Join(h.dir, "state.json") }
@@ -267,6 +267,8 @@ func (a *app) userHalf() *half {
 		name:  "user",
 		dir:   a.paths.UserState,
 		layer: layer.NewHome(a.paths.Home, a.paths.UserState, a.dirs()),
+		// Not AppImages: one that changed isn't gone, and its record is
+		// what tells arcus it may still act on it.
 		kinds: []string{state.AUR, state.UserUnits, state.HomeDirs, state.HomeLinks},
 	}
 }

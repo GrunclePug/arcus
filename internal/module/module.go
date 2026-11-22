@@ -9,6 +9,7 @@ import (
 	"fmt"
 	iofs "io/fs"
 	"maps"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -30,6 +31,9 @@ var (
 	// Units need their type suffix so ownership compares exact names.
 	unitNameRegex  = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9:_.@\\-]*\.(service|socket|timer|path|target|mount|automount|swap)$`)
 	groupNameRegex = regexp.MustCompile(`^[a-z_][a-z0-9_-]*$`)
+	// AppImage names make the default file name, Applications/<name>.AppImage.
+	appImageNameRegex = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	sha256Regex       = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 // reservedNames cannot be module names: "orig" is the backup tag for host
@@ -71,7 +75,23 @@ type Manifest struct {
 		User   []string `toml:"user"`
 		Now    bool     `toml:"now"`
 	} `toml:"units"`
+
+	// AppImages are vendor AppImages downloaded into $HOME, keyed by name.
+	AppImages map[string]AppImage `toml:"appimages"`
 }
+
+// AppImage is one [appimages.<name>] table: a file downloaded from URL that
+// must have SHA256 before it is put at Path.
+type AppImage struct {
+	URL    string `toml:"url"`
+	SHA256 string `toml:"sha256"`
+	// Path is relative to $HOME; Load fills in Applications/<name>.AppImage.
+	Path string `toml:"path"`
+}
+
+// TempSuffix names the file a download is written to beside its AppImage,
+// <path>.arcus-tmp. No AppImage path may use it.
+const TempSuffix = ".arcus-tmp"
 
 // Module is a loaded module directory. Its name is the directory name.
 type Module struct {
@@ -139,6 +159,9 @@ func (m *Module) validate() error {
 			return fmt.Errorf("links: %q points at itself", p)
 		}
 	}
+	if err := m.validateAppImages(); err != nil {
+		return err
+	}
 	if m.Category != "" && !moduleNameRegex.MatchString(m.Category) {
 		return fmt.Errorf("category: invalid name %q (lowercase letters, digits, '-' and '_')", m.Category)
 	}
@@ -170,6 +193,85 @@ func (m *Module) validate() error {
 		}
 	}
 	return nil
+}
+
+// validateAppImages checks the [appimages] tables and fills in their
+// default paths. Digests are compared in lowercase.
+func (m *Module) validateAppImages() error {
+	var paths []string
+	for _, name := range slices.Sorted(maps.Keys(m.AppImages)) {
+		ai := m.AppImages[name]
+		if !appImageNameRegex.MatchString(name) {
+			return fmt.Errorf("appimages: invalid name %q (letters, digits, '.', '-' and '_')", name)
+		}
+		if u, err := url.Parse(ai.URL); err != nil || u.Scheme != "https" || u.Host == "" {
+			return fmt.Errorf("appimages.%s: url %q must be an https URL", name, ai.URL)
+		}
+		ai.SHA256 = strings.ToLower(ai.SHA256)
+		if !sha256Regex.MatchString(ai.SHA256) {
+			return fmt.Errorf("appimages.%s: sha256 must be 64 hex digits", name)
+		}
+		if ai.Path == "" {
+			ai.Path = path.Join("Applications", name+".AppImage")
+		}
+		if !homeRelative(ai.Path) {
+			return fmt.Errorf("appimages.%s: path %q must be a relative path inside $HOME", name, ai.Path)
+		}
+		// Not even as a directory: A.arcus-tmp/x would take the place of A's
+		// temp file.
+		if slices.ContainsFunc(strings.Split(ai.Path, "/"), func(c string) bool { return strings.HasSuffix(c, TempSuffix) }) {
+			return fmt.Errorf("appimages.%s: path %q can't end in %s, the suffix of a download's temp file", name, ai.Path, TempSuffix)
+		}
+		if slices.ContainsFunc(paths, func(p string) bool { return Nested(p, ai.Path) }) {
+			return fmt.Errorf("appimages.%s: path %q is used twice, or inside another AppImage's", name, ai.Path)
+		}
+		paths = append(paths, ai.Path)
+		m.AppImages[name] = ai
+	}
+	return nil
+}
+
+// Nested reports whether two paths below $HOME are the same or one is
+// inside the other.
+func Nested(a, b string) bool {
+	return a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
+}
+
+// Deploys reports whether the module's home/ tree has anything at p, below
+// $HOME, or a file where one of p's directories would go, so an AppImage
+// there would collide with the module's own layer.
+func (m *Module) Deploys(p string) bool {
+	if m.Dir == "" {
+		return false
+	}
+	for a := p; a != "."; a = path.Dir(a) {
+		info, err := os.Lstat(filepath.Join(m.Dir, "home", filepath.FromSlash(a)))
+		if err == nil && (a == p || !info.IsDir()) {
+			return true
+		}
+	}
+	return false
+}
+
+// AppImagePaths are the paths of the module's AppImages, sorted. Ownership
+// is by path: renaming an AppImage keeps its file, moving it doesn't.
+func (m *Manifest) AppImagePaths() []string {
+	var paths []string
+	for _, ai := range m.AppImages {
+		paths = append(paths, ai.Path)
+	}
+	slices.Sort(paths)
+	return paths
+}
+
+// AppImageAt returns the declaration of the module's AppImage at p.
+func (m *Manifest) AppImageAt(p string) (AppImage, bool) {
+	for _, ai := range m.AppImages {
+		if ai.Path == p {
+			return ai, true
+		}
+	}
+	return AppImage{}, false
 }
 
 // RecipeDir returns the directory of the recipe for the own build pkg.

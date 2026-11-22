@@ -15,6 +15,7 @@ The project is in early development: until 1.0, commands and file formats may st
 * **Every resource kind is reversible**: turning a module off removes the packages, units, groups and files it brought, whether arcus installed them or took them over (packages it takes over are marked explicitly installed, like the ones it installs), but never ones another module still wants or that are protected. A package another installed package still needs stays, marked as a dependency, so pacman removes it with the last package that needs it.
 * **Same result on any machine**: a machine set up by hand ends up like a fresh install of the same profile after `arcus machine`, `apply` and `clean`.
 * **Own builds**: a module can carry PKGBUILD recipes; arcus builds them with makepkg as you, installs them with pacman, and rebuilds when a recipe changes. An own build that another pending one needs to build (its `depends`, `makedepends` and `checkdepends` as `makepkg --printsrcinfo` lists them, by name or through `provides`) is built and installed in an earlier batch, and one that a package depends on is installed with it or before; unrelated builds share a batch, a batch doesn't remove what one of its builds needs, and a dependency cycle is refused before anything changes.
+* **AppImages**: a module can pin a vendor AppImage by URL and sha256; arcus downloads it into `$HOME` as you, updates it when the pin moves, and leaves it alone once the app updates itself.
 * **Conflicts in the plan**: an installed package that a package to install conflicts with is listed in the plan and removed right before its replacement goes in, unless a module wants it.
 * **Clean on request**: `apply` never touches packages arcus didn't install; `arcus clean` removes the ones no module lists, after showing its plan.
 * **Updates**: from a clone with `make install`, or `arcus update` for the latest release, checksum-verified.
@@ -103,7 +104,24 @@ local  = []                 # own builds, from pkg/<name>/
 system = []
 user   = ["mako.service"]
 now    = false
+
+[appimages.editor]          # one table per AppImage, downloaded into $HOME
+url    = "https://example.org/releases/1.2.0/Editor-x86_64.AppImage"
+sha256 = "<the release's sha256>"
+path   = "Applications/Editor.AppImage"   # relative to $HOME; default Applications/<name>.AppImage
 ```
+
+An AppImage is downloaded as your user into `<path>.arcus-tmp` beside its destination, checked against `sha256`, made executable, and put in place without replacing anything that appeared there meanwhile. Keep `path` free of the version: an app that updates itself under a new name would otherwise be downloaded again. arcus acts on the file only while it is exactly what arcus installed:
+
+| At the path | `apply` |
+|-------------|---------|
+| nothing | downloads the pin |
+| the pinned file, which arcus didn't install or which isn't executable | takes it over and makes it executable |
+| what arcus installed, and the pin moved | downloads the new pin over it |
+| what arcus installed, changed since (the app updated itself, or you replaced it) | leaves it alone, and says so whenever it checks the file's content; remove it to get the pin |
+| any other file, or a directory | refuses: move it away, then apply again |
+
+Turning the module off, or dropping the table, removes the file while it is what arcus installed; a changed one stays, is named, and is forgotten. arcus never deletes a `<path>.arcus-tmp` left by an interrupted download: the next run refuses until you remove it. As with home files, an AppImage can't go below a directory in `$HOME` that is a symlink, nor inside arcus's own data; nor where two modules that are on both put one, nor at or below a home file or home link of a module that is on; a module's home file turning into an AppImage at the same path takes two applies (remove the file, apply, then add the AppImage).
 
 A profile is a file that lists modules in stacking order, and the host file `~/.local/state/arcus/host.toml` picks profiles and adds the machine's own modules:
 

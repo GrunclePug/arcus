@@ -2,6 +2,8 @@ package plan
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"maps"
 	"os"
 	"path/filepath"
@@ -794,4 +796,234 @@ func TestCheckBatch(t *testing.T) {
 			}
 		})
 	}
+}
+
+// appImageFixture is a home with module desk declaring AppImages and
+// module old, which is being turned off, owning some. record writes a file
+// and records it as arcus installed it; place writes one arcus doesn't know.
+type appImageFixture struct {
+	t     *testing.T
+	home  string
+	in    Input
+	st    *state.State
+	notes []string
+}
+
+func newAppImageFixture(t *testing.T) *appImageFixture {
+	root := t.TempDir()
+	f := &appImageFixture{t: t, home: filepath.Join(root, "home"), st: &state.State{}}
+	f.in = Input{Desired: []string{"desk"}, Modules: module.Set{
+		"desk": {Name: "desk", Dir: filepath.Join(root, "desk")},
+		"old":  {Name: "old", Dir: filepath.Join(root, "old")},
+	}}
+	f.in.Modules["desk"].AppImages = map[string]module.AppImage{}
+	if err := os.MkdirAll(f.home, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+func sum(content string) string {
+	s := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(s[:])
+}
+
+func (f *appImageFixture) declare(p, content string) {
+	f.in.Modules["desk"].AppImages[p] = module.AppImage{URL: "https://x.org/" + p, SHA256: sum(content), Path: p}
+}
+
+func (f *appImageFixture) place(p, content string) {
+	f.t.Helper()
+	path := filepath.Join(f.home, p)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		f.t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func (f *appImageFixture) record(owner, p, content string) {
+	f.t.Helper()
+	f.place(p, content)
+	f.st.SetAppImage(owner, p, sum(content))
+}
+
+func (f *appImageFixture) user() ([]Step, error) {
+	f.notes = nil
+	h := Half{State: f.st, Layer: layer.NewHome(f.home, filepath.Join(f.home, ".state"), nil), Note: func(n string) { f.notes = append(f.notes, n) }}
+	return User(f.in, h)
+}
+
+func (f *appImageFixture) plan() []Step {
+	f.t.Helper()
+	steps, err := f.user()
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return steps
+}
+
+func (f *appImageFixture) refused(want string) {
+	f.t.Helper()
+	if _, err := f.user(); err == nil || !strings.Contains(err.Error(), want) {
+		f.t.Fatalf("err = %v, want %q", err, want)
+	}
+}
+
+// Each case of the AppImage decision table becomes its step, and a changed
+// file is left alone with a note rather than a step.
+func TestAppImagePlan(t *testing.T) {
+	f := newAppImageFixture(t)
+	f.declare("missing", "v1")
+	f.declare("pinned", "v1")
+	f.place("pinned", "v1")
+	f.declare("bumped", "v2")
+	f.record("desk", "bumped", "v1")
+	f.declare("fine", "v1")
+	f.record("desk", "fine", "v1")
+	f.declare("updated", "v2")
+	f.record("desk", "updated", "v1")
+	f.place("updated", "v3 from the app")
+
+	f.record("old", "a-unchanged", "v1")
+	f.record("old", "b-modified", "v1")
+	f.place("b-modified", "edited")
+	f.record("old", "c-vanished", "v1")
+	if err := os.Remove(filepath.Join(f.home, "c-vanished")); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []Step{
+		{Stage: UserTeardown, Op: RemoveAppImage, Names: []string{"a-unchanged"}, Kept: []string{"b-modified", "c-vanished"}, Changes: []string{
+			"= ~/b-modified: changed since arcus installed it, so it stays", "= ~/c-vanished: already gone",
+		}},
+		{Stage: UserSetup, Op: Adopt, Of: state.HomeAppImages, Module: "desk", Names: []string{"pinned"}},
+		{Stage: UserSetup, Op: InstallAppImage, Module: "desk", Names: []string{"bumped"}, Changes: []string{"from https://x.org/bumped"}},
+		{Stage: UserSetup, Op: InstallAppImage, Module: "desk", Names: []string{"missing"}, Changes: []string{"from https://x.org/missing"}},
+	}
+	steps := f.plan()
+	if !reflect.DeepEqual(steps, want) {
+		t.Fatalf("got  %+v\nwant %+v", steps, want)
+	}
+	if !slices.Equal(f.notes, []string{"~/updated: changed since arcus installed it, so it stays; remove it to get the pinned version"}) {
+		t.Errorf("notes = %q", f.notes)
+	}
+	if len(f.st.Owned[state.HomeAppImages]["old"]) != 3 {
+		t.Error("planning must not change the state")
+	}
+}
+
+// A changed AppImage whose declaration moves to another module is handed
+// over with its record, not dropped and then refused.
+func TestAppImageHandOverOfAChangedFile(t *testing.T) {
+	f := newAppImageFixture(t)
+	f.declare("app", "v2")
+	f.record("old", "app", "v1")
+	f.place("app", "v3 from the app")
+	want := []Step{{Stage: UserTeardown, Op: HandOver, Of: state.HomeAppImages, Changes: []string{"app: old → desk"}}}
+	if got := f.plan(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("got  %+v\nwant %+v", got, want)
+	}
+	if len(f.notes) != 1 {
+		t.Errorf("notes = %q", f.notes)
+	}
+}
+
+// Removing a file below a symlinked directory would follow the link, into
+// a dotfiles checkout say: it stays.
+func TestAppImageBelowASymlinkedParentStays(t *testing.T) {
+	f := newAppImageFixture(t)
+	f.record("old", "linked/app", "v1")
+	checkout := filepath.Join(filepath.Dir(f.home), "checkout")
+	if err := os.Rename(filepath.Join(f.home, "linked"), checkout); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(checkout, filepath.Join(f.home, "linked")); err != nil {
+		t.Fatal(err)
+	}
+	want := []Step{{Stage: UserTeardown, Op: RemoveAppImage, Kept: []string{"linked/app"}, Changes: []string{
+		"= ~/linked/app: parent " + filepath.Join(f.home, "linked") + " is a symlink, so it stays",
+	}}}
+	if got := f.plan(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("got  %+v\nwant %+v", got, want)
+	}
+}
+
+func TestAppImagePlanRefuses(t *testing.T) {
+	t.Run("another file", func(t *testing.T) {
+		f := newAppImageFixture(t)
+		f.declare("app", "v1")
+		f.place("app", "mine")
+		f.refused("isn't the pinned AppImage: move it away")
+	})
+	t.Run("a directory", func(t *testing.T) {
+		f := newAppImageFixture(t)
+		f.declare("app", "v1")
+		if err := os.MkdirAll(filepath.Join(f.home, "app"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		f.refused("isn't a regular file")
+	})
+	t.Run("a leftover download", func(t *testing.T) {
+		f := newAppImageFixture(t)
+		f.declare("app", "v1")
+		f.place("app.arcus-tmp", "half")
+		f.refused("left by an interrupted download")
+	})
+	t.Run("arcus's own data", func(t *testing.T) {
+		f := newAppImageFixture(t)
+		f.declare(".state/state.json", "v1")
+		f.refused("inside arcus's own data")
+	})
+	t.Run("arcus's own data through a link", func(t *testing.T) {
+		f := newAppImageFixture(t)
+		state := filepath.Join(f.home, ".state")
+		if err := os.MkdirAll(state, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// $HOME reaches the state directory under another name too.
+		if err := os.Symlink(state, filepath.Join(filepath.Dir(f.home), "elsewhere")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(filepath.Dir(f.home), "elsewhere"), filepath.Join(f.home, "s")); err != nil {
+			t.Fatal(err)
+		}
+		f.declare("s/state.json", "v1")
+		f.refused("inside arcus's own data")
+	})
+	t.Run("a symlinked parent", func(t *testing.T) {
+		f := newAppImageFixture(t)
+		checkout := filepath.Join(filepath.Dir(f.home), "checkout")
+		if err := os.MkdirAll(checkout, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(checkout, filepath.Join(f.home, ".apps")); err != nil {
+			t.Fatal(err)
+		}
+		f.declare(".apps/bin/app.AppImage", "v1")
+		f.refused("parent " + filepath.Join(f.home, ".apps") + " is a symlink")
+	})
+	t.Run("two modules, one path", func(t *testing.T) {
+		f := newAppImageFixture(t)
+		f.declare("Applications/app", "v1")
+		f.in.Desired = append(f.in.Desired, "old")
+		f.in.Modules["old"].AppImages = map[string]module.AppImage{"x": {URL: "https://x.org/x", SHA256: sum("v1"), Path: "Applications/app/inner"}}
+		f.refused("both put an AppImage at ~/Applications/app or inside it")
+	})
+	t.Run("a home link above it", func(t *testing.T) {
+		f := newAppImageFixture(t)
+		f.declare("Applications/app", "v1")
+		f.in.Modules["desk"].Links = map[string]string{"Applications": "Sync/apps"}
+		f.refused("module desk links ~/Applications")
+	})
+	t.Run("a home file of a module", func(t *testing.T) {
+		f := newAppImageFixture(t)
+		f.declare("Applications/app", "v1")
+		home := filepath.Join(f.in.Modules["desk"].Dir, "home", "Applications", "app")
+		if err := os.MkdirAll(home, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		f.refused("module desk deploys a file at or above that path from its home/")
+	})
 }

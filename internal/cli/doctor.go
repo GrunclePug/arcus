@@ -251,7 +251,7 @@ func (a *app) doctorHost(o *opts, r *report) {
 		r.problem("%v", err)
 		return
 	}
-	steps, err := a.plan(in)
+	steps, err := a.plan(in, nil)
 	if err != nil {
 		r.problem("planning: %v", err)
 		return
