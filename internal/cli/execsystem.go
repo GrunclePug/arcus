@@ -141,7 +141,9 @@ func (a *app) execSystem(args []string) error {
 	if s == plan.LocalPackages {
 		batch = strings.Split(*local, ",")
 	}
-	sit, steps, err := a.systemPlan(in, h, batch)
+	// Root never projects unexecuted AUR removals: SystemTeardown only inspects
+	// Adopted (disjoint from AURRemove), and later stages verify the live system.
+	sit, steps, err := a.systemPlan(in, h, s, batch, nil)
 	if err != nil {
 		return err
 	}
