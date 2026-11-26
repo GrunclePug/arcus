@@ -382,14 +382,19 @@ func (a *app) homeLinks() (map[string]bool, error) {
 	return present, nil
 }
 
-// situation loads a half's state and queries what its plan depends on.
-func (a *app) situation(in plan.Input, h *half) (plan.Half, error) {
+// situation loads a half's state and queries what its plan depends on. When
+// aurRemoved is set (system half during planning before AURRemove runs), those
+// direct AUR removals are projected out of Installed and RequiredBy so the
+// planned Packages steps match what root sees after AURRemove.
+func (a *app) situation(in plan.Input, h *half, aurRemoved map[string]bool) (plan.Half, error) {
 	st, err := h.loadState()
 	if err != nil {
 		return plan.Half{}, err
 	}
 	s := plan.Half{State: st, Layer: h.layer}
 	// Each query runs only if one of its kinds is declared or owned.
+	// System includes AUR so adoptInfo sees installed AUR packages even
+	// when no pacman or own-build packages are declared or owned.
 	type query struct {
 		kinds []string
 		into  *map[string]bool
@@ -397,7 +402,7 @@ func (a *app) situation(in plan.Input, h *half) (plan.Half, error) {
 	queries := []query{{[]string{state.AUR}, &s.Installed}, {[]string{state.UserUnits}, &s.Units}, {[]string{state.HomeDirs}, &s.Dirs}, {[]string{state.HomeLinks}, &s.Links}}
 	if h.name == "system" {
 		queries = []query{
-			{[]string{state.Pacman, state.Local}, &s.Installed},
+			{[]string{state.Pacman, state.Local, state.AUR}, &s.Installed},
 			{[]string{state.SystemUnits}, &s.Units},
 			{[]string{state.Groups}, &s.Groups},
 		}
@@ -411,6 +416,9 @@ func (a *app) situation(in plan.Input, h *half) (plan.Half, error) {
 			return plan.Half{}, err
 		}
 		*q.into = m
+	}
+	for n := range aurRemoved {
+		delete(s.Installed, n)
 	}
 	// What depends on the packages this plan would remove, so those that
 	// other packages still need can stay.
@@ -426,6 +434,11 @@ func (a *app) situation(in plan.Input, h *half) (plan.Half, error) {
 		if s.RequiredBy, err = system.RequiredBy(leaving); err != nil {
 			return plan.Half{}, err
 		}
+		if len(aurRemoved) > 0 {
+			for pkg, by := range s.RequiredBy {
+				s.RequiredBy[pkg] = slices.DeleteFunc(by, func(n string) bool { return aurRemoved[n] })
+			}
+		}
 	}
 	if h.name == "system" {
 		if err := a.adoptInfo(in, &s); err != nil {
@@ -435,7 +448,7 @@ func (a *app) situation(in plan.Input, h *half) (plan.Half, error) {
 	return s, nil
 }
 
-// adoptInfo reads what marking the packages taken over needs: the user
+// adoptInfo reads what marking the packages to take over needs: the user
 // half's state, when a module lists an AUR package that is installed, then
 // which packages are explicitly installed, when anything is taken over.
 func (a *app) adoptInfo(in plan.Input, s *plan.Half) error {
@@ -458,17 +471,21 @@ func (a *app) adoptInfo(in plan.Input, s *plan.Half) error {
 }
 
 // systemPlan plans the system half, including the removal of installed
-// packages that the packages it installs conflict with. When batch isn't
-// nil, it installs only the own builds it names: the root stage of one
-// batch (see plan.Local).
-func (a *app) systemPlan(in plan.Input, h *half, batch []string) (plan.Half, []plan.Step, error) {
-	sit, err := a.situation(in, h)
+// packages that the packages it installs conflict with. When stage is
+// SystemTeardown or SystemSetup, conflict queries are skipped because those
+// stages never emit RemoveConflicting. When batch isn't nil, it installs only
+// the own builds it names: the root stage of one batch (see plan.Local).
+func (a *app) systemPlan(in plan.Input, h *half, stage plan.Stage, batch []string, aurRemoved map[string]bool) (plan.Half, []plan.Step, error) {
+	sit, err := a.situation(in, h, aurRemoved)
 	if err != nil {
 		return sit, nil, err
 	}
 	steps, err := plan.System(in, sit)
 	if err != nil {
 		return sit, nil, err
+	}
+	if stage == plan.SystemTeardown || stage == plan.SystemSetup {
+		return sit, steps, nil
 	}
 	if batch != nil {
 		steps = slices.DeleteFunc(steps, func(s plan.Step) bool {
@@ -490,6 +507,17 @@ func (a *app) systemPlan(in plan.Input, h *half, batch []string) (plan.Half, []p
 	}
 	if sit.Packages, err = system.Info("-Qi"); err != nil {
 		return sit, nil, err
+	}
+	if len(aurRemoved) > 0 {
+		for n := range aurRemoved {
+			delete(sit.Packages, n)
+		}
+		for q, p := range sit.Packages {
+			if len(p.RequiredBy) > 0 {
+				p.RequiredBy = slices.DeleteFunc(p.RequiredBy, func(n string) bool { return aurRemoved[n] })
+				sit.Packages[q] = p
+			}
+		}
 	}
 	sit.Incoming = map[string]system.Package{}
 	if len(repo) > 0 {
@@ -551,11 +579,7 @@ func (a *app) plan(in plan.Input, note func(string)) ([]plan.Step, error) {
 	}
 	defer lock.Release()
 
-	sit, sys, err := a.systemPlan(in, sh, nil)
-	if err != nil {
-		return nil, err
-	}
-	us, err := a.situation(in, a.userHalf())
+	us, err := a.situation(in, a.userHalf(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -564,7 +588,28 @@ func (a *app) plan(in plan.Input, note func(string)) ([]plan.Step, error) {
 	if err != nil {
 		return nil, err
 	}
+	sit, sys, err := a.systemPlan(in, sh, 0, nil, aurRemovedFrom(usr))
+	if err != nil {
+		return nil, err
+	}
 	return plan.Local(in, sit, plan.Merge(sys, usr))
+}
+
+// aurRemovedFrom returns the AUR packages the user plan will uninstall
+// (excluding Kept), so systemPlan sees the system as AURRemove leaves it.
+func aurRemovedFrom(steps []plan.Step) map[string]bool {
+	var removed map[string]bool
+	for _, s := range steps {
+		if s.Stage == plan.AURRemove && s.Op == plan.Remove && len(s.Names) > 0 {
+			if removed == nil {
+				removed = make(map[string]bool, len(s.Names))
+			}
+			for _, n := range s.Names {
+				removed[n] = true
+			}
+		}
+	}
+	return removed
 }
 
 func (a *app) printPlan(steps []plan.Step) {
@@ -667,7 +712,7 @@ func describe(s plan.Step) string {
 	case plan.Adopt:
 		return fmt.Sprintf("take over %s for %s (already there): %s", kindNames[s.Of], s.Module, names)
 	case plan.MarkAdopted:
-		return fmt.Sprintf("mark the packages taken over as explicitly installed: %s", names)
+		return fmt.Sprintf("mark the packages to take over as explicitly installed: %s", names)
 	case plan.MarkExplicit:
 		return fmt.Sprintf("mark as explicitly installed (a module lists them or they are protected): %s", names)
 	case plan.MarkDeps:

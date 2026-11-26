@@ -32,7 +32,7 @@ type Stage int
 
 const (
 	UserTeardown   Stage = iota + 1 // user units disabled, home layers off
-	SystemTeardown                  // groups left, system units disabled, system layers off
+	SystemTeardown                  // groups left, system units disabled, system layers off, adopted packages marked explicit
 	AURRemove                       // AUR packages removed
 	Packages                        // pacman packages and own builds removed, pacman packages installed
 	Build                           // own builds of one batch made from their recipes (makepkg, as the user)
@@ -196,15 +196,44 @@ func (in Input) protected(kind string) []string {
 	return nil
 }
 
+// otherPackageKind returns the counterpart package kind that a pacman or AUR
+// package can hand over to without uninstalling or demoting it. Own builds
+// stay separate.
+func otherPackageKind(kind string) string {
+	switch kind {
+	case state.Pacman:
+		return state.AUR
+	case state.AUR:
+		return state.Pacman
+	}
+	return ""
+}
+
+// keepOnRelease returns the names of kind that reconciling must not remove:
+// protected packages, plus for pacman and AUR any package a desired module
+// declares in the other kind.
+func (in Input) keepOnRelease(kind string) []string {
+	keep := slices.Clone(in.protected(kind))
+	other := otherPackageKind(kind)
+	if other == "" {
+		return keep
+	}
+	declares := in.Declares(other)
+	for _, name := range in.Desired {
+		keep = append(keep, declares[name]...)
+	}
+	return keep
+}
+
 // Removals returns what reconciling kind would remove, without changing st.
 func (in Input) Removals(st *state.State, kind string, present map[string]bool) []string {
-	return st.Clone().Reconcile(kind, in.Desired, in.Declares(kind), in.protected(kind), present)
+	return st.Clone().Reconcile(kind, in.Desired, in.Declares(kind), in.keepOnRelease(kind), present)
 }
 
 // Reconcile updates st's ownership record for kind as if the removals it
 // returns were carried out.
 func (in Input) Reconcile(st *state.State, kind string, present map[string]bool) []string {
-	return st.Reconcile(kind, in.Desired, in.Declares(kind), in.protected(kind), present)
+	return st.Reconcile(kind, in.Desired, in.Declares(kind), in.keepOnRelease(kind), present)
 }
 
 // Half is the current situation of one half.
@@ -239,6 +268,9 @@ type Half struct {
 // System plans the root half: pacman packages, system files, system units
 // and groups.
 func System(in Input, h Half) ([]Step, error) {
+	if err := checkReleasedLocal(in, h); err != nil {
+		return nil, err
+	}
 	var steps []Step
 	steps = append(steps, removals(in, h.State, Leave, SystemTeardown, state.Groups, h.Groups)...)
 	steps = append(steps, removals(in, h.State, Disable, SystemTeardown, state.SystemUnits, h.Units)...)
@@ -247,12 +279,12 @@ func System(in Input, h Half) ([]Step, error) {
 		return nil, err
 	}
 	steps = append(steps, layers.off...)
+	if names := slices.DeleteFunc(Adopted(in, h), func(n string) bool { return h.Explicit[n] }); len(names) > 0 {
+		steps = append(steps, Step{Stage: SystemTeardown, Op: MarkAdopted, Names: names})
+	}
 	steps = append(steps, packageRemovals(in, h, Remove, Packages, state.Pacman)...)
 	steps = append(steps, packageRemovals(in, h, RemoveLocal, Packages, state.Local)...)
 	steps = append(steps, additions(in, h.State, Install, Packages, state.Pacman, h.Installed)...)
-	if names := slices.DeleteFunc(Adopted(in, h), func(n string) bool { return h.Explicit[n] }); len(names) > 0 {
-		steps = append(steps, Step{Stage: Packages, Op: MarkAdopted, Names: names})
-	}
 	local, err := localInstalls(in, h)
 	if err != nil {
 		return nil, err
@@ -262,6 +294,27 @@ func System(in Input, h Half) ([]Step, error) {
 	steps = append(steps, additions(in, h.State, Enable, SystemSetup, state.SystemUnits, h.Units)...)
 	steps = append(steps, additions(in, h.State, Join, SystemSetup, state.Groups, h.Groups)...)
 	return steps, nil
+}
+
+// checkReleasedLocal refuses releasing an installed non-protected own build
+// while a desired module lists the same package under pacman or AUR: otherwise
+// RemoveLocal would uninstall or demote it while the other kind plans Adopt.
+func checkReleasedLocal(in Input, h Half) error {
+	released := in.Removals(h.State, state.Local, h.Installed)
+	if len(released) == 0 {
+		return nil
+	}
+	for _, kind := range []string{state.Pacman, state.AUR} {
+		declares := in.Declares(kind)
+		for _, mod := range in.Desired {
+			for _, pkg := range declares[mod] {
+				if slices.Contains(released, pkg) {
+					return fmt.Errorf("own build %s is being released while module %s lists it under %s; apply once without any pacman or aur entry for %s (and make sure nothing still depends on it), then add it back", pkg, mod, kind, pkg)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // User plans the user half: AUR packages, home files and user units.
@@ -1048,8 +1101,12 @@ func handOvers(in Input, st *state.State, kind string, present map[string]bool) 
 				moves = append(moves, fmt.Sprintf("%s: %s → %s", n, owner, to))
 			case present != nil && !present[n]:
 				moves = append(moves, fmt.Sprintf("%s: %s, already gone, forgotten", n, owner))
-			default:
+			case slices.Contains(in.protected(kind), n):
 				moves = append(moves, fmt.Sprintf("%s: %s, protected and kept, forgotten", n, owner))
+			case otherPackageKind(kind) != "":
+				moves = append(moves, fmt.Sprintf("%s: %s, kept for %s, forgotten", n, owner, otherPackageKind(kind)))
+			default:
+				moves = append(moves, fmt.Sprintf("%s: %s, kept, forgotten", n, owner))
 			}
 		}
 	}
@@ -1114,7 +1171,7 @@ func Adopted(in Input, h Half) []string {
 		}
 	}
 	slices.Sort(names)
-	return names
+	return slices.Compact(names)
 }
 
 // localInstalls plans one install per own build that is missing, was built

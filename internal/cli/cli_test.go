@@ -856,8 +856,8 @@ func TestAdoptMarksExplicit(t *testing.T) {
 
 	must(t, e.run("plan", "m"))
 	for _, want := range []string{
+		"root  mark the packages to take over as explicitly installed: applet foot\n",
 		"root  take over packages for m (already there): foot wmenu",
-		"root  mark the packages taken over as explicitly installed: applet foot\n",
 		"user  take over AUR packages for m (already there): applet",
 	} {
 		if !strings.Contains(e.out.String(), want) {
@@ -1895,4 +1895,325 @@ func TestOwnBuildBatchKeepsWhatItsPackagesNeed(t *testing.T) {
 		t.Fatalf("the batch ran:\n%s", log)
 	}
 	contains(t, e.sys.Packages(), "x")
+}
+
+// Adopted packages are marked explicitly installed in SystemTeardown before
+// AUR or pacman removals run, so -Rns never orphans a package being taken over.
+func TestRemovalCascadeKeepsAdopted(t *testing.T) {
+	t.Run("AUR removal cascade to pacman adopt", func(t *testing.T) {
+		e := newEnv(t)
+		e.module("a", "[packages]\naur = [\"applet\"]\n", nil)
+		must(t, e.run("on", "-y", "a"))
+		e.sys.SetPackages(append(e.sys.Packages(), "foot")...)
+		e.sys.SetDeps("foot")
+		e.sys.SetRequires("applet foot")
+		e.module("b", "conflicts = [\"a\"]\n[packages]\npacman = [\"foot\"]\n", nil)
+
+		must(t, e.run("on", "-y", "b"))
+		contains(t, e.sys.Packages(), "foot")
+		lacks(t, e.sys.Packages(), "applet")
+		lacks(t, e.sys.Deps(), "foot")
+		contains(t, e.state(true).Owned[state.Pacman]["b"], "foot")
+		must(t, e.run("plan"))
+		if !strings.Contains(e.out.String(), "Nothing to do.") {
+			t.Errorf("plan after on:\n%s", e.out.String())
+		}
+		must(t, e.run("doctor"))
+	})
+
+	t.Run("AUR-only adoption cascade with no pacman packages", func(t *testing.T) {
+		e := newEnv(t)
+		e.module("a", "[packages]\naur = [\"applet\"]\n", nil)
+		must(t, e.run("on", "-y", "a"))
+		e.sys.SetPackages(append(e.sys.Packages(), "helper")...)
+		e.sys.SetDeps("helper")
+		e.sys.SetRequires("applet helper")
+		e.module("b", "conflicts = [\"a\"]\n[packages]\naur = [\"helper\"]\n", nil)
+
+		must(t, e.run("on", "-y", "b"))
+		contains(t, e.sys.Packages(), "helper")
+		lacks(t, e.sys.Packages(), "applet")
+		lacks(t, e.sys.Deps(), "helper")
+		contains(t, e.state(false).Owned[state.AUR]["b"], "helper")
+	})
+
+	t.Run("pacman swap cascade to pacman adopt", func(t *testing.T) {
+		e := newEnv(t)
+		e.module("a", "[packages]\npacman = [\"sway\"]\n", nil)
+		must(t, e.run("on", "-y", "a"))
+		e.sys.SetPackages(append(e.sys.Packages(), "foot")...)
+		e.sys.SetDeps("foot")
+		e.sys.SetRequires("sway foot")
+		e.module("b", "conflicts = [\"a\"]\n[packages]\npacman = [\"foot\"]\n", nil)
+
+		must(t, e.run("on", "-y", "b"))
+		contains(t, e.sys.Packages(), "foot")
+		lacks(t, e.sys.Packages(), "sway")
+		lacks(t, e.sys.Deps(), "foot")
+		contains(t, e.state(true).Owned[state.Pacman]["b"], "foot")
+	})
+}
+
+// AURRemove runs before Packages, so planning projects direct AUR removals out
+// of Conflicts and RequiredBy while SystemTeardown skips conflict queries.
+func TestAURRemoveProjectedInPackages(t *testing.T) {
+	t.Run("conflicts and SystemTeardown skips conflict queries", func(t *testing.T) {
+		e := newEnv(t)
+		e.module("a", "[packages]\naur = [\"foo-git\", \"applet\", \"kept-aur\"]\n", map[string]string{
+			"system/etc/a.conf": "a",
+		})
+		must(t, e.run("on", "-y", "a"))
+		e.sys.SetPackages(append(e.sys.Packages(), "old", "stay")...)
+		e.sys.SetRequires("applet old", "stay kept-aur")
+		e.sys.SetMeta("foo conflicts foo-git", "foo conflicts old", "bar conflicts kept-aur")
+		e.module("b", "conflicts = [\"a\"]\n[packages]\npacman = [\"foo\", \"bar\"]\n", nil)
+
+		must(t, e.run("on", "-n", "b"))
+		out := e.out.String()
+		if strings.Contains(out, "x foo-git:") {
+			t.Errorf("plan should not RemoveConflicting outgoing AUR pkg foo-git:\n%s", out)
+		}
+		if strings.Contains(out, "needed by applet") {
+			t.Errorf("plan should strip outgoing AUR pkg applet from needed by:\n%s", out)
+		}
+		if !strings.Contains(out, "x kept-aur: conflicts with bar; needed by stay") {
+			t.Errorf("plan should still RemoveConflicting kept-aur:\n%s", out)
+		}
+
+		// Wrap sudo to observe calls made specifically during SystemTeardown.
+		a := e.app("")
+		sudo := a.sudo
+		var teardownLog []string
+		a.sudo = func(args []string) error {
+			before := len(e.sys.Log())
+			err := sudo(args)
+			if i := slices.Index(args, "-stage"); i >= 0 && i+1 < len(args) && args[i+1] == strconv.Itoa(int(plan.SystemTeardown)) {
+				teardownLog = append(teardownLog, e.sys.Log()[before:]...)
+			}
+			return err
+		}
+		must(t, a.run([]string{"on", "-y", "b"}))
+		for _, line := range teardownLog {
+			if line == "pacman -Qi" || strings.HasPrefix(line, "pacman -Si ") {
+				t.Errorf("SystemTeardown ran conflict query %q", line)
+			}
+		}
+		contains(t, e.sys.Packages(), "foo", "bar", "stay")
+		lacks(t, e.sys.Packages(), "foo-git", "applet", "old", "kept-aur")
+		must(t, e.run("plan"))
+		if !strings.Contains(e.out.String(), "Nothing to do.") {
+			t.Errorf("plan after on:\n%s", e.out.String())
+		}
+	})
+
+	t.Run("RequiredBy and Kept with sole and shared AUR dependers", func(t *testing.T) {
+		e := newEnv(t)
+		e.module("a", "[packages]\naur = [\"applet\"]\npacman = [\"bar\", \"shared\"]\n", nil)
+		must(t, e.run("on", "-y", "a"))
+		e.sys.SetPackages(append(e.sys.Packages(), "steam")...)
+		e.sys.SetRequires("applet bar", "applet shared", "steam shared")
+
+		must(t, e.run("off", "-n", "a"))
+		out := e.out.String()
+		if !strings.Contains(out, "= shared: needed by steam\n") {
+			t.Errorf("plan should omit outgoing applet from shared's needed by:\n%s", out)
+		}
+		if strings.Contains(out, "= bar:") {
+			t.Errorf("plan should remove bar instead of keeping it:\n%s", out)
+		}
+
+		must(t, e.run("off", "-y", "a"))
+		lacks(t, e.sys.Packages(), "applet", "bar")
+		contains(t, e.sys.Packages(), "shared", "steam")
+		contains(t, e.sys.Deps(), "shared")
+		must(t, e.run("plan"))
+		if !strings.Contains(e.out.String(), "Nothing to do.") {
+			t.Errorf("plan after off:\n%s", e.out.String())
+		}
+	})
+
+	t.Run("package owned in both pacman and AUR released together", func(t *testing.T) {
+		e := newEnv(t)
+		e.sys.SetPackages("dup")
+		e.module("a", "[packages]\naur = [\"dup\"]\npacman = [\"dup\"]\n", nil)
+		must(t, e.run("on", "-y", "a"))
+		contains(t, e.state(true).Owned[state.Pacman]["a"], "dup")
+		contains(t, e.state(false).Owned[state.AUR]["a"], "dup")
+
+		must(t, e.run("off", "-y", "a"))
+		lacks(t, e.sys.Packages(), "dup")
+		if len(e.state(true).Owned) != 0 || len(e.state(false).Owned) != 0 {
+			t.Errorf("state left behind: sys=%v usr=%v", e.state(true).Owned, e.state(false).Owned)
+		}
+	})
+}
+
+// Moving a package between pacman and AUR hands ownership over without
+// uninstalling or demoting it to --asdeps.
+func TestCrossKindPacmanAURHandOver(t *testing.T) {
+	t.Run("AUR to pacman with outgoing depender (explicit and dep)", func(t *testing.T) {
+		for _, dep := range []bool{false, true} {
+			name := "explicit"
+			if dep {
+				name = "asdeps"
+			}
+			t.Run(name, func(t *testing.T) {
+				e := newEnv(t)
+				e.module("a", "[packages]\naur = [\"foo\"]\npacman = [\"bar\"]\n", nil)
+				must(t, e.run("on", "-y", "a"))
+				if dep {
+					e.sys.SetDeps("foo")
+				}
+				e.sys.SetRequires("bar foo")
+				e.module("b", "conflicts = [\"a\"]\n[packages]\npacman = [\"foo\"]\n", nil)
+
+				must(t, e.run("on", "-y", "b"))
+				contains(t, e.sys.Packages(), "foo")
+				lacks(t, e.sys.Packages(), "bar")
+				lacks(t, e.sys.Deps(), "foo")
+				contains(t, e.state(true).Owned[state.Pacman]["b"], "foo")
+				if len(e.state(false).Owned[state.AUR]) != 0 {
+					t.Errorf("AUR state still owns: %v", e.state(false).Owned[state.AUR])
+				}
+				for _, line := range e.sys.Log() {
+					if strings.Contains(line, "--asdeps") && strings.Contains(line, "foo") {
+						t.Errorf("foo was demoted: %s", line)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("AUR to pacman with staying depender", func(t *testing.T) {
+		e := newEnv(t)
+		e.module("a", "[packages]\naur = [\"foo\"]\n", nil)
+		must(t, e.run("on", "-y", "a"))
+		e.sys.SetPackages(append(e.sys.Packages(), "stay")...)
+		e.sys.SetRequires("stay foo")
+		e.module("b", "conflicts = [\"a\"]\n[packages]\npacman = [\"foo\"]\n", nil)
+
+		must(t, e.run("on", "-y", "b"))
+		contains(t, e.sys.Packages(), "foo", "stay")
+		lacks(t, e.sys.Deps(), "foo")
+		contains(t, e.state(true).Owned[state.Pacman]["b"], "foo")
+	})
+
+	t.Run("mixed AUR removal and pacman hand-over", func(t *testing.T) {
+		e := newEnv(t)
+		e.module("a", "[packages]\naur = [\"applet\", \"foo\"]\n", nil)
+		must(t, e.run("on", "-y", "a"))
+		e.sys.SetRequires("applet foo")
+		e.module("b", "conflicts = [\"a\"]\n[packages]\npacman = [\"foo\"]\n", nil)
+
+		must(t, e.run("on", "-y", "b"))
+		contains(t, e.sys.Packages(), "foo")
+		lacks(t, e.sys.Packages(), "applet")
+		lacks(t, e.sys.Deps(), "foo")
+		contains(t, e.state(true).Owned[state.Pacman]["b"], "foo")
+		if len(e.state(false).Owned[state.AUR]) != 0 {
+			t.Errorf("AUR state still owns: %v", e.state(false).Owned[state.AUR])
+		}
+		for _, line := range e.sys.Log() {
+			if strings.Contains(line, "-Rns") && strings.Contains(line, "foo") {
+				t.Errorf("foo was passed to -Rns: %s", line)
+			}
+		}
+	})
+
+	t.Run("pacman to AUR unrequired and with staying depender", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			dep     bool
+			staying bool
+		}{
+			{"explicit unrequired", false, false},
+			{"asdeps with staying depender", true, true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				e := newEnv(t)
+				e.module("a", "[packages]\npacman = [\"foo\"]\n", nil)
+				must(t, e.run("on", "-y", "a"))
+				if tc.dep {
+					e.sys.SetDeps("foo")
+				}
+				if tc.staying {
+					e.sys.SetPackages(append(e.sys.Packages(), "stay")...)
+					e.sys.SetRequires("stay foo")
+				}
+				e.module("b", "conflicts = [\"a\"]\n[packages]\naur = [\"foo\"]\n", nil)
+
+				must(t, e.run("on", "-y", "b"))
+				contains(t, e.sys.Packages(), "foo")
+				lacks(t, e.sys.Deps(), "foo")
+				contains(t, e.state(false).Owned[state.AUR]["b"], "foo")
+				if len(e.state(true).Owned[state.Pacman]) != 0 {
+					t.Errorf("pacman state still owns: %v", e.state(true).Owned[state.Pacman])
+				}
+				for _, line := range e.sys.Log() {
+					if strings.Contains(line, "--asdeps") && strings.Contains(line, "foo") {
+						t.Errorf("foo was demoted: %s", line)
+					}
+				}
+			})
+		}
+	})
+}
+
+// Releasing a local own build while another module lists the same package
+// under pacman or AUR refuses before anything runs.
+func TestRefusesLocalCrossKindMove(t *testing.T) {
+	e := newEnv(t)
+	t.Setenv("XDG_CACHE_HOME", "")
+	e.module("a", "[packages]\nlocal = [\"foo\"]\naur = [\"applet\"]\n", map[string]string{
+		"pkg/foo/PKGBUILD": "pkgname=foo\npkgver=1\npkgrel=1\n",
+	})
+	must(t, e.run("on", "-y", "a"))
+	e.sys.SetRequires("applet foo")
+	e.module("b", "conflicts = [\"a\"]\n[packages]\npacman = [\"foo\"]\n", nil)
+
+	err := e.run("on", "-y", "b")
+	if err == nil || !strings.Contains(err.Error(), "own build foo is being released while module b lists it under pacman") {
+		t.Fatalf("err = %v", err)
+	}
+	contains(t, e.sys.Packages(), "foo", "applet")
+	if got := e.hostModules(); !slices.Equal(got, []string{"a"}) {
+		t.Errorf("host modules changed on refusal: %v", got)
+	}
+}
+
+// exec-system never projects unexecuted AUR removals: if AURRemove has not run
+// yet, invoking the Packages stage with the projected hash must refuse.
+func TestExecSystemPackagesRefusesWithoutAURRemove(t *testing.T) {
+	e := newEnv(t)
+	e.module("a", "[packages]\naur = [\"foo-git\"]\n", nil)
+	must(t, e.run("on", "-y", "a"))
+	e.sys.SetMeta("foo conflicts foo-git")
+	e.module("b", "conflicts = [\"a\"]\n[packages]\npacman = [\"foo\"]\n", nil)
+
+	a := e.app("")
+	must(t, a.load(&opts{}))
+	in, err := a.input([]string{"b"})
+	must(t, err)
+	steps, err := a.plan(in, nil)
+	must(t, err)
+	pkgSteps := plan.Filter(steps, plan.Packages)
+	for _, s := range pkgSteps {
+		if s.Op == plan.RemoveConflicting {
+			t.Fatalf("preview did not project out foo-git: %+v", pkgSteps)
+		}
+	}
+
+	err = a.sudo([]string{
+		"-stage", strconv.Itoa(int(plan.Packages)),
+		"-hash", plan.Hash(pkgSteps),
+		"-home", e.home,
+		"-config", filepath.Join(e.home, ".config", "arcus"),
+		"-state", filepath.Join(e.home, ".local", "state", "arcus"),
+		"--", "b",
+	})
+	if err == nil || !strings.Contains(err.Error(), "changed since the plan was shown") {
+		t.Fatalf("exec-system without AURRemove = %v", err)
+	}
+	lacks(t, e.sys.Packages(), "foo")
+	contains(t, e.sys.Packages(), "foo-git")
 }

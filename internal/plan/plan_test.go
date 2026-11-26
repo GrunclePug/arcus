@@ -139,7 +139,7 @@ func TestMarkAdopted(t *testing.T) {
 		}
 		for _, s := range steps {
 			if s.Op == MarkAdopted {
-				if s.Stage != Packages {
+				if s.Stage != SystemTeardown {
 					t.Errorf("stage = %v", s.Stage)
 				}
 				return s.Names
@@ -154,7 +154,7 @@ func TestMarkAdopted(t *testing.T) {
 	if got := marks(h); !slices.Equal(got, []string{"aur-dep", "dep"}) {
 		t.Errorf("marked = %v", got)
 	}
-	h.User = nil // no AUR package is installed: the user half isn't read
+	h.User = nil // no module lists an AUR package: the user half isn't read
 	if got := marks(h); !slices.Equal(got, []string{"dep"}) {
 		t.Errorf("marked without the user half = %v", got)
 	}
@@ -189,11 +189,11 @@ func TestSystemPackagesAndGroups(t *testing.T) {
 	}
 	want := []Step{
 		{Stage: SystemTeardown, Op: Leave, Names: []string{"input"}},
+		{Stage: SystemTeardown, Op: MarkAdopted, Names: []string{"wmenu"}},
 		{Stage: Packages, Op: Remove, Names: []string{"oldpkg"}}, // go moves to a, which declares it
 		{Stage: Packages, Op: Adopt, Of: state.Pacman, Module: "a", Names: []string{"wmenu"}},
 		{Stage: Packages, Op: Install, Module: "a", Names: []string{"foot"}},
 		{Stage: Packages, Op: Install, Module: "b", Names: []string{"river"}},
-		{Stage: Packages, Op: MarkAdopted, Names: []string{"wmenu"}},
 		// No layer steps: neither module has a system/ tree.
 		{Stage: SystemSetup, Op: Join, Module: "b", Names: []string{"video"}},
 	}
@@ -1026,4 +1026,116 @@ func TestAppImagePlanRefuses(t *testing.T) {
 		}
 		f.refused("module desk deploys a file at or above that path from its home/")
 	})
+}
+
+// Moving a package between pacman and AUR releases ownership via HandOver
+// without removing it, while protected packages still report protected.
+func TestCrossKindHandOver(t *testing.T) {
+	t.Run("aur to pacman", func(t *testing.T) {
+		modules := module.Set{"a": {Name: "a"}, "b": {Name: "b"}}
+		modules["b"].Packages.Pacman = []string{"foo"}
+		st := &state.State{}
+		st.Own(state.AUR, "a", []string{"foo"})
+		in := Input{Desired: []string{"b"}, Modules: modules}
+		h := Half{State: st, Layer: layer.NewHome(t.TempDir(), t.TempDir(), nil), Installed: set("foo")}
+		steps, err := User(in, h)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []Step{{Stage: AURRemove, Op: HandOver, Of: state.AUR, Changes: []string{"foo: a, kept for pacman, forgotten"}}}
+		if !reflect.DeepEqual(steps, want) {
+			t.Fatalf("got  %+v\nwant %+v", steps, want)
+		}
+	})
+
+	t.Run("same module pacman to aur", func(t *testing.T) {
+		modules := module.Set{"a": {Name: "a"}}
+		modules["a"].Packages.AUR = []string{"foo"}
+		st := &state.State{}
+		st.Own(state.Pacman, "a", []string{"foo"})
+		in := Input{Desired: []string{"a"}, Modules: modules}
+		h := Half{State: st, Layer: layer.NewSystem(t.TempDir(), t.TempDir(), nil), Installed: set("foo"), Explicit: set("foo")}
+		steps, err := System(in, h)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []Step{{Stage: Packages, Op: HandOver, Of: state.Pacman, Changes: []string{"foo: a, kept for aur, forgotten"}}}
+		if !reflect.DeepEqual(steps, want) {
+			t.Fatalf("got  %+v\nwant %+v", steps, want)
+		}
+	})
+
+	t.Run("protected takes precedence over cross-kind", func(t *testing.T) {
+		modules := module.Set{"a": {Name: "a"}, "b": {Name: "b"}}
+		modules["b"].Packages.Pacman = []string{"foo"}
+		st := &state.State{}
+		st.Own(state.AUR, "a", []string{"foo"})
+		in := Input{Desired: []string{"b"}, Modules: modules, Protected: []string{"foo"}}
+		h := Half{State: st, Layer: layer.NewHome(t.TempDir(), t.TempDir(), nil), Installed: set("foo")}
+		steps, err := User(in, h)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []Step{{Stage: AURRemove, Op: HandOver, Of: state.AUR, Changes: []string{"foo: a, protected and kept, forgotten"}}}
+		if !reflect.DeepEqual(steps, want) {
+			t.Fatalf("got  %+v\nwant %+v", steps, want)
+		}
+	})
+
+	t.Run("Adopted deduplicates a package in both pacman and aur", func(t *testing.T) {
+		modules := module.Set{"a": {Name: "a"}}
+		modules["a"].Packages.Pacman = []string{"foo"}
+		modules["a"].Packages.AUR = []string{"foo"}
+		in := Input{Desired: []string{"a"}, Modules: modules}
+		h := Half{State: &state.State{}, User: &state.State{}, Installed: set("foo")}
+		if got := Adopted(in, h); !slices.Equal(got, []string{"foo"}) {
+			t.Fatalf("adopted = %v, want [foo]", got)
+		}
+	})
+}
+
+// Releasing an installed non-protected own build while a desired module lists
+// the same package under pacman or AUR is refused at plan time.
+func TestRefusesReleasedLocalListedElsewhere(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		desired   []string
+		pacman    map[string][]string
+		aur       map[string][]string
+		reqBy     map[string][]string
+		protected []string
+		wantErr   string
+	}{
+		{"local to pacman", []string{"b"}, map[string][]string{"b": {"foo"}}, nil, nil, nil, "own build foo is being released while module b lists it under pacman"},
+		{"local to aur when kept", []string{"b"}, nil, map[string][]string{"b": {"foo"}}, map[string][]string{"foo": {"stay"}}, nil, "own build foo is being released while module b lists it under aur"},
+		{"same module local to pacman", []string{"a"}, map[string][]string{"a": {"foo"}}, nil, nil, nil, "own build foo is being released while module a lists it under pacman"},
+		{"protected own build allowed", []string{"b"}, map[string][]string{"b": {"foo"}}, nil, nil, []string{"foo"}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			modules := module.Set{"a": {Name: "a"}, "b": {Name: "b"}}
+			for m, pkgs := range tc.pacman {
+				modules[m].Packages.Pacman = pkgs
+			}
+			for m, pkgs := range tc.aur {
+				modules[m].Packages.AUR = pkgs
+			}
+			st := &state.State{}
+			st.Own(state.Local, "a", []string{"foo"})
+			in := Input{Desired: tc.desired, Modules: modules, Protected: tc.protected}
+			h := Half{
+				State:      st,
+				Layer:      layer.NewSystem(t.TempDir(), t.TempDir(), nil),
+				Installed:  set("foo"),
+				RequiredBy: tc.reqBy,
+				Explicit:   set("foo"),
+			}
+			_, err := System(in, h)
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("unexpected err: %v", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Fatalf("err = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
 }
