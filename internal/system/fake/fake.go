@@ -5,6 +5,9 @@
 package fake
 
 import (
+	"errors"
+	iofs "io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -14,8 +17,10 @@ import (
 
 // System is a fake system rooted in a temporary directory.
 type System struct {
-	t   *testing.T
-	Dir string
+	t          *testing.T
+	Dir        string
+	Root       string
+	ConfigHome string
 }
 
 // The fakes share one package database, so the AUR helper sees what pacman
@@ -168,22 +173,85 @@ mkdir -p "$PKGDEST"
 cat $(find . -type f | sort) > "$PKGDEST/$pkgname-$pkgver-$pkgrel-x86_64.pkg.tar.zst"
 `
 
+// systemctlScript writes and removes real enablement symlinks inside the
+// sandboxed root/config directories read from $dir/unit-root and
+// $dir/unit-config. Like real systemctl, it leaves top-level links (masks,
+// home/-deployed units) untouched on disable and removes empty *.wants dirs.
+// Unlike real systemctl, enable creates a stub [Unit] file under
+// <root>/usr/lib/systemd/{system,user} when neither the unit nor its template
+// exists yet, and links into multi-user.target.wants or default.target.wants
+// without requiring a WantedBy= line.
 const systemctlScript = `#!/bin/sh
 dir=%DIR%
-echo "systemctl $*" >> "$dir/log"
-db="$dir/units"
-if [ "$1" = --user ]; then db="$dir/user-units"; shift; fi
+printf 'systemctl %s\n' "$*" >> "$dir/log"
+user=0
+if [ "$1" = --user ]; then user=1; shift; fi
 if [ "$1" = --root=/ ]; then shift; fi
 op=$1; shift
-touch "$db"
 case $op in
-  list-unit-files) out=$(while read -r u; do [ -n "$u" ] || continue; p=disabled; grep -qsx "$u" "$db-preset" && p=enabled; echo "$u enabled $p"; done < "$db"); [ -n "$out" ] || exit 1; echo "$out"; exit 0 ;;
+  start|stop) exit 0 ;;
+  enable|disable) ;;
+  *) printf 'fake systemctl: unsupported op %s\n' "$op" >&2; exit 1 ;;
 esac
+root=$(cat "$dir/unit-root")
+cfg=$(cat "$dir/unit-config")
+if [ "$user" = 1 ]; then
+  scope="$cfg/systemd/user"
+  wants="default.target.wants"
+  lib="$root/usr/lib/systemd/user"
+  target_prefix="/usr/lib/systemd/user"
+  data="$(dirname "$cfg")/.local/share/systemd/user"
+else
+  scope="$root/etc/systemd/system"
+  wants="multi-user.target.wants"
+  lib="$root/usr/lib/systemd/system"
+  target_prefix="/usr/lib/systemd/system"
+fi
+has_file() {
+  f=$1
+  if [ "$user" = 1 ]; then
+    for d in "$cfg/systemd/user" "$root/etc/systemd/user" "$data" "$root/usr/local/share/systemd/user" "$root/usr/share/systemd/user" "$root/usr/local/lib/systemd/user" "$root/usr/lib/systemd/user"; do
+      if [ -e "$d/$f" ] || [ -L "$d/$f" ]; then return 0; fi
+    done
+  else
+    for d in "$root/etc/systemd/system" "$root/usr/local/lib/systemd/system" "$root/usr/lib/systemd/system"; do
+      if [ -e "$d/$f" ] || [ -L "$d/$f" ]; then return 0; fi
+    done
+  fi
+  return 1
+}
 for u in "$@"; do
   case $u in -*) continue ;; esac
+  tpl=$u
+  case $u in
+    *@*.*)
+      rest=${u#*@}
+      suffix=.${rest##*.}
+      if [ "$rest" = "$suffix" ]; then
+        printf 'fake systemctl: bare template %s\n' "$u" >&2
+        exit 1
+      fi
+      tpl="${u%%@*}@${suffix}"
+      ;;
+  esac
   case $op in
-    enable) grep -qx "$u" "$db" || echo "$u" >> "$db" ;;
-    disable) grep -vx "$u" "$db" > "$db.tmp"; mv "$db.tmp" "$db" ;;
+    enable)
+      if ! has_file "$u" && ! has_file "$tpl"; then
+        mkdir -p "$lib"
+        printf '[Unit]\n' > "$lib/$tpl"
+      fi
+      mkdir -p "$scope/$wants"
+      ln -sfn "$target_prefix/$tpl" "$scope/$wants/$u"
+      ;;
+    disable)
+      for dep in "$scope"/*.wants "$scope"/*.requires "$scope"/*.upholds; do
+        [ -d "$dep" ] || continue
+        if [ -L "$dep/$u" ]; then
+          rm -f "$dep/$u"
+          rmdir "$dep" 2>/dev/null || true
+        fi
+      done
+      ;;
   esac
 done
 `
@@ -212,10 +280,11 @@ esac
 `
 
 // New installs the fakes in a temporary directory and puts it first on PATH
-// for the rest of the test.
+// for the rest of the test. Unit links default to a sandboxed root inside Dir.
 func New(t *testing.T) *System {
 	t.Helper()
 	s := &System{t: t, Dir: t.TempDir()}
+	s.SetUnitDirs(filepath.Join(s.Dir, "root"), filepath.Join(s.Dir, "root/home/u/.config"))
 	bin := filepath.Join(s.Dir, "bin")
 	if err := os.MkdirAll(bin, 0o755); err != nil {
 		t.Fatal(err)
@@ -298,30 +367,135 @@ func (s *System) SetMeta(lines ...string) { s.set("meta", lines) }
 // SetRequires replaces the dependencies: "<package> <dependency>" pairs.
 func (s *System) SetRequires(pairs ...string) { s.set("requires", pairs) }
 
-// Units returns the enabled system (or user) units, sorted.
+// SetUnitDirs points fake systemctl, SetUnits and Units at the given sandboxed
+// root and XDG_CONFIG_HOME (read dynamically by fake systemctl).
+func (s *System) SetUnitDirs(root, configHome string) {
+	s.Root, s.ConfigHome = root, configHome
+	s.set("unit-root", []string{root})
+	s.set("unit-config", []string{configHome})
+}
+
+func (s *System) unitScope(user bool) (scope, wants, lib, targetPrefix string, search []string) {
+	if user {
+		data := filepath.Join(filepath.Dir(s.ConfigHome), ".local/share/systemd/user")
+		return filepath.Join(s.ConfigHome, "systemd/user"), "default.target.wants",
+			filepath.Join(s.Root, "usr/lib/systemd/user"), "/usr/lib/systemd/user",
+			[]string{
+				filepath.Join(s.ConfigHome, "systemd/user"),
+				filepath.Join(s.Root, "etc/systemd/user"),
+				data,
+				filepath.Join(s.Root, "usr/local/share/systemd/user"),
+				filepath.Join(s.Root, "usr/share/systemd/user"),
+				filepath.Join(s.Root, "usr/local/lib/systemd/user"),
+				filepath.Join(s.Root, "usr/lib/systemd/user"),
+			}
+	}
+	return filepath.Join(s.Root, "etc/systemd/system"), "multi-user.target.wants",
+		filepath.Join(s.Root, "usr/lib/systemd/system"), "/usr/lib/systemd/system",
+		[]string{
+			filepath.Join(s.Root, "etc/systemd/system"),
+			filepath.Join(s.Root, "usr/local/lib/systemd/system"),
+			filepath.Join(s.Root, "usr/lib/systemd/system"),
+		}
+}
+
+func fakeTemplate(unit string) string {
+	at, dot := strings.Index(unit, "@"), strings.LastIndex(unit, ".")
+	if at < 0 || dot < at {
+		return unit
+	}
+	return unit[:at+1] + unit[dot:]
+}
+
+func isDepDir(name string) bool {
+	return strings.HasSuffix(name, ".wants") || strings.HasSuffix(name, ".requires") || strings.HasSuffix(name, ".upholds")
+}
+
+// Units returns the system (or user) units linked in *.wants/*.requires/*.upholds, sorted.
 func (s *System) Units(user bool) []string {
-	if user {
-		return sorted(s.lines("user-units"))
+	scope, _, _, _, _ := s.unitScope(user)
+	entries, err := os.ReadDir(scope)
+	if errors.Is(err, iofs.ErrNotExist) {
+		return nil
 	}
-	return sorted(s.lines("units"))
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	set := map[string]bool{}
+	for _, e := range entries {
+		if !e.IsDir() || !isDepDir(e.Name()) {
+			continue
+		}
+		subs, err := os.ReadDir(filepath.Join(scope, e.Name()))
+		if err != nil {
+			s.t.Fatal(err)
+		}
+		for _, sub := range subs {
+			if sub.Type()&iofs.ModeSymlink != 0 {
+				set[sub.Name()] = true
+			}
+		}
+	}
+	return slices.Sorted(maps.Keys(set))
 }
 
-// SetUnits replaces the enabled system (or user) units.
+// SetUnits replaces the enabled system (or user) units in *.wants/*.requires/*.upholds,
+// preserving unit files, masks and top-level links. Missing stub unit files are
+// written under <Root>/usr/lib/systemd/{system,user} using the template name
+// for instances so they never shadow test-written templates.
 func (s *System) SetUnits(user bool, units ...string) {
-	if user {
-		s.set("user-units", units)
-	} else {
-		s.set("units", units)
+	s.t.Helper()
+	scope, wants, lib, targetPrefix, search := s.unitScope(user)
+	if entries, err := os.ReadDir(scope); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() || !isDepDir(e.Name()) {
+				continue
+			}
+			depDir := filepath.Join(scope, e.Name())
+			subs, err := os.ReadDir(depDir)
+			if err != nil {
+				s.t.Fatal(err)
+			}
+			for _, sub := range subs {
+				if sub.Type()&iofs.ModeSymlink != 0 {
+					if err := os.Remove(filepath.Join(depDir, sub.Name())); err != nil {
+						s.t.Fatal(err)
+					}
+				}
+			}
+			_ = os.Remove(depDir)
+		}
+	} else if !errors.Is(err, iofs.ErrNotExist) {
+		s.t.Fatal(err)
 	}
-}
 
-// SetPresets replaces the system (or user) units that the vendor preset
-// enables; list-unit-files reports every other unit as preset disabled.
-func (s *System) SetPresets(user bool, units ...string) {
-	if user {
-		s.set("user-units-preset", units)
-	} else {
-		s.set("units-preset", units)
+	hasFile := func(name string) bool {
+		for _, d := range search {
+			if _, err := os.Lstat(filepath.Join(d, name)); err == nil {
+				return true
+			}
+		}
+		return false
+	}
+	for _, u := range units {
+		tpl := fakeTemplate(u)
+		if !hasFile(u) && !hasFile(tpl) {
+			if err := os.MkdirAll(lib, 0o755); err != nil {
+				s.t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(lib, tpl), []byte("[Unit]\n"), 0o644); err != nil {
+				s.t.Fatal(err)
+			}
+		}
+		wantsDir := filepath.Join(scope, wants)
+		if err := os.MkdirAll(wantsDir, 0o755); err != nil {
+			s.t.Fatal(err)
+		}
+		link := filepath.Join(wantsDir, u)
+		_ = os.Remove(link)
+		if err := os.Symlink(targetPrefix+"/"+tpl, link); err != nil {
+			s.t.Fatal(err)
+		}
 	}
 }
 

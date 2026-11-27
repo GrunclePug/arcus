@@ -91,9 +91,9 @@ arcus on mine              # takes over what is already there
 arcus clean -n             # shows what's left: dependencies nothing needs any more
 ```
 
-`-unlisted` lists packages installed explicitly (from the repositories in `pacman`, the rest in `aur`), units enabled against their vendor preset and groups, leaving out protected packages and whatever a module that's on lists. A unit that another listed unit enables through `Also=` isn't listed again, and names a module can't hold are left out and shown. It never touches files in `/etc` or `$HOME`. Turning the module off removes everything it lists, so split it into real modules as you go. A package in `aur` that isn't on the AUR, or a unit you wrote yourself, works on this machine but needs its recipe or unit file in the module before it works on another. Units enabled by hand that their vendor preset also enables, such as `systemd-networkd.service`, and template instances enabled by hand, such as `wg-quick@wg0.service`, aren't listed yet; add them yourself.
+`-unlisted` lists packages installed explicitly (from the repositories in `pacman`, the rest in `aur`), enabled system and user units (including stock system defaults such as `getty@tty1.service`, `remote-fs.target` and `systemd-userdbd.socket`, and template instances such as `wg-quick@wg0.service`) and groups, leaving out protected packages and whatever a module that's on lists. A unit that another listed unit enables through `Also=` isn't listed again, and names a module can't hold are left out and shown. User units cover only `$XDG_CONFIG_HOME/systemd/user`, not system-wide package links in `/etc/systemd/user`. It never touches files in `/etc` or `$HOME`. Turning the module off removes everything it lists (including `getty@tty1.service` if left in it), so split it into real modules as you go. A package in `aur` that isn't on the AUR, or a unit you wrote yourself, works on this machine but needs its recipe or unit file in the module before it works on another.
 
-`arcus doctor` also reports what the modules don't account for: a machine module older than what `arcus machine` would write, units enabled against their vendor preset and groups that no module that's on lists (following `Also=` in the unit files), and, with aurlock, approvals no module lists. It only reports these; `-fix` never disables a unit, leaves a group or rewrites the machine module.
+`arcus doctor` also reports what the modules don't account for: a machine module older than what `arcus machine` would write, enabled system units in `/etc/systemd/system` and user units in `$XDG_CONFIG_HOME/systemd/user` and groups that no module that's on lists (following `Also=` in the unit files), and, with aurlock, approvals no module lists. It only reports these; `-fix` never disables a unit, leaves a group or rewrites the machine module. On machines upgraded from an older arcus whose `base` module predates this check, add the system defaults you want kept (`getty@tty1.service`, `remote-fs.target`, `systemd-userdbd.socket`) to `base`. Any user unit a module previously adopted through a global `/etc/systemd/user` link is enabled once in `$XDG_CONFIG_HOME/systemd/user` on the next `apply`.
 
 On the Arch ISO, `arcus-install` opens a TUI that writes an install plan and runs it, or saves it to `/root/plan.toml`. `arcus-install detect` shows the hardware modules a machine needs, `arcus-install check plan.toml` validates a plan against the machine without changing anything, and `arcus-install run plan.toml` installs it.
 
@@ -114,8 +114,8 @@ aur    = []
 local  = []                 # own builds, from pkg/<name>/
 
 [units]
-system = []
-user   = ["mako.service"]
+system = []                 # concrete units or instances (e.g. "getty@tty1.service"), never bare templates ("getty@.service")
+user   = ["mako.service"]   # managed in $XDG_CONFIG_HOME/systemd/user; off leaves package links in /etc/systemd/user alone (now = true still stops the running unit)
 now    = false
 
 [appimages.editor]          # one table per AppImage, downloaded into $HOME

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	iofs "io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -315,8 +316,8 @@ func (a *app) doctorMachineModule(r *report) {
 	}
 }
 
-// doctorUnits reports units enabled outside their vendor preset that no
-// module that's on lists, nor pulls in through Also= in its unit files.
+// doctorUnits reports enabled system or user units that no module that's on
+// lists, nor pulls in through Also= in its unit files.
 func (a *app) doctorUnits(in plan.Input, r *report) {
 	found := false
 	for _, kind := range []string{state.SystemUnits, state.UserUnits} {
@@ -335,14 +336,15 @@ func (a *app) doctorUnits(in plan.Input, r *report) {
 	}
 }
 
-// unlistedUnits returns the system or user units enabled outside their
-// vendor preset that no module that's on lists, nor pulls in through Also=
-// in its unit files, sorted.
+// unlistedUnits returns the enabled system or user units that no module
+// that's on lists, nor pulls in through Also= in its unit files, sorted.
 func (a *app) unlistedUnits(in plan.Input, user bool) ([]string, error) {
-	enabled, err := system.EnabledOffPreset(user)
+	dirs := a.unitDirs(user)
+	enabledSet, err := system.EnabledUnits(a.root, dirs)
 	if err != nil {
 		return nil, err
 	}
+	enabled := slices.Sorted(maps.Keys(enabledSet))
 	kind := state.SystemUnits
 	if user {
 		kind = state.UserUnits
@@ -351,9 +353,13 @@ func (a *app) unlistedUnits(in plan.Input, user bool) ([]string, error) {
 	for _, names := range in.Declares(kind) {
 		declared = append(declared, names...)
 	}
+	withAlso, err := system.WithAlso(a.root, dirs, declared)
+	if err != nil {
+		return nil, err
+	}
 	listed := map[string]bool{}
-	for _, u := range system.WithAlso(a.unitDirs(user), declared) {
-		listed[u], listed[system.Template(u)] = true, true
+	for _, u := range withAlso {
+		listed[u] = true
 	}
 	return slices.DeleteFunc(enabled, func(u string) bool { return listed[u] }), nil
 }

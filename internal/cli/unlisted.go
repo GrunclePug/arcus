@@ -37,8 +37,8 @@ type unlisted struct {
 }
 
 // unlisted collects what no module that's on lists: explicitly installed
-// packages, units enabled outside their vendor preset and the user's
-// groups, as doctor reports them. Without a host file nothing is on.
+// packages, enabled system and user units and the user's groups, as doctor
+// reports them. Without a host file nothing is on.
 func (a *app) unlisted() (*unlisted, error) {
 	in, err := a.selectionOrNone()
 	if err != nil {
@@ -76,7 +76,11 @@ func (a *app) unlisted() (*unlisted, error) {
 		if user {
 			field, list = "units.user", &u.user
 		}
-		*list = collapseAlso(a.unitDirs(user), u.valid(field, units))
+		collapsed, err := collapseAlso(a.root, a.unitDirs(user), u.valid(field, units))
+		if err != nil {
+			return nil, fmt.Errorf("querying units: %w", err)
+		}
+		*list = collapsed
 	}
 
 	groups, err := a.unlistedGroups(in)
@@ -141,27 +145,61 @@ now    = false
 `
 }
 
-// collapseAlso drops each unit that another one in units enables with it
-// through Also=, so a module lists NetworkManager.service and not the
-// units it brings along. Of units that enable each other, the first in
-// sort order stays. The result doesn't depend on the order of units.
-func collapseAlso(dirs, units []string) []string {
+// collapseAlso drops each unit that a retained unit in units enables with it
+// through Also=, so a module lists NetworkManager.service and not the units
+// it brings along. Of units that enable each other, the first in sort order
+// stays. A unit is dropped only when some unit kept in the result covers it.
+// The result doesn't depend on the order of units.
+func collapseAlso(root string, dirs, units []string) ([]string, error) {
 	reach := map[string]map[string]bool{}
 	for _, u := range units {
+		also, err := system.WithAlso(root, dirs, []string{u})
+		if err != nil {
+			return nil, err
+		}
 		r := map[string]bool{}
-		for _, x := range system.WithAlso(dirs, []string{u})[1:] {
-			r[x], r[system.Template(x)] = true, true
+		for _, x := range also[1:] {
+			r[x] = true
 		}
 		reach[u] = r
 	}
-	return slices.DeleteFunc(slices.Clone(units), func(u string) bool {
-		for _, v := range units {
-			if v != u && reach[v][u] && (!reach[u][v] || v < u) {
-				return true
+	kept := map[string]bool{}
+	covered := map[string]bool{}
+	keep := func(u string) {
+		kept[u] = true
+		covered[u] = true
+		for x := range reach[u] {
+			covered[x] = true
+		}
+	}
+	remaining := slices.Clone(units)
+	for len(remaining) > 0 {
+		added := false
+		for _, u := range remaining {
+			drop := false
+			for _, v := range remaining {
+				if v != u && reach[v][u] && (!reach[u][v] || v < u) {
+					drop = true
+					break
+				}
+			}
+			if !drop {
+				keep(u)
+				added = true
 			}
 		}
-		return false
-	})
+		if !added {
+			keep(slices.Min(remaining))
+		}
+		var next []string
+		for _, u := range remaining {
+			if !covered[u] {
+				next = append(next, u)
+			}
+		}
+		remaining = next
+	}
+	return slices.DeleteFunc(slices.Clone(units), func(u string) bool { return !kept[u] }), nil
 }
 
 // selectionOrNone is the host file's selection, or nothing on when there

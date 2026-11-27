@@ -35,9 +35,7 @@ func mutations(log []string) []string {
 				out = append(out, l)
 			}
 		case "systemctl":
-			if !slices.Contains(f, "list-unit-files") {
-				out = append(out, l)
-			}
+			out = append(out, l)
 		case "makepkg", "gpasswd":
 			out = append(out, l)
 		}
@@ -58,16 +56,21 @@ func TestNewUnlisted(t *testing.T) {
 	e.sys.SetRequires("htop lib-needed", "my-aur aur-dep")
 	e.sys.SetForeign("wlr-randr-git", "my-aur", "hand-built", "aur-dep")
 
-	e.sys.SetUnits(false, "seatd.service", "sshd.service", "getty@.service",
+	e.sys.SetUnits(false, "seatd.service", "sshd.service", "getty@tty1.service", "wg-quick@wg0.service",
 		"NetworkManager.service", "NetworkManager-dispatcher.service", "NetworkManager-wait-online.service",
 		"a.service", "b.service", "foo.slice", "helper.service", `mnt-my\x2dshare.mount`)
-	e.sys.SetPresets(false, "getty@.service")
 	e.unitFile("NetworkManager.service", "[Install]\nWantedBy=multi-user.target\nAlso=NetworkManager-dispatcher.service\nAlso=NetworkManager-wait-online.service\n")
 	e.unitFile("a.service", "[Install]\nAlso=b.service\n")
 	e.unitFile("b.service", "[Install]\nAlso=a.service\n")
 	// A unit arcus can't list still doesn't hide what it brings along.
 	e.unitFile("foo.slice", "[Install]\nAlso=helper.service\n")
 	e.sys.SetUnits(true, "mako.service", "syncthing.service")
+	// Global user links in /etc/systemd/user are never captured.
+	globalUserWants := filepath.Join(e.root, "etc/systemd/user/sockets.target.wants")
+	must(t, os.MkdirAll(globalUserWants, 0o755))
+	must(t, os.MkdirAll(filepath.Join(e.root, "usr/lib/systemd/user"), 0o755))
+	must(t, os.WriteFile(filepath.Join(e.root, "usr/lib/systemd/user/pipewire.socket"), []byte("[Unit]\n"), 0o644))
+	must(t, os.Symlink("/usr/lib/systemd/user/pipewire.socket", filepath.Join(globalUserWants, "pipewire.socket")))
 	e.sys.SetGroups(me.Username, "wheel", "users", "video", "audio", "staff", "DomainUsers")
 	e.sys.SetPrimaryGroup("staff")
 
@@ -76,7 +79,7 @@ func TestNewUnlisted(t *testing.T) {
 	out := e.out.String()
 	for _, want := range []string{
 		"Left out (arcus can't manage these names): foo.slice DomainUsers\n",
-		": 2 pacman, 2 aur, 6 units, 1 groups.\n",
+		": 2 pacman, 2 aur, 8 units, 1 groups.\n",
 		"Review it, then 'arcus on mine'.\n",
 		"The machine module isn't on",
 		"'arcus rm mine'",
@@ -95,7 +98,7 @@ func TestNewUnlisted(t *testing.T) {
 	}{
 		{"pacman", m.Packages.Pacman, []string{"htop", "lib-needed"}},
 		{"aur", m.Packages.AUR, []string{"hand-built", "my-aur"}},
-		{"units.system", m.Units.System, []string{"NetworkManager.service", "a.service", "helper.service", `mnt-my\x2dshare.mount`, "sshd.service"}},
+		{"units.system", m.Units.System, []string{"NetworkManager.service", "a.service", "getty@tty1.service", "helper.service", `mnt-my\x2dshare.mount`, "sshd.service", "wg-quick@wg0.service"}},
 		{"units.user", m.Units.User, []string{"syncthing.service"}},
 		{"groups", m.Groups, []string{"audio"}},
 	} {
@@ -115,7 +118,7 @@ func TestNewUnlisted(t *testing.T) {
 	}
 	contains(t, e.state(true).Owned[state.Pacman]["mine"], "htop", "lib-needed")
 	contains(t, e.state(false).Owned[state.AUR]["mine"], "hand-built", "my-aur") // the user half's
-	contains(t, e.state(true).Owned[state.SystemUnits]["mine"], "NetworkManager.service", "a.service", "helper.service", `mnt-my\x2dshare.mount`, "sshd.service")
+	contains(t, e.state(true).Owned[state.SystemUnits]["mine"], "NetworkManager.service", "a.service", "getty@tty1.service", "helper.service", `mnt-my\x2dshare.mount`, "sshd.service", "wg-quick@wg0.service")
 	lacks(t, e.state(true).Owned[state.SystemUnits]["mine"], "NetworkManager-dispatcher.service", "b.service")
 	contains(t, e.state(false).Owned[state.UserUnits]["mine"], "syncthing.service")
 	contains(t, e.state(true).Owned[state.Groups]["mine"], "audio")
@@ -268,7 +271,13 @@ func TestNewUnlistedRefusals(t *testing.T) {
 }
 
 func TestCollapseAlso(t *testing.T) {
-	dirs := []string{t.TempDir()}
+	root := t.TempDir()
+	etcDir := filepath.Join(root, "etc/systemd/system")
+	libDir := filepath.Join(root, "usr/lib/systemd/system")
+	for _, d := range []string{etcDir, libDir} {
+		must(t, os.MkdirAll(d, 0o755))
+	}
+	dirs := []string{etcDir, libDir}
 	for name, content := range map[string]string{
 		"NetworkManager.service": "[Install]\nAlso=NetworkManager-dispatcher.service NetworkManager-wait-online.service\n",
 		"a.service":              "[Install]\nAlso=b.service\n",
@@ -276,13 +285,20 @@ func TestCollapseAlso(t *testing.T) {
 		"c.service":              "[Install]\nAlso=a.service\n",
 		"root.service":           "[Install]\nAlso=mid.service\n",
 		"mid.service":            "[Install]\nAlso=leaf.service\n",
-		"tpl@.service":           "[Install]\nAlso=tpl-helper.service\n",
+		"tpl@.service":           "[Install]\nAlso=tpl-helper.service tpl-sub@%i.service\n",
 		"x.service":              "[Install]\nAlso=y.service\n",
 		"y.service":              "[Install]\nAlso=x.service\n",
 		"z.service":              "[Install]\nAlso=y.service\n",
+		"parent.service":         "[Install]\nAlso=worker@.service\n",
+		"worker@.service":        "[Install]\nDefaultInstance=one\n",
 	} {
-		must(t, os.WriteFile(filepath.Join(dirs[0], name), []byte(content), 0o644))
+		must(t, os.WriteFile(filepath.Join(libDir, name), []byte(content), 0o644))
 	}
+	// Exact instance override adds helper.service; parent.service reaches
+	// worker@one.service through worker@.service (which does NOT list helper.service),
+	// so collapseAlso must keep helper.service when dropping worker@one.service.
+	must(t, os.WriteFile(filepath.Join(etcDir, "worker@one.service"), []byte("[Install]\nAlso=override-helper.service\n"), 0o644))
+
 	for _, c := range []struct {
 		name     string
 		in, want []string
@@ -290,12 +306,14 @@ func TestCollapseAlso(t *testing.T) {
 		{"NetworkManager", []string{"NetworkManager-dispatcher.service", "NetworkManager-wait-online.service", "NetworkManager.service"}, []string{"NetworkManager.service"}},
 		{"cycle keeps the first", []string{"c.service", "b.service", "a.service"}, []string{"a.service"}},
 		{"chain keeps the root", []string{"leaf.service", "mid.service", "root.service"}, []string{"root.service"}},
-		{"instance", []string{"tpl@a.service", "tpl-helper.service"}, []string{"tpl@a.service"}},
+		{"instance and %i", []string{"tpl@a.service", "tpl-helper.service", "tpl-sub@a.service", "tpl-sub@b.service"}, []string{"tpl@a.service", "tpl-sub@b.service"}},
 		{"cycle reached from outside", []string{"x.service", "y.service", "z.service"}, []string{"z.service"}},
 		{"unrelated stay", []string{"sshd.service", "a.service"}, []string{"sshd.service", "a.service"}},
+		{"non-transitive override keeps helper", []string{"parent.service", "worker@one.service", "override-helper.service"}, []string{"override-helper.service", "parent.service"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			got := collapseAlso(dirs, c.in)
+			got, err := collapseAlso(root, dirs, c.in)
+			must(t, err)
 			slices.Sort(got)
 			want := slices.Sorted(slices.Values(c.want))
 			if !slices.Equal(got, want) {
@@ -303,7 +321,8 @@ func TestCollapseAlso(t *testing.T) {
 			}
 			reversed := slices.Clone(c.in)
 			slices.Reverse(reversed)
-			again := collapseAlso(dirs, reversed)
+			again, err := collapseAlso(root, dirs, reversed)
+			must(t, err)
 			slices.Sort(again)
 			if !slices.Equal(again, want) {
 				t.Errorf("reversed input: got %v, want %v", again, want)

@@ -48,13 +48,21 @@ var namePatterns = map[string]*regexp.Regexp{
 	"units.user":      unitNameRegex,
 }
 
+// isUnitTemplate reports whether name is a bare systemd template unit (such as
+// "getty@.service"), not a concrete instance ("getty@tty1.service").
+func isUnitTemplate(name string) bool {
+	at, dot := strings.Index(name, "@"), strings.LastIndex(name, ".")
+	return at > 0 && dot == at+1 && dot < len(name)-1
+}
+
 // ValidNames splits names into those the manifest list field (such as
 // "units.system") accepts and those it refuses, keeping their order. A
 // field without names refuses everything.
 func ValidNames(field string, names []string) (ok, bad []string) {
 	re := namePatterns[field]
+	unitField := field == "units.system" || field == "units.user"
 	for _, n := range names {
-		if re != nil && re.MatchString(n) {
+		if re != nil && re.MatchString(n) && !(unitField && isUnitTemplate(n)) {
 			ok = append(ok, n)
 		} else {
 			bad = append(bad, n)
@@ -210,9 +218,15 @@ func (m *Module) validate() error {
 		return fmt.Errorf("category: invalid name %q (lowercase letters, digits, '-' and '_')", m.Category)
 	}
 	for _, l := range lists {
+		unitField := l.field == "units.system" || l.field == "units.user"
 		for i, n := range l.names {
 			if !namePatterns[l.field].MatchString(n) {
 				return fmt.Errorf("%s: invalid name %q", l.field, n)
+			}
+			if unitField && isUnitTemplate(n) {
+				at := strings.Index(n, "@")
+				example := n[:at+1] + "instance" + n[at+1:]
+				return fmt.Errorf("%s: %q is a template unit; list a concrete instance instead (such as %q)", l.field, n, example)
 			}
 			if slices.Contains(l.names[:i], n) {
 				return fmt.Errorf("%s: %q is listed twice", l.field, n)
