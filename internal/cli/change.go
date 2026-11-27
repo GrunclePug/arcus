@@ -1065,15 +1065,29 @@ func (a *app) remove(st *state.State, steps []plan.Step, in plan.Input, r *syste
 }
 
 // link creates a home link, and its parent directories. It refuses to
-// replace anything already at the path.
+// replace anything already at the path, and refuses if any ledger records
+// deployed files at, below, or above the path.
 func (a *app) link(name string) error {
 	p, target, ok := module.SplitLink(name)
 	if !ok {
 		return fmt.Errorf("bad link %q", name)
 	}
 	host := filepath.Join(a.paths.Home, p)
+	mods, err := a.userHalf().layer.LedgerCollisions(host, nil)
+	if err != nil {
+		return err
+	}
+	if len(mods) > 0 {
+		pronoun := mods[0]
+		if len(mods) > 1 {
+			pronoun = "them"
+		}
+		return fmt.Errorf("~/%s has files deployed by %s; turn %s off or drop the link instead of moving it away", p, strings.Join(mods, ", "), pronoun)
+	}
 	if _, err := os.Lstat(host); err == nil {
 		return fmt.Errorf("~/%s already exists and isn't a link to ~/%s: move it away, then apply again", p, target)
+	} else if !errors.Is(err, iofs.ErrNotExist) {
+		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(host), 0o755); err != nil {
 		return err

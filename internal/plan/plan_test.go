@@ -1139,3 +1139,218 @@ func TestRefusesReleasedLocalListedElsewhere(t *testing.T) {
 		})
 	}
 }
+
+func TestHomeLinkCollisions(t *testing.T) {
+	setup := func(t *testing.T) (string, string, map[string]string, module.Set) {
+		t.Helper()
+		root := t.TempDir()
+		home := filepath.Join(root, "home")
+		stateDir := filepath.Join(root, "state")
+		mustMkdir := func(p string) {
+			if err := os.MkdirAll(p, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		mustMkdir(home)
+		mustMkdir(stateDir)
+		dirs := map[string]string{
+			"a": filepath.Join(root, "mods", "a"),
+			"b": filepath.Join(root, "mods", "b"),
+			"c": filepath.Join(root, "mods", "c"),
+		}
+		for _, d := range dirs {
+			mustMkdir(d)
+		}
+		mods := module.Set{
+			"a": {Name: "a", Dir: dirs["a"]},
+			"b": {Name: "b", Dir: dirs["b"]},
+			"c": {Name: "c", Dir: dirs["c"]},
+		}
+		return home, stateDir, dirs, mods
+	}
+	writeFile := func(t *testing.T, p, content string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("desired home file below link", func(t *testing.T) {
+		home, stateDir, dirs, mods := setup(t)
+		writeFile(t, filepath.Join(dirs["a"], "home", ".config/app/rc"), "x")
+		mods["b"].Links = map[string]string{".config/app": "Sync/app"}
+		in := Input{Desired: []string{"a", "b"}, Modules: mods}
+		h := Half{State: &state.State{}, Layer: layer.NewHome(home, stateDir, dirs)}
+		if _, err := User(in, h); err == nil || !strings.Contains(err.Error(), "deploys files there from its home/") {
+			t.Fatalf("err = %v, want home/ clash", err)
+		}
+	})
+
+	t.Run("desired home file above link", func(t *testing.T) {
+		home, stateDir, dirs, mods := setup(t)
+		writeFile(t, filepath.Join(dirs["a"], "home", ".config/app"), "x")
+		mods["b"].Links = map[string]string{".config/app/sub": "Sync/sub"}
+		in := Input{Desired: []string{"a", "b"}, Modules: mods}
+		h := Half{State: &state.State{}, Layer: layer.NewHome(home, stateDir, dirs)}
+		if _, err := User(in, h); err == nil || !strings.Contains(err.Error(), "deploys files there from its home/") {
+			t.Fatalf("err = %v, want home/ clash", err)
+		}
+	})
+
+	t.Run("empty dir and pycache only do not false-positive", func(t *testing.T) {
+		home, stateDir, dirs, mods := setup(t)
+		writeFile(t, filepath.Join(dirs["a"], "home", ".config/app/__pycache__/m.cpython-314.pyc"), "pyc")
+		if err := os.MkdirAll(filepath.Join(dirs["a"], "home", ".config/empty"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// A regular file named home/ must not look like a file deployed at $HOME.
+		if err := os.WriteFile(filepath.Join(dirs["c"], "home"), []byte("not a dir"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mods["b"].Links = map[string]string{".config/app": "Sync/app", ".config/empty": "Sync/empty"}
+		in := Input{Desired: []string{"a", "b", "c"}, Modules: mods}
+		h := Half{State: &state.State{}, Layer: layer.NewHome(home, stateDir, dirs)}
+		if _, err := User(in, h); err != nil {
+			t.Fatalf("unexpected err for empty/pycache/non-dir home: %v", err)
+		}
+	})
+
+	t.Run("symlinked parent alias still collides with deployed files", func(t *testing.T) {
+		home, stateDir, dirs, mods := setup(t)
+		writeFile(t, filepath.Join(dirs["a"], "home", "real/app/rc"), "from a")
+		st := &state.State{Modules: []string{"a"}}
+		l := layer.NewHome(home, stateDir, dirs)
+		if err := l.Activate(context.Background(), "a", nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(home, "real"), filepath.Join(home, "alias")); err != nil {
+			t.Fatal(err)
+		}
+		mods["b"].Links = map[string]string{"alias/app": "Sync/app"}
+		in := Input{Desired: []string{"a", "b"}, Modules: mods}
+		h := Half{State: st, Layer: l}
+		if _, err := User(in, h); err == nil || !strings.Contains(err.Error(), "deploys files there from its home/") {
+			t.Fatalf("tree alias clash err = %v, want home/ clash", err)
+		}
+		// Remove a/home so only the ledger records real/app/rc.
+		if err := os.RemoveAll(filepath.Join(dirs["a"], "home")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := User(in, h); err == nil || !strings.Contains(err.Error(), "still has files deployed there") {
+			t.Fatalf("ledger alias clash err = %v, want ledger clash", err)
+		}
+	})
+
+	t.Run("ledger entry behind moved symlink collides with link on real target", func(t *testing.T) {
+		home, stateDir, dirs, mods := setup(t)
+		writeFile(t, filepath.Join(home, "managed/rc"), "orig")
+		writeFile(t, filepath.Join(dirs["a"], "home", "managed/rc"), "from a")
+		st := &state.State{Modules: []string{"a"}}
+		l := layer.NewHome(home, stateDir, dirs)
+		if err := l.Activate(context.Background(), "a", nil); err != nil {
+			t.Fatal(err)
+		}
+		// Move managed -> real and link managed -> real; ledger still records managed/rc(.orig).
+		if err := os.Rename(filepath.Join(home, "managed"), filepath.Join(home, "real")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(home, "real"), filepath.Join(home, "managed")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.RemoveAll(filepath.Join(dirs["a"], "home")); err != nil {
+			t.Fatal(err)
+		}
+		mods["b"].Links = map[string]string{"real/rc.orig": "Sync/orig"}
+		in := Input{Desired: []string{"a", "b"}, Modules: mods}
+		h := Half{State: st, Layer: l}
+		if _, err := User(in, h); err == nil || !strings.Contains(err.Error(), "still has files deployed there") {
+			t.Fatalf("moved-ledger backup clash err = %v, want ledger clash", err)
+		}
+
+		// Moving real -> sync leaves managed -> real dangling; claiming real -> sync must still collide.
+		if err := os.Rename(filepath.Join(home, "real"), filepath.Join(home, "sync")); err != nil {
+			t.Fatal(err)
+		}
+		mods["b"].Links = map[string]string{"real": "sync"}
+		if _, err := User(in, h); err == nil || !strings.Contains(err.Error(), "still has files deployed there") {
+			t.Fatalf("dangling-parent ledger clash err = %v, want ledger clash", err)
+		}
+
+		// Symlink target with ".." after another symlink resolves through the symlinked parent.
+		if err := os.Remove(filepath.Join(home, "managed")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(home, "nested", "sub"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("nested/sub", filepath.Join(home, "jump")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("jump/../real", filepath.Join(home, "managed")); err != nil {
+			t.Fatal(err)
+		}
+		mods["b"].Links = map[string]string{"nested/real": "sync"}
+		if _, err := User(in, h); err == nil || !strings.Contains(err.Error(), "still has files deployed there") {
+			t.Fatalf("nested .. symlink-target ledger clash err = %v, want ledger clash", err)
+		}
+	})
+
+	t.Run("staying ledger Host and Backup clash, Link vs Adopt wording", func(t *testing.T) {
+		home, stateDir, dirs, mods := setup(t)
+		writeFile(t, filepath.Join(home, ".config/app/rc"), "orig")
+		writeFile(t, filepath.Join(dirs["a"], "home", ".config/app/rc"), "from a")
+		st := &state.State{Modules: []string{"a"}}
+		l := layer.NewHome(home, stateDir, dirs)
+		if err := l.Activate(context.Background(), "a", nil); err != nil {
+			t.Fatal(err)
+		}
+		// Drop home file from a so only the ledger (restacking after Link) holds it.
+		if err := os.RemoveAll(filepath.Join(dirs["a"], "home")); err != nil {
+			t.Fatal(err)
+		}
+		mods["b"].Links = map[string]string{".config/app": "Sync/app"}
+		in := Input{Desired: []string{"a", "b"}, Modules: mods}
+		h := Half{State: st, Layer: l}
+		if _, err := User(in, h); err == nil || !strings.Contains(err.Error(), "apply once without the link") {
+			t.Fatalf("Link clash err = %v, want restack/ledger message", err)
+		}
+
+		// Link colliding only with a's recorded Backup path.
+		mods["b"].Links = map[string]string{".config/app/rc.orig": "Sync/orig"}
+		if _, err := User(in, h); err == nil || !strings.Contains(err.Error(), "apply once without the link") {
+			t.Fatalf("Backup clash err = %v, want ledger backup clash", err)
+		}
+
+		// When the link already exists on disk (Adopt), advise turning it back into a real directory.
+		mods["b"].Links = map[string]string{".config/app": "Sync/app"}
+		h.Links = set(".config/app -> Sync/app")
+		if _, err := User(in, h); err == nil || !strings.Contains(err.Error(), "real directory") || strings.Contains(err.Error(), "apply once without the link") {
+			t.Fatalf("Adopt clash err = %v, want real-directory message", err)
+		}
+
+		// Already-owned broken link does not block unrelated applies.
+		st.Own(state.HomeLinks, "b", []string{".config/app -> Sync/app"})
+		if _, err := User(in, h); err != nil {
+			t.Fatalf("already-owned link should not block unrelated plan: %v", err)
+		}
+	})
+
+	t.Run("swap turning off conflicting module is allowed", func(t *testing.T) {
+		home, stateDir, dirs, mods := setup(t)
+		writeFile(t, filepath.Join(dirs["a"], "home", ".config/app/rc"), "from a")
+		st := &state.State{Modules: []string{"a"}}
+		l := layer.NewHome(home, stateDir, dirs)
+		if err := l.Activate(context.Background(), "a", nil); err != nil {
+			t.Fatal(err)
+		}
+		mods["b"].Links = map[string]string{".config/app": "Sync/app"}
+		in := Input{Desired: []string{"b"}, Modules: mods}
+		h := Half{State: st, Layer: l}
+		if _, err := User(in, h); err != nil {
+			t.Fatalf("swap should be allowed: %v", err)
+		}
+	})
+}

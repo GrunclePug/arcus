@@ -157,8 +157,7 @@ func (a *app) execSystem(args []string) error {
 	return a.runSteps(h, sit.State, steps, in, r, *force)
 }
 
-// renameHalf moves a module's layer and records in one half after its
-// directory was renamed.
+// renameHalf moves a module's layer and records in one half.
 func (a *app) renameHalf(h *half, oldName, newName, oldDir, newDir string) error {
 	for _, name := range []string{oldName, newName} {
 		if err := module.ValidateName(name); err != nil {
@@ -167,6 +166,9 @@ func (a *app) renameHalf(h *half, oldName, newName, oldDir, newDir string) error
 	}
 	st, err := h.loadState()
 	if err != nil {
+		return err
+	}
+	if err := h.layer.CheckRename(oldName, newName, st.Modules); err != nil {
 		return err
 	}
 	if err := h.layer.Rename(oldName, newName, oldDir, newDir, st.Modules); err != nil {

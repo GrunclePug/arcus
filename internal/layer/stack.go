@@ -204,11 +204,30 @@ func (s *Stacker) Activate(ctx context.Context, module string, activeStack []str
 		}
 
 		// Re-check right before mutating: the host may have changed since planning.
-		if exists(e.Host) != (e.Backup != "") {
+		if err := s.symlinkProblem(e.Host); err != nil {
+			return err
+		}
+		hostExists, err := statExists(e.Host)
+		if err != nil {
+			return fmt.Errorf("checking %q: %w", e.Host, err)
+		}
+		if hostExists != (e.Backup != "") {
 			return fmt.Errorf("host path %q changed during activation", e.Host)
 		}
+		if e.Backup != "" {
+			backupExists, err := statExists(e.Backup)
+			if err != nil {
+				return fmt.Errorf("checking backup %q: %w", e.Backup, err)
+			}
+			if backupExists {
+				return fmt.Errorf("backup path %q appeared during activation", e.Backup)
+			}
+		}
 
-		created := missingDirs(filepath.Dir(e.Host))
+		created, err := missingDirs(filepath.Dir(e.Host))
+		if err != nil {
+			return err
+		}
 		l.CreatedDirs = append(l.CreatedDirs, created...)
 		l.Entries = append(l.Entries, e)
 		if err := s.saveLedger(l); err != nil {
@@ -286,10 +305,21 @@ func (s *Stacker) Frees(module string, hosts []string, freed map[string]bool) er
 	return nil
 }
 
-// symlinkedParent returns the first existing directory between Target and
-// host that is a symlink, or "". Deploying through one would write wherever
-// it points: into a dotfiles repository, or, for the system half, anywhere.
-func (s *Stacker) symlinkedParent(host string) string {
+const (
+	activateSymlinkAdvice = "remove it first"
+	teardownSymlinkAdvice = "make it a real directory again, with everything that was in it back in place if you moved it"
+)
+
+type symlinkHit struct {
+	dir  string
+	host string
+}
+
+// parentLink returns the first existing directory between Target and host
+// that is a symlink, or "" if none is. Only ErrNotExist and ENOTDIR count as
+// absent; any other Lstat error is returned so unreadable paths aren't treated
+// as missing.
+func (s *Stacker) parentLink(host string) (string, error) {
 	var dirs []string
 	for dir := filepath.Dir(host); dir != s.Target && isWithin(dir, s.Target); dir = filepath.Dir(dir) {
 		dirs = append([]string{dir}, dirs...)
@@ -297,32 +327,216 @@ func (s *Stacker) symlinkedParent(host string) string {
 	for _, dir := range dirs {
 		info, err := os.Lstat(dir)
 		if err != nil {
-			return ""
+			if isAbsent(err) {
+				return "", nil
+			}
+			return "", fmt.Errorf("inspecting %s: %w", dir, err)
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			return dir
+			return dir, nil
 		}
 	}
-	return ""
+	return "", nil
+}
+
+// symlinkedParent returns the first existing directory between Target and
+// host that is a symlink, or "". Deploying through one would write wherever
+// it points: into a dotfiles repository, or, for the system half, anywhere.
+func (s *Stacker) symlinkedParent(host string) string {
+	dir, _ := s.parentLink(host)
+	return dir
+}
+
+// formatSymlinkGroups groups affected paths by their symlinked parent so a
+// moved directory with many files prints one header and advice per directory.
+func formatSymlinkGroups(hits []symlinkHit, advice string) []string {
+	if len(hits) == 0 {
+		return nil
+	}
+	byDir := map[string][]string{}
+	for _, h := range hits {
+		byDir[h.dir] = append(byDir[h.dir], h.host)
+	}
+	dirs := slices.Sorted(maps.Keys(byDir))
+	out := make([]string, 0, len(dirs))
+	for _, dir := range dirs {
+		hosts := byDir[dir]
+		slices.Sort(hosts)
+		hosts = slices.Compact(hosts)
+		target, err := os.Readlink(dir)
+		if err != nil {
+			target = "(unreadable)"
+		}
+		out = append(out, fmt.Sprintf("parent %s is a symlink (to %s); %s:\n    %s", dir, target, advice, strings.Join(hosts, "\n    ")))
+	}
+	return out
+}
+
+func dedupeStrings(in []string) []string {
+	if len(in) < 2 {
+		return in
+	}
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // symlinkProblem refuses teardown of an entry whose host path lies below a
-// directory that has become a symlink since activation, which refuses such a
-// path too. Everything teardown would look at or change there (the
-// deployment, its backup, a lower layer's file) comes through the link, so
-// nothing about the entry can be trusted, not even that nothing is left to do.
+// directory that has become a symlink since activation (or cannot be looked
+// up). Everything teardown would look at or change there comes through the
+// link, so nothing about the entry can be trusted.
 func (s *Stacker) symlinkProblem(host string) error {
-	dir := s.symlinkedParent(host)
+	dir, err := s.parentLink(host)
+	if err != nil {
+		return err
+	}
 	if dir == "" {
 		return nil
 	}
-	target, _ := os.Readlink(dir)
-	return fmt.Errorf("%s: parent %s is a symlink (to %s); make it a real directory again, with everything that was in it back in place if you moved it", host, dir, target)
+	return errors.New(formatSymlinkGroups([]symlinkHit{{dir, host}}, teardownSymlinkAdvice)[0])
 }
 
 // SymlinkedParent is symlinkedParent for files arcus puts below Target
 // outside a layer, such as AppImages.
 func (s *Stacker) SymlinkedParent(host string) string { return s.symlinkedParent(host) }
+
+// followSymlinks resolves symlinks along path component-by-component, even
+// when a symlink's target does not exist yet (unlike filepath.EvalSymlinks).
+// Raw target components are queued before resolving "..", matching kernel
+// symlink resolution. Symlink loops stop after 40 expansions.
+func followSymlinks(path string) string {
+	if !filepath.IsAbs(path) {
+		return filepath.Clean(path)
+	}
+	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	out := "/"
+	hops := 0
+	for len(parts) > 0 {
+		comp := parts[0]
+		parts = parts[1:]
+		if comp == "" || comp == "." {
+			continue
+		}
+		if comp == ".." {
+			out = filepath.Dir(out)
+			continue
+		}
+		next := filepath.Join(out, comp)
+		if info, err := os.Lstat(next); err == nil && info.Mode()&os.ModeSymlink != 0 && hops < 40 {
+			if target, rerr := os.Readlink(next); rerr == nil {
+				hops++
+				if filepath.IsAbs(target) {
+					out = "/"
+					target = strings.TrimPrefix(target, "/")
+				}
+				parts = append(strings.Split(target, "/"), parts...)
+				continue
+			}
+		}
+		out = next
+	}
+	return out
+}
+
+// hostAliases returns host plus its parent-resolved spelling (both raw and
+// mapped back under s.Target when Target itself resolves through a symlink),
+// so symlinked parents like ~/alias -> ~/real (even when dangling) still match
+// deployments under ~/real. The final component stays unresolved.
+func (s *Stacker) hostAliases(host string) []string {
+	out := []string{host}
+	real := filepath.Join(followSymlinks(filepath.Dir(host)), filepath.Base(host))
+	if real != host {
+		out = append(out, real)
+		realTarget := followSymlinks(s.Target)
+		if realTarget != s.Target && isWithin(real, realTarget) {
+			if rel, err := filepath.Rel(realTarget, real); err == nil {
+				if norm := filepath.Join(s.Target, rel); norm != host && norm != real {
+					out = append(out, norm)
+				}
+			}
+		}
+	}
+	return out
+}
+
+func collidesAny(a, b []string) bool {
+	for _, x := range a {
+		for _, y := range b {
+			if isWithin(x, y) || isWithin(y, x) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TreeCollisions reports whether module's tree has any deployable file at,
+// below, or above host (skipping empty directories, __pycache__, and a non-dir
+// tree root itself).
+func (s *Stacker) TreeCollisions(module, host string) (bool, error) {
+	tree := s.tree(module)
+	if tree == "" {
+		return false, nil
+	}
+	hosts := s.hostAliases(host)
+	found := false
+	err := walkTree(tree, func(src string, d iofs.DirEntry, err error) error {
+		if err != nil || src == tree || d.IsDir() {
+			return err
+		}
+		p, err := s.hostPathFor(tree, src)
+		if err != nil {
+			return err
+		}
+		if collidesAny(s.hostAliases(p), hosts) {
+			found = true
+			return iofs.SkipAll
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, iofs.ErrNotExist) {
+		return false, fmt.Errorf("scanning %s of %q: %w", s.Subdir, module, err)
+	}
+	return found, nil
+}
+
+// LedgerCollisions returns the sorted names of modules whose ledgers (excluding
+// HoldLedger and modules in exclude) record any Host or Backup path at, below,
+// or above host.
+func (s *Stacker) LedgerCollisions(host string, exclude map[string]bool) ([]string, error) {
+	names, err := s.ListLedgers()
+	if err != nil {
+		return nil, err
+	}
+	hosts := s.hostAliases(host)
+	var hits []string
+	for _, name := range names {
+		if name == HoldLedger || exclude[name] {
+			continue
+		}
+		l, err := s.LoadLedger(name)
+		if err != nil {
+			return nil, err
+		}
+		if l == nil {
+			continue
+		}
+		for _, e := range l.Entries {
+			if collidesAny(s.hostAliases(e.Host), hosts) || (e.Backup != "" && collidesAny(s.hostAliases(e.Backup), hosts)) {
+				hits = append(hits, name)
+				break
+			}
+		}
+	}
+	slices.Sort(hits)
+	return hits, nil
+}
 
 func (s *Stacker) planActivation(module string, below []*Ledger, checkAccess bool, freed map[string]bool) ([]Entry, error) {
 	tree := s.tree(module)
@@ -333,8 +547,20 @@ func (s *Stacker) planActivation(module string, below []*Ledger, checkAccess boo
 		return nil, nil // nothing to deploy in this half
 	}
 
-	var plan []Entry
+	// Non-root previews of the system half cannot inspect root-only
+	// directories such as /etc/sudoers.d; root checks strictly in exec-system.
+	unprivSystemPreview := !checkAccess && s.Copy && os.Geteuid() != 0
+
+	type candidate struct {
+		entry      Entry
+		needBackup bool
+	}
+	var candidates []candidate
+	var symlinkHits []symlinkHit
+	var lookupErrs []string
 	var problems []string
+	reserved := map[string]bool{}
+
 	err := walkTree(tree, func(src string, d iofs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -355,9 +581,11 @@ func (s *Stacker) planActivation(module string, below []*Ledger, checkAccess boo
 			problems = append(problems, fmt.Sprintf("%s: outside the allowed directories (%s)", host, strings.Join(s.Allowed, ", ")))
 			return nil
 		}
-		if dir := s.symlinkedParent(host); dir != "" {
-			target, _ := os.Readlink(dir)
-			problems = append(problems, fmt.Sprintf("%s: parent %s is a symlink (to %s); remove it first", host, dir, target))
+		if dir, perr := s.parentLink(host); dir != "" {
+			symlinkHits = append(symlinkHits, symlinkHit{dir, host})
+			return nil
+		} else if perr != nil && !(unprivSystemPreview && errors.Is(perr, iofs.ErrPermission)) {
+			lookupErrs = append(lookupErrs, perr.Error())
 			return nil
 		}
 		if checkAccess {
@@ -385,21 +613,74 @@ func (s *Stacker) planActivation(module string, below []*Ledger, checkAccess boo
 			e.UID, e.GID = os.Geteuid(), os.Getegid()
 		}
 
-		if info, err := os.Lstat(host); err == nil && !freed[host] {
+		needBackup := false
+		if info, lerr := os.Lstat(host); lerr == nil && !freed[host] {
 			if info.IsDir() {
 				problems = append(problems, fmt.Sprintf("%s: module provides a file but the host has a directory", host))
 				return nil
 			}
-			e.Backup = uniquePath(host + "." + ownerTag(host, below))
+			needBackup = true
+		} else if lerr != nil && !isAbsent(lerr) && !(unprivSystemPreview && errors.Is(lerr, iofs.ErrPermission)) {
+			lookupErrs = append(lookupErrs, fmt.Sprintf("inspecting %s: %v", host, lerr))
+			return nil
 		}
-		plan = append(plan, e)
+
+		// Reserve this host path and every ancestor below Target so no backup
+		// picked in pass 2 can occupy a path this activation deploys at or under.
+		reserved[host] = true
+		for dir := filepath.Dir(host); dir != s.Target && isWithin(dir, s.Target); dir = filepath.Dir(dir) {
+			reserved[dir] = true
+		}
+		candidates = append(candidates, candidate{entry: e, needBackup: needBackup})
 		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("scanning %s of %q: %w", s.Subdir, module, err)
 	}
-	if len(problems) > 0 {
-		return nil, fmt.Errorf("pre-flight failed for %q, nothing was changed:\n  %s", module, strings.Join(problems, "\n  "))
+	if len(symlinkHits) > 0 || len(lookupErrs) > 0 || len(problems) > 0 {
+		all := slices.Concat(formatSymlinkGroups(symlinkHits, activateSymlinkAdvice), dedupeStrings(lookupErrs), problems)
+		return nil, fmt.Errorf("pre-flight failed for %q, nothing was changed:\n  %s", module, strings.Join(all, "\n  "))
+	}
+
+	// Pass 2: assign backup names avoiding planned hosts/ancestors, backups
+	// already referenced by ledgers on disk, and backups chosen earlier in this pass.
+	needAnyBackup := slices.ContainsFunc(candidates, func(c candidate) bool { return c.needBackup })
+	if needAnyBackup {
+		names, err := s.ListLedgers()
+		if err != nil {
+			return nil, err
+		}
+		for _, name := range names {
+			if name == HoldLedger {
+				continue
+			}
+			l, err := s.LoadLedger(name)
+			if err != nil {
+				return nil, err
+			}
+			if l == nil {
+				continue
+			}
+			for _, e := range l.Entries {
+				if e.Backup != "" {
+					reserved[e.Backup] = true
+				}
+			}
+		}
+	}
+
+	plan := make([]Entry, len(candidates))
+	for i, c := range candidates {
+		e := c.entry
+		if c.needBackup {
+			backup, err := uniquePath(e.Host+"."+ownerTag(e.Host, below), reserved)
+			if err != nil {
+				return nil, err
+			}
+			e.Backup = backup
+			reserved[backup] = true
+		}
+		plan[i] = e
 	}
 	return plan, nil
 }
@@ -428,8 +709,10 @@ type step struct {
 }
 
 // planStep classifies one entry. It is written so that re-running teardown
-// after a crash at any point converges instead of misreporting state.
-func (s *Stacker) planStep(l *Ledger, idx int, above []*Ledger) step {
+// after a crash at any point converges instead of misreporting state. Only
+// ErrNotExist and ENOTDIR count as absent; any other lookup or read error is
+// returned so teardown stops and keeps the entry.
+func (s *Stacker) planStep(l *Ledger, idx int, above []*Ledger) (step, error) {
 	e := l.Entries[idx]
 	st := step{idx: idx}
 	for _, a := range above {
@@ -448,32 +731,76 @@ func (s *Stacker) planStep(l *Ledger, idx int, above []*Ledger) step {
 		st.loc = st.next.Entries[st.nextIdx].Backup
 		if e.Backup != "" && st.loc == e.Backup {
 			st.finished = true // already spliced out
-			return st
+			return st, nil
 		}
 	}
 
-	switch {
-	case st.loc == "" || !exists(st.loc):
+	if st.loc == "" {
+		return st, nil
+	}
+	locExists, err := statExists(st.loc)
+	if err != nil {
+		return st, fmt.Errorf("inspecting %s: %w", st.loc, err)
+	}
+	if !locExists {
 		// Nothing deployed here any more.
-	case owns(e, st.loc):
+		return st, nil
+	}
+
+	owned, err := owns(e, st.loc)
+	if err != nil {
+		return st, fmt.Errorf("inspecting %s: %w", st.loc, err)
+	}
+	if owned {
 		// A copy whose recorded backup never got created is
 		// indistinguishable from an untouched original with identical
 		// content; leave it rather than risk deleting the original.
-		if st.next == nil && e.Kind == KindCopy && e.Backup != "" && !exists(e.Backup) {
-			return st
+		if st.next == nil && e.Kind == KindCopy && e.Backup != "" {
+			backupExists, err := statExists(e.Backup)
+			if err != nil {
+				return st, fmt.Errorf("inspecting backup %s: %w", e.Backup, err)
+			}
+			if !backupExists {
+				return st, nil
+			}
 		}
 		st.remove = true
-	case st.next == nil && e.Backup != "" && !exists(e.Backup):
-		st.finished = true // original already restored by an interrupted run
-	case st.next == nil && cacheEntry(e) && isWithin(st.loc, s.Target) && s.symlinkedParent(st.loc) == "" && isPyc(st.loc):
-		// Ledgers written before 0.8.2 hold cache links, and Python replaces a
-		// cache by renaming a new file over it. This comes after finished, so
-		// an original a re-run already put back is kept.
-		st.cache = true
-	default:
-		st.foreign = true
+		return st, nil
 	}
-	return st
+
+	if st.next == nil && e.Backup != "" {
+		backupExists, err := statExists(e.Backup)
+		if err != nil {
+			return st, fmt.Errorf("inspecting backup %s: %w", e.Backup, err)
+		}
+		if !backupExists {
+			st.finished = true // original already restored by an interrupted run
+			return st, nil
+		}
+	}
+
+	if st.next == nil && cacheEntry(e) && isWithin(st.loc, s.Target) {
+		dir, err := s.parentLink(st.loc)
+		if err != nil {
+			return st, err
+		}
+		if dir == "" {
+			pyc, err := isPyc(st.loc)
+			if err != nil {
+				return st, fmt.Errorf("inspecting %s: %w", st.loc, err)
+			}
+			if pyc {
+				// Ledgers written before 0.8.2 hold cache links, and Python replaces a
+				// cache by renaming a new file over it. This comes after finished, so
+				// an original a re-run already put back is kept.
+				st.cache = true
+				return st, nil
+			}
+		}
+	}
+
+	st.foreign = true
+	return st, nil
 }
 
 // Deactivate removes module's layer. activeStack is the full current stack
@@ -497,19 +824,36 @@ func (s *Stacker) Deactivate(ctx context.Context, module string, activeStack []s
 	}
 
 	// Pre-flight: refuse before mutating anything if a path lies below a
-	// symlinked parent, which -f doesn't override, or if unforced and foreign.
-	var linked, foreign []string
+	// symlinked parent or cannot be looked up (neither is overridden by -f),
+	// or if unforced and foreign.
+	var symlinkHits []symlinkHit
+	var lookupErrs, foreign []string
 	for i, e := range l.Entries {
-		if err := s.symlinkProblem(e.Host); err != nil {
-			linked = append(linked, err.Error())
+		if dir, perr := s.parentLink(e.Host); dir != "" {
+			symlinkHits = append(symlinkHits, symlinkHit{dir, e.Host})
+			continue
+		} else if perr != nil {
+			lookupErrs = append(lookupErrs, perr.Error())
 			continue
 		}
-		if st := s.planStep(l, i, above); st.foreign {
+		st, perr := s.planStep(l, i, above)
+		if perr != nil {
+			lookupErrs = append(lookupErrs, perr.Error())
+			continue
+		}
+		if st.next == nil && e.Backup != "" {
+			if _, berr := statExists(e.Backup); berr != nil {
+				lookupErrs = append(lookupErrs, fmt.Sprintf("inspecting backup %s: %v", e.Backup, berr))
+				continue
+			}
+		}
+		if st.foreign {
 			foreign = append(foreign, st.loc)
 		}
 	}
-	if len(linked) > 0 {
-		return fmt.Errorf("cannot turn off %q, nothing was changed in its %s files:\n  %s", module, s.Subdir, strings.Join(linked, "\n  "))
+	if len(symlinkHits) > 0 || len(lookupErrs) > 0 {
+		all := append(formatSymlinkGroups(symlinkHits, teardownSymlinkAdvice), dedupeStrings(lookupErrs)...)
+		return fmt.Errorf("cannot turn off %q, nothing was changed in its %s files:\n  %s", module, s.Subdir, strings.Join(all, "\n  "))
 	}
 	if len(foreign) > 0 && !force {
 		return fmt.Errorf("%w: these paths changed since %q was turned on, nothing was changed (use -f to move them aside):\n  %s",
@@ -526,7 +870,7 @@ func (s *Stacker) Deactivate(ctx context.Context, module string, activeStack []s
 			return fmt.Errorf("deactivation of %q interrupted, re-run it or 'arcus doctor -fix' to finish: %w", module, err)
 		}
 		s.crashPoint()
-		if err := s.teardownEntry(l, i, above); err != nil {
+		if err := s.teardownEntry(l, i, above, force); err != nil {
 			return err
 		}
 		s.crashPoint()
@@ -543,14 +887,20 @@ func (s *Stacker) Deactivate(ctx context.Context, module string, activeStack []s
 	return s.removeLedger(module)
 }
 
-func (s *Stacker) teardownEntry(l *Ledger, idx int, above []*Ledger) error {
+func (s *Stacker) teardownEntry(l *Ledger, idx int, above []*Ledger, force bool) error {
 	e := l.Entries[idx]
 	if err := s.symlinkProblem(e.Host); err != nil {
 		return err
 	}
-	st := s.planStep(l, idx, above)
+	st, err := s.planStep(l, idx, above)
+	if err != nil {
+		return err
+	}
 	if st.finished {
 		return nil
+	}
+	if st.foreign && !force {
+		return fmt.Errorf("%w: %s changed during teardown", ErrForeign, st.loc)
 	}
 
 	switch {
@@ -560,7 +910,10 @@ func (s *Stacker) teardownEntry(l *Ledger, idx int, above []*Ledger) error {
 		}
 		s.crashPoint()
 	case st.foreign:
-		aside := uniquePath(st.loc + ".arcus-foreign")
+		aside, err := uniquePath(st.loc+".arcus-foreign", nil)
+		if err != nil {
+			return fmt.Errorf("choosing aside path for %q: %w", st.loc, err)
+		}
 		if err := renameDurable(st.loc, aside); err != nil {
 			return fmt.Errorf("moving modified %q aside: %w", st.loc, err)
 		}
@@ -574,12 +927,22 @@ func (s *Stacker) teardownEntry(l *Ledger, idx int, above []*Ledger) error {
 		return s.saveLedger(st.next)
 	}
 
-	if e.Backup != "" && exists(e.Backup) {
-		if exists(e.Host) {
-			return fmt.Errorf("cannot restore %q: %q is occupied", e.Backup, e.Host)
+	if e.Backup != "" {
+		backupExists, err := statExists(e.Backup)
+		if err != nil {
+			return fmt.Errorf("checking backup %q: %w", e.Backup, err)
 		}
-		if err := renameDurable(e.Backup, e.Host); err != nil {
-			return fmt.Errorf("restoring %q to %q: %w", e.Backup, e.Host, err)
+		if backupExists {
+			hostExists, err := statExists(e.Host)
+			if err != nil {
+				return fmt.Errorf("checking %q: %w", e.Host, err)
+			}
+			if hostExists {
+				return fmt.Errorf("cannot restore %q: %q is occupied", e.Backup, e.Host)
+			}
+			if err := renameDurable(e.Backup, e.Host); err != nil {
+				return fmt.Errorf("restoring %q to %q: %w", e.Backup, e.Host, err)
+			}
 		}
 	}
 	return nil
@@ -689,8 +1052,12 @@ func (s *Stacker) yieldHeldDirs(module string) error {
 		return err
 	}
 	tree := s.tree(module)
-	if tree == "" || !exists(tree) {
+	if tree == "" {
 		return nil
+	}
+	treeExists, err := statExists(tree)
+	if err != nil || !treeExists {
+		return err
 	}
 	var yielded []string
 	err = walkTree(tree, func(src string, d iofs.DirEntry, err error) error {
@@ -704,7 +1071,7 @@ func (s *Stacker) yieldHeldDirs(module string) error {
 		dirs := slices.DeleteFunc(slices.Clone(hold.CreatedDirs), func(dir string) bool { return !isWithin(dir, host) })
 		slices.SortFunc(dirs, func(a, b string) int { return len(b) - len(a) })
 		for _, dir := range dirs {
-			if s.symlinkedParent(dir) == "" && syscall.Rmdir(dir) == nil {
+			if link, perr := s.parentLink(dir); link == "" && perr == nil && syscall.Rmdir(dir) == nil {
 				yielded = append(yielded, dir)
 			}
 		}
@@ -732,7 +1099,10 @@ func (s *Stacker) removeCreatedDirs(l *Ledger, stack []*Ledger) error {
 
 	var errs []error
 	for _, dir := range dirs {
-		if s.symlinkedParent(dir) != "" {
+		if link, perr := s.parentLink(dir); link != "" {
+			continue
+		} else if perr != nil {
+			errs = append(errs, perr)
 			continue
 		}
 		err := syscall.Rmdir(dir)
@@ -780,19 +1150,27 @@ func (s *Stacker) Rollback(module string) error {
 		return err
 	}
 
+	var symlinkHits []symlinkHit
 	var problems []string
 	for i := len(l.Entries) - 1; i >= 0; i-- {
 		// Before planStep, whose view through the link can't be trusted.
-		if err := s.symlinkProblem(l.Entries[i].Host); err != nil {
+		if dir, perr := s.parentLink(l.Entries[i].Host); dir != "" {
+			symlinkHits = append(symlinkHits, symlinkHit{dir, l.Entries[i].Host})
+			continue
+		} else if perr != nil {
+			problems = append(problems, perr.Error())
+			continue
+		}
+		st, err := s.planStep(l, i, nil)
+		if err != nil {
 			problems = append(problems, err.Error())
 			continue
 		}
-		st := s.planStep(l, i, nil)
 		if st.foreign {
 			problems = append(problems, fmt.Sprintf("%s was modified; left in place", st.loc))
 			continue
 		}
-		if err := s.teardownEntry(l, i, nil); err != nil {
+		if err := s.teardownEntry(l, i, nil, false); err != nil {
 			problems = append(problems, err.Error())
 			continue
 		}
@@ -801,8 +1179,9 @@ func (s *Stacker) Rollback(module string) error {
 			return err
 		}
 	}
-	if len(problems) > 0 {
-		return errors.New(strings.Join(problems, "; "))
+	if len(symlinkHits) > 0 || len(problems) > 0 {
+		all := append(formatSymlinkGroups(symlinkHits, teardownSymlinkAdvice), dedupeStrings(problems)...)
+		return errors.New(strings.Join(all, "\n  "))
 	}
 
 	if err := s.removeCreatedDirs(l, nil); err != nil {
@@ -811,10 +1190,106 @@ func (s *Stacker) Rollback(module string) error {
 	return s.removeLedger(module)
 }
 
+// verifyRenameDir checks that path's parent directory allows modifying entries
+// and can be opened for fsync (as renameDurable requires).
+func verifyRenameDir(path string) error {
+	if err := VerifyWritePrivilege(path); err != nil {
+		return err
+	}
+	dir := filepath.Dir(path)
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("opening %q for fsync: %w", dir, err)
+	}
+	return d.Close()
+}
+
+// CheckRename verifies that renaming oldName to newName in this half won't
+// follow a symlinked parent or hit a lookup error when relinking home links or
+// retagging other ledgers' backups. Mirrors Rename's early return when oldName
+// has no active layer in this half.
+func (s *Stacker) CheckRename(oldName, newName string, activeStack []string) error {
+	stack, err := s.loadStack(activeStack)
+	if err != nil {
+		return err
+	}
+	pos := slices.Index(activeStack, oldName)
+	if pos < 0 || stack[pos] == nil {
+		return nil
+	}
+	l, above := stack[pos], stack[pos+1:]
+
+	var symlinkHits []symlinkHit
+	var lookupErrs []string
+	for i, e := range l.Entries {
+		if e.Kind != KindLink {
+			continue
+		}
+		if dir, perr := s.parentLink(e.Host); dir != "" {
+			symlinkHits = append(symlinkHits, symlinkHit{dir, e.Host})
+			continue
+		} else if perr != nil {
+			lookupErrs = append(lookupErrs, perr.Error())
+			continue
+		}
+		st, perr := s.planStep(l, i, above)
+		if perr != nil {
+			lookupErrs = append(lookupErrs, perr.Error())
+			continue
+		}
+		if st.loc != "" && st.remove {
+			if werr := verifyRenameDir(st.loc); werr != nil {
+				lookupErrs = append(lookupErrs, werr.Error())
+			}
+			if _, uerr := uniquePath(st.loc+".arcus-tmp", nil); uerr != nil {
+				lookupErrs = append(lookupErrs, uerr.Error())
+			}
+		}
+	}
+	for _, other := range stack {
+		if other == nil || other == l {
+			continue
+		}
+		for _, e := range other.Entries {
+			if tag, ok := strings.CutPrefix(e.Backup, e.Host+"."); !ok || backupTag(tag) != oldName {
+				continue
+			}
+			if dir, perr := s.parentLink(e.Backup); dir != "" {
+				symlinkHits = append(symlinkHits, symlinkHit{dir, e.Backup})
+				continue
+			} else if perr != nil {
+				lookupErrs = append(lookupErrs, perr.Error())
+				continue
+			}
+			backupExists, berr := statExists(e.Backup)
+			if berr != nil {
+				lookupErrs = append(lookupErrs, fmt.Sprintf("inspecting backup %s: %v", e.Backup, berr))
+				continue
+			}
+			if backupExists {
+				if werr := verifyRenameDir(e.Backup); werr != nil {
+					lookupErrs = append(lookupErrs, werr.Error())
+				}
+			}
+			if _, uerr := uniquePath(e.Host+"."+newName, nil); uerr != nil {
+				lookupErrs = append(lookupErrs, uerr.Error())
+			}
+		}
+	}
+	if len(symlinkHits) > 0 || len(lookupErrs) > 0 {
+		all := append(formatSymlinkGroups(symlinkHits, teardownSymlinkAdvice), dedupeStrings(lookupErrs)...)
+		return fmt.Errorf("cannot rename %q, nothing was changed in its %s files:\n  %s", oldName, s.Subdir, strings.Join(all, "\n  "))
+	}
+	return nil
+}
+
 // Rename moves a layer's ledger and live symlinks from oldName to newName
-// after the module directory was moved from oldDir to newDir. activeStack
-// uses the old name.
+// with module directory moving from oldDir to newDir. activeStack uses the old
+// name.
 func (s *Stacker) Rename(oldName, newName, oldDir, newDir string, activeStack []string) error {
+	if err := s.CheckRename(oldName, newName, activeStack); err != nil {
+		return err
+	}
 	stack, err := s.loadStack(activeStack)
 	if err != nil {
 		return err
@@ -829,10 +1304,15 @@ func (s *Stacker) Rename(oldName, newName, oldDir, newDir string, activeStack []
 	for i := range l.Entries {
 		e := &l.Entries[i]
 		newSrc := newRoot + strings.TrimPrefix(e.Src, oldRoot)
-		st := s.planStep(l, i, above)
-		if e.Kind == KindLink && st.loc != "" && st.remove {
-			if err := symlinkReplace(newSrc, st.loc); err != nil {
-				return fmt.Errorf("relinking %q: %w", st.loc, err)
+		if e.Kind == KindLink {
+			st, err := s.planStep(l, i, above)
+			if err != nil {
+				return err
+			}
+			if st.loc != "" && st.remove {
+				if err := symlinkReplace(newSrc, st.loc); err != nil {
+					return fmt.Errorf("relinking %q: %w", st.loc, err)
+				}
 			}
 		}
 		e.Src = newSrc
@@ -850,8 +1330,15 @@ func (s *Stacker) Rename(oldName, newName, oldDir, newDir string, activeStack []
 			if tag, ok := strings.CutPrefix(e.Backup, e.Host+"."); !ok || backupTag(tag) != oldName {
 				continue
 			}
-			fresh := uniquePath(e.Host + "." + newName)
-			if exists(e.Backup) {
+			fresh, err := uniquePath(e.Host+"."+newName, nil)
+			if err != nil {
+				return err
+			}
+			backupExists, err := statExists(e.Backup)
+			if err != nil {
+				return fmt.Errorf("checking backup %q: %w", e.Backup, err)
+			}
+			if backupExists {
 				if err := renameDurable(e.Backup, fresh); err != nil {
 					return fmt.Errorf("renaming backup %q: %w", e.Backup, err)
 				}

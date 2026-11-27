@@ -1693,3 +1693,327 @@ func TestTeardownRefusalLeavesTheLayerWhole(t *testing.T) {
 		}
 	})
 }
+
+func TestTeardownRefusesLookupError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory mode bits")
+	}
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		sb.hostFile("private/foo/rc", "original")
+		sb.moduleFile("p", "private/foo/rc", "from p")
+		must(t, sb.activate("p"))
+
+		priv := filepath.Join(sb.host, "private")
+		must(t, os.Chmod(priv, 0))
+		t.Cleanup(func() { _ = os.Chmod(priv, 0o755) })
+
+		for _, force := range []bool{false, true} {
+			if err := sb.deactivate("p", force); err == nil {
+				t.Fatalf("deactivate(force=%v) succeeded despite unreadable parent", force)
+			}
+			sb.wantEntries("p", 1)
+		}
+		if err := sb.s.Rollback("p"); err == nil {
+			t.Fatal("rollback succeeded despite unreadable parent")
+		}
+		sb.wantEntries("p", 1)
+
+		findings, err := sb.s.Audit("p", sb.stack)
+		must(t, err)
+		if len(findings) == 0 {
+			t.Fatal("audit reported no finding for unreadable parent")
+		}
+		for _, f := range findings {
+			if strings.Contains(f, "deployment is missing") || strings.Contains(f, "was modified") {
+				t.Errorf("audit misclassified lookup error: %s", f)
+			}
+		}
+
+		must(t, os.Chmod(priv, 0o755))
+		must(t, sb.deactivate("p", false))
+		if got := sb.read("private/foo/rc"); got != "original" {
+			t.Fatalf("rc = %q, want original restored", got)
+		}
+		sb.assertNoLedgers()
+	})
+
+	// Unreadable deployed copy with missing backup must not look finished.
+	t.Run("unreadable copy with missing backup", func(t *testing.T) {
+		sb := newSandbox(t, halves[1])
+		sb.hostFile("conf", "original")
+		sb.moduleFile("p", "conf", "from p")
+		must(t, sb.activate("p"))
+		must(t, os.Remove(filepath.Join(sb.host, "conf.orig")))
+		conf := filepath.Join(sb.host, "conf")
+		must(t, os.Chmod(conf, 0))
+		t.Cleanup(func() { _ = os.Chmod(conf, 0o644) })
+
+		for _, force := range []bool{false, true} {
+			if err := sb.deactivate("p", force); err == nil {
+				t.Fatalf("deactivate(force=%v) succeeded on unreadable copy", force)
+			}
+			sb.wantEntries("p", 1)
+		}
+		must(t, os.Chmod(conf, 0o644))
+		must(t, sb.deactivate("p", false))
+		sb.assertNoLedgers()
+	})
+}
+
+func TestTeardownConvergesOnENOTDIR(t *testing.T) {
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		sb.hostFile("foo/rc", "original")
+		sb.moduleFile("p", "foo/rc", "from p")
+		must(t, sb.activate("p"))
+		must(t, os.RemoveAll(filepath.Join(sb.host, "foo")))
+		sb.hostFile("foo", "now a file")
+
+		must(t, sb.deactivate("p", false))
+		sb.assertNoLedgers()
+		if got := sb.read("foo"); got != "now a file" {
+			t.Fatalf("foo = %q, want user file kept", got)
+		}
+	})
+}
+
+func TestRenameRefusesSymlinkedParent(t *testing.T) {
+	t.Run("home link below symlinked parent", func(t *testing.T) {
+		sb := newSandbox(t, halves[0])
+		sb.moduleFile("old", "foo/rc", "from old")
+		must(t, sb.activate("old"))
+		sync := filepath.Join(sb.root, "sync", "foo")
+		sb.moveAndLink("foo", sync)
+		before := sb.snapDir(sync)
+
+		oldDir := sb.s.Dirs["old"]
+		newDir := filepath.Join(filepath.Dir(oldDir), "new")
+		wantSymlinkRefusal(t, sb.s.Rename("old", "new", oldDir, newDir, sb.stack))
+		assertSame(t, before, sb.snapDir(sync))
+		sb.wantEntries("old", 1)
+	})
+
+	t.Run("other layer backup below symlinked parent", func(t *testing.T) {
+		eachHalf(t, func(t *testing.T, sb *sandbox) {
+			sb.moduleFile("old", "foo/rc", "from old")
+			sb.moduleFile("top", "foo/rc", "from top")
+			must(t, sb.activate("old"))
+			must(t, sb.activate("top"))
+			topLedger, err := os.ReadFile(sb.s.ledgerPath("top"))
+			must(t, err)
+
+			sync := filepath.Join(sb.root, "sync", "foo")
+			sb.moveAndLink("foo", sync)
+			before := sb.snapDir(sync)
+
+			oldDir := sb.s.Dirs["old"]
+			newDir := filepath.Join(filepath.Dir(oldDir), "new")
+			wantSymlinkRefusal(t, sb.s.Rename("old", "new", oldDir, newDir, sb.stack))
+			assertSame(t, before, sb.snapDir(sync))
+			if got, err := os.ReadFile(sb.s.ledgerPath("top")); err != nil || string(got) != string(topLedger) {
+				t.Fatalf("upper ledger changed on refusal: %v", err)
+			}
+			sb.wantEntries("old", 1)
+
+			// Once restored, Rename succeeds and retags the backup cleanly.
+			sb.moveBack("foo", sync)
+			must(t, os.Rename(oldDir, newDir))
+			sb.s.Dirs["new"] = newDir
+			delete(sb.s.Dirs, "old")
+			must(t, sb.s.Rename("old", "new", oldDir, newDir, sb.stack))
+			sb.stack[0] = "new"
+			if !exists(filepath.Join(sb.host, "foo/rc.new")) {
+				t.Fatal("backup was not renamed to .new")
+			}
+		})
+	})
+
+	t.Run("read-only and unreadable-for-fsync deployment dirs caught in CheckRename", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses directory mode bits")
+		}
+		for _, mode := range []os.FileMode{0o555, 0o300} {
+			sb := newSandbox(t, halves[0])
+			sb.moduleFile("old", "ro/rc", "from old")
+			must(t, sb.activate("old"))
+			ro := filepath.Join(sb.host, "ro")
+			must(t, os.Chmod(ro, mode))
+			t.Cleanup(func() { _ = os.Chmod(ro, 0o755) })
+
+			if err := sb.s.CheckRename("old", "new", sb.stack); err == nil {
+				t.Fatalf("CheckRename succeeded on %04o deployment dir", mode)
+			}
+		}
+	})
+
+	t.Run("overlong arcus-tmp path caught in CheckRename", func(t *testing.T) {
+		sb := newSandbox(t, halves[0])
+		// 244 bytes: legal with ".arcus-tmp" (254) and ".old" (248),
+		// but ".old.arcus-tmp" (258) exceeds NAME_MAX.
+		longName := strings.Repeat("a", 244)
+		sb.moduleFile("old", longName, "from old")
+		sb.moduleFile("top", longName, "from top")
+		must(t, sb.activate("old"))
+		must(t, sb.activate("top"))
+
+		if err := sb.s.CheckRename("old", "new", sb.stack); err == nil {
+			t.Fatal("CheckRename succeeded when relink .arcus-tmp exceeds NAME_MAX")
+		}
+	})
+}
+
+func TestActivationReservesBackupPaths(t *testing.T) {
+	t.Run("foo symlink and foo.orig/rc", func(t *testing.T) {
+		eachHalf(t, func(t *testing.T, sb *sandbox) {
+			outside := filepath.Join(sb.root, "outside")
+			must(t, os.MkdirAll(outside, 0o755))
+			must(t, os.Symlink(outside, filepath.Join(sb.host, "foo")))
+
+			sb.moduleFile("p", "foo", "from p")
+			sb.moduleFile("p", "foo.orig/rc", "rc from p")
+			must(t, sb.activate("p"))
+
+			if entries, err := os.ReadDir(outside); err != nil || len(entries) != 0 {
+				t.Fatalf("wrote into symlink target %s: %v %v", outside, entries, err)
+			}
+			if got := sb.read("foo.orig/rc"); got != "rc from p" {
+				t.Fatalf("foo.orig/rc = %q", got)
+			}
+			if target, err := os.Readlink(filepath.Join(sb.host, "foo.orig.1")); err != nil || target != outside {
+				t.Fatalf("backup foo.orig.1 = %q (%v), want symlink to %s", target, err, outside)
+			}
+			if dangling, err := sb.s.DanglingBackups(); err != nil || len(dangling) != 0 {
+				t.Fatalf("DanglingBackups = %v (%v), want empty", dangling, err)
+			}
+
+			must(t, sb.deactivate("p", false))
+			if target, err := os.Readlink(filepath.Join(sb.host, "foo")); err != nil || target != outside {
+				t.Fatalf("restored foo = %q (%v), want symlink to %s", target, err, outside)
+			}
+			if exists(filepath.Join(sb.host, "foo.orig")) || exists(filepath.Join(sb.host, "foo.orig.1")) {
+				t.Fatal("leftovers remain after deactivate")
+			}
+			sb.assertNoLedgers()
+		})
+	})
+
+	t.Run("foo and foo.orig file", func(t *testing.T) {
+		eachHalf(t, func(t *testing.T, sb *sandbox) {
+			sb.hostFile("foo", "original")
+			sb.moduleFile("p", "foo", "from p")
+			sb.moduleFile("p", "foo.orig", "orig from p")
+			must(t, sb.activate("p"))
+
+			if got := sb.read("foo"); got != "from p" {
+				t.Fatalf("foo = %q", got)
+			}
+			if got := sb.read("foo.orig"); got != "orig from p" {
+				t.Fatalf("foo.orig = %q", got)
+			}
+			if got := sb.read("foo.orig.1"); got != "original" {
+				t.Fatalf("foo.orig.1 = %q", got)
+			}
+			if dangling, err := sb.s.DanglingBackups(); err != nil || len(dangling) != 0 {
+				t.Fatalf("DanglingBackups = %v (%v), want empty", dangling, err)
+			}
+			must(t, sb.deactivate("p", false))
+			if got := sb.read("foo"); got != "original" {
+				t.Fatalf("restored foo = %q", got)
+			}
+			sb.assertNoLedgers()
+		})
+	})
+
+	t.Run("existing ledger missing backup reserved", func(t *testing.T) {
+		eachHalf(t, func(t *testing.T, sb *sandbox) {
+			sb.hostFile("foo", "old orig")
+			sb.moduleFile("a", "foo", "from a")
+			must(t, sb.activate("a"))
+			// Remove a's deployment and its recorded backup foo.orig from disk,
+			// then activate b without a in below (e.g. a is an orphan ledger)
+			// so b's ownerTag is "orig" and would otherwise reuse foo.orig.
+			must(t, os.Remove(filepath.Join(sb.host, "foo")))
+			must(t, os.Remove(filepath.Join(sb.host, "foo.orig")))
+			sb.hostFile("foo", "new host")
+			sb.moduleFile("b", "foo", "from b")
+			must(t, sb.s.Activate(context.Background(), "b", nil))
+
+			l, err := sb.s.LoadLedger("b")
+			must(t, err)
+			if l.Entries[0].Backup == filepath.Join(sb.host, "foo.orig") {
+				t.Fatalf("b reused backup path %s still referenced by a's ledger", l.Entries[0].Backup)
+			}
+		})
+	})
+}
+
+func TestDanglingBackupsSkipsSymlinkedParent(t *testing.T) {
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		sb.moduleFile("p", "foo/rc", "from p")
+		outside := filepath.Join(sb.root, "outside")
+		must(t, os.MkdirAll(outside, 0o755))
+		must(t, os.WriteFile(filepath.Join(outside, "rc.orig"), []byte("unrelated"), 0o644))
+		must(t, os.Symlink(outside, filepath.Join(sb.host, "foo")))
+
+		got, err := sb.s.DanglingBackups()
+		must(t, err)
+		if len(got) != 0 {
+			t.Fatalf("DanglingBackups scanned through symlinked parent: %v", got)
+		}
+	})
+}
+
+func TestSymlinkedParentRefusalsGroupedByDirectory(t *testing.T) {
+	eachHalf(t, func(t *testing.T, sb *sandbox) {
+		elsewhere := filepath.Join(sb.root, "elsewhere")
+		must(t, os.MkdirAll(elsewhere, 0o755))
+		for _, name := range []string{"a", "b", "c"} {
+			sb.moduleFile("p", "foo/"+name, "from p")
+		}
+		// Activation refusal grouped into one header for foo.
+		must(t, os.Symlink(elsewhere, filepath.Join(sb.host, "foo")))
+		err := sb.activate("p")
+		wantSymlinkRefusal(t, err)
+		if n := strings.Count(err.Error(), "is a symlink"); n != 1 {
+			t.Fatalf("activation repeated symlink header %d times:\n%v", n, err)
+		}
+		for _, name := range []string{"foo/a", "foo/b", "foo/c"} {
+			if !strings.Contains(err.Error(), name) {
+				t.Errorf("activation refusal missing %s:\n%v", name, err)
+			}
+		}
+
+		// Activate cleanly, move foo behind a symlink, check Deactivate, Rollback, and Audit.
+		must(t, os.Remove(filepath.Join(sb.host, "foo")))
+		must(t, sb.activate("p"))
+		sync := filepath.Join(sb.root, "sync", "foo")
+		sb.moveAndLink("foo", sync)
+
+		err = sb.deactivate("p", false)
+		wantSymlinkRefusal(t, err)
+		if n := strings.Count(err.Error(), "is a symlink"); n != 1 {
+			t.Fatalf("deactivate repeated symlink header %d times:\n%v", n, err)
+		}
+		for _, name := range []string{"foo/a", "foo/b", "foo/c"} {
+			if !strings.Contains(err.Error(), name) {
+				t.Errorf("deactivate refusal missing %s:\n%v", name, err)
+			}
+		}
+
+		err = sb.s.Rollback("p")
+		wantSymlinkRefusal(t, err)
+		if n := strings.Count(err.Error(), "is a symlink"); n != 1 {
+			t.Fatalf("rollback repeated symlink header %d times:\n%v", n, err)
+		}
+
+		findings, err := sb.s.Audit("p", sb.stack)
+		must(t, err)
+		if len(findings) != 1 {
+			t.Fatalf("audit findings = %d (%q), want 1 grouped finding", len(findings), findings)
+		}
+		for _, name := range []string{"foo/a", "foo/b", "foo/c"} {
+			if !strings.Contains(findings[0], name) {
+				t.Errorf("audit finding missing %s:\n%s", name, findings[0])
+			}
+		}
+	})
+}

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/grunclepug/arcus/internal/host"
+	"github.com/grunclepug/arcus/internal/layer"
 	"github.com/grunclepug/arcus/internal/machine"
 	"github.com/grunclepug/arcus/internal/module"
 )
@@ -284,6 +285,11 @@ func (a *app) cmdMv(args []string) (err error) {
 	oldDir, newDir := m.Dir, filepath.Join(filepath.Dir(m.Dir), newName)
 	if _, err := os.Lstat(newDir); err == nil {
 		return fmt.Errorf("%s already exists", newDir)
+	} else if !errors.Is(err, iofs.ErrNotExist) {
+		return err
+	}
+	if err := layer.VerifyWritePrivilege(newDir); err != nil {
+		return err
 	}
 
 	path, err := a.hostPath()
@@ -311,6 +317,11 @@ func (a *app) cmdMv(args []string) (err error) {
 	if err != nil {
 		return err
 	}
+	if inUser {
+		if err := uh.layer.CheckRename(oldName, newName, ust.Modules); err != nil {
+			return err
+		}
+	}
 	// Renaming a module nothing selects or records changes no state: like
 	// new and rm, it isn't recorded.
 	if inUser || inSystem || f != nil && slices.Contains(f.Modules, oldName) {
@@ -319,7 +330,24 @@ func (a *app) cmdMv(args []string) (err error) {
 		}
 	}
 
+	// Rename the system half first: copy layers never touch the module
+	// directory on disk, so a root refusal or cancelled sudo leaves the
+	// module directory and user half untouched.
+	if inSystem {
+		args := []string{"-mv", "-home", a.paths.Home, "-config", a.paths.Config, "--", oldName, newName, oldDir, newDir}
+		if err := a.sudo(args); err != nil {
+			return fmt.Errorf("renaming the system layer (module directory and home files were not changed): %w", err)
+		}
+	}
+	if inUser && inSystem {
+		if err := uh.layer.CheckRename(oldName, newName, ust.Modules); err != nil {
+			return fmt.Errorf("renaming the user layer (the system half was already renamed to %q; do not run 'arcus apply' yet — fix this and re-run 'arcus mv %s %s'): %w", newName, oldName, newName, err)
+		}
+	}
 	if err := os.Rename(oldDir, newDir); err != nil {
+		if inSystem {
+			return fmt.Errorf("renaming the module directory (the system half was already renamed to %q; do not run 'arcus apply' yet — fix the directory error and re-run 'arcus mv %s %s'): %w", newName, oldName, newName, err)
+		}
 		return fmt.Errorf("renaming the module directory: %w", err)
 	}
 	delete(a.modules, oldName)
@@ -328,13 +356,10 @@ func (a *app) cmdMv(args []string) (err error) {
 
 	if inUser {
 		if err := a.renameHalf(a.userHalf(), oldName, newName, oldDir, newDir); err != nil {
-			return err
-		}
-	}
-	if inSystem {
-		args := []string{"-mv", "-home", a.paths.Home, "-config", a.paths.Config, "--", oldName, newName, oldDir, newDir}
-		if err := a.sudo(args); err != nil {
-			return fmt.Errorf("renaming the system layer (run 'arcus doctor'): %w", err)
+			if inSystem {
+				return fmt.Errorf("renaming the user layer (the system half and module directory were already renamed to %q; run 'arcus doctor'): %w", newName, err)
+			}
+			return fmt.Errorf("renaming the user layer (the module directory was already renamed to %q; run 'arcus doctor'): %w", newName, err)
 		}
 	}
 	if f != nil {
