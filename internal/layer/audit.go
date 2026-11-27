@@ -29,25 +29,35 @@ func (s *Stacker) Audit(module string, activeStack []string) ([]string, error) {
 	}
 	l, above := stack[pos], stack[pos+1:]
 
-	var findings []string
+	var symlinkHits []symlinkHit
+	var entryFindings []string
 	deployed := make(map[string]bool, len(l.Entries))
 	for i, e := range l.Entries {
 		deployed[e.Src] = true
 		// Below a symlinked parent the deployment can't be judged, and
 		// teardown refuses; the module's source can still be checked.
-		if err := s.symlinkProblem(e.Host); err != nil {
-			findings = append(findings, err.Error())
+		if dir, perr := s.parentLink(e.Host); dir != "" {
+			symlinkHits = append(symlinkHits, symlinkHit{dir, e.Host})
+		} else if perr != nil {
+			entryFindings = append(entryFindings, s.inspectFinding(e.Host, perr))
 		} else {
-			findings = append(findings, s.auditDeployment(l, i, above)...)
+			entryFindings = append(entryFindings, s.auditDeployment(l, i, above)...)
 		}
-		if !exists(e.Src) {
-			findings = append(findings, fmt.Sprintf("%s: source %s was deleted from the module", e.Host, e.Src))
+		srcExists, serr := statExists(e.Src)
+		if serr != nil {
+			entryFindings = append(entryFindings, fmt.Sprintf("%s: cannot inspect source %s: %v", e.Host, e.Src, serr))
+		} else if !srcExists {
+			entryFindings = append(entryFindings, fmt.Sprintf("%s: source %s was deleted from the module", e.Host, e.Src))
 		} else if e.Kind == KindCopy {
-			if sum, err := hashFile(e.Src); err == nil && sum != e.SHA256 {
-				findings = append(findings, fmt.Sprintf("%s: source %s changed since deployment", e.Host, e.Src))
+			sum, herr := hashFile(e.Src)
+			if herr != nil {
+				entryFindings = append(entryFindings, fmt.Sprintf("%s: cannot inspect source %s: %v", e.Host, e.Src, herr))
+			} else if sum != e.SHA256 {
+				entryFindings = append(entryFindings, fmt.Sprintf("%s: source %s changed since deployment", e.Host, e.Src))
 			}
 		}
 	}
+	findings := append(formatSymlinkGroups(symlinkHits, teardownSymlinkAdvice), entryFindings...)
 
 	var added int
 	if tree := s.tree(module); tree != "" {
@@ -64,10 +74,20 @@ func (s *Stacker) Audit(module string, activeStack []string) ([]string, error) {
 	return findings, nil
 }
 
+func (s *Stacker) inspectFinding(path string, err error) string {
+	if s.Copy && os.Geteuid() != 0 && errors.Is(err, iofs.ErrPermission) {
+		return fmt.Sprintf("%s: cannot inspect without root: %v", path, err)
+	}
+	return fmt.Sprintf("%s: cannot inspect: %v", path, err)
+}
+
 // auditDeployment reports the drift of entry idx's deployment and backup.
 func (s *Stacker) auditDeployment(l *Ledger, idx int, above []*Ledger) []string {
 	e := l.Entries[idx]
-	st := s.planStep(l, idx, above)
+	st, err := s.planStep(l, idx, above)
+	if err != nil {
+		return []string{s.inspectFinding(e.Host, err)}
+	}
 	var findings []string
 	switch {
 	case st.foreign:
@@ -77,21 +97,29 @@ func (s *Stacker) auditDeployment(l *Ledger, idx int, above []*Ledger) []string 
 	case !st.remove && !st.finished:
 		findings = append(findings, fmt.Sprintf("%s: deployment is missing", e.Host))
 	case st.remove && e.Kind == KindCopy:
-		if f := attrDrift(e, st.loc); f != "" {
+		if f := s.attrDrift(e, st.loc); f != "" {
 			findings = append(findings, f)
 		}
 	}
-	if e.Backup != "" && !exists(e.Backup) && !st.finished {
-		findings = append(findings, fmt.Sprintf("%s: recorded backup %s is missing", e.Host, e.Backup))
+	if e.Backup != "" && !st.finished {
+		backupExists, berr := statExists(e.Backup)
+		if berr != nil {
+			findings = append(findings, s.inspectFinding(e.Backup, berr))
+		} else if !backupExists {
+			findings = append(findings, fmt.Sprintf("%s: recorded backup %s is missing", e.Host, e.Backup))
+		}
 	}
 	return findings
 }
 
 // attrDrift reports a copy whose mode or owner no longer match the ledger.
-func attrDrift(e Entry, loc string) string {
+func (s *Stacker) attrDrift(e Entry, loc string) string {
 	info, err := os.Lstat(loc)
 	if err != nil {
-		return ""
+		if isAbsent(err) {
+			return ""
+		}
+		return s.inspectFinding(loc, err)
 	}
 	mode := fmt.Sprintf("%04o", info.Mode().Perm())
 	uid, gid := -1, -1
@@ -132,6 +160,12 @@ func (s *Stacker) DanglingBackups() ([]string, error) {
 			if e.Backup != "" {
 				referenced[e.Backup] = true
 			}
+			// Deployed files and their parent directories are not backups
+			// even if their name looks like <other>.orig.
+			referenced[e.Host] = true
+			for dir := filepath.Dir(e.Host); dir != s.Target && isWithin(dir, s.Target); dir = filepath.Dir(dir) {
+				referenced[dir] = true
+			}
 		}
 	}
 
@@ -148,6 +182,9 @@ func (s *Stacker) DanglingBackups() ([]string, error) {
 				return err
 			}
 			seen[host] = true
+			if dir, perr := s.parentLink(host); dir != "" || perr != nil {
+				return nil
+			}
 			matches, _ := filepath.Glob(escapeGlob(host) + ".*")
 			for _, m := range matches {
 				if !referenced[m] && tags[backupTag(strings.TrimPrefix(m, host+"."))] {

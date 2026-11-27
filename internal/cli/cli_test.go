@@ -2217,3 +2217,136 @@ func TestExecSystemPackagesRefusesWithoutAURRemove(t *testing.T) {
 	lacks(t, e.sys.Packages(), "foo")
 	contains(t, e.sys.Packages(), "foo-git")
 }
+
+func TestMvRefusesSymlinkedParentWithoutMovingDir(t *testing.T) {
+	t.Run("home symlinked parent", func(t *testing.T) {
+		e := newEnv(t)
+		e.module("old", "", map[string]string{"home/sub/rc": "from old"})
+		must(t, e.run("on", "-y", "old"))
+
+		elsewhere := filepath.Join(t.TempDir(), "sub")
+		must(t, os.Rename(filepath.Join(e.home, "sub"), elsewhere))
+		must(t, os.Symlink(elsewhere, filepath.Join(e.home, "sub")))
+
+		err := e.run("mv", "old", "new")
+		if err == nil || !strings.Contains(err.Error(), "is a symlink") {
+			t.Fatalf("mv = %v, want symlinked-parent refusal", err)
+		}
+		oldDir := filepath.Join(e.home, ".config", "arcus", "modules", "old")
+		newDir := filepath.Join(e.home, ".config", "arcus", "modules", "new")
+		if _, err := os.Stat(oldDir); err != nil {
+			t.Fatalf("old module dir was moved despite refusal: %v", err)
+		}
+		if _, err := os.Lstat(newDir); !errors.Is(err, iofs.ErrNotExist) {
+			t.Fatalf("new module dir appeared despite refusal: %v", err)
+		}
+		if got := e.hostModules(); !slices.Equal(got, []string{"old"}) {
+			t.Errorf("host modules changed: %v", got)
+		}
+	})
+
+	t.Run("system backup symlinked parent", func(t *testing.T) {
+		e := newEnv(t)
+		e.module("old", "", map[string]string{
+			"home/rc":             "home old",
+			"system/etc/sub/conf": "sys old",
+		})
+		e.module("top", "", map[string]string{"system/etc/sub/conf": "sys top"})
+		must(t, e.run("on", "-y", "old"))
+		must(t, e.run("on", "-y", "top"))
+
+		elsewhere := filepath.Join(t.TempDir(), "sub")
+		sysSub := filepath.Join(e.root, "etc", "sub")
+		must(t, os.Rename(sysSub, elsewhere))
+		must(t, os.Symlink(elsewhere, sysSub))
+
+		err := e.run("mv", "old", "new")
+		if err == nil || !strings.Contains(err.Error(), "is a symlink") {
+			t.Fatalf("mv = %v, want system symlinked-parent refusal", err)
+		}
+		if strings.Contains(err.Error(), "run 'arcus doctor'") {
+			t.Errorf("pre-flight refusal should not tell user to run doctor: %v", err)
+		}
+		oldDir := filepath.Join(e.home, ".config", "arcus", "modules", "old")
+		if _, err := os.Stat(oldDir); err != nil {
+			t.Fatalf("old module dir was moved despite system refusal: %v", err)
+		}
+		if got := e.state(false).Modules; !slices.Equal(got, []string{"old"}) {
+			t.Errorf("user state changed despite system refusal: %v", got)
+		}
+		if got := e.hostModules(); !slices.Equal(got, []string{"old", "top"}) {
+			t.Errorf("host modules changed: %v", got)
+		}
+	})
+
+	t.Run("unwritable modules parent dir caught before system rename", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses directory mode bits")
+		}
+		e := newEnv(t)
+		e.module("old", "", map[string]string{"system/etc/old.conf": "sys old"})
+		must(t, e.run("on", "-y", "old"))
+
+		modsDir := filepath.Join(e.home, ".config", "arcus", "modules")
+		must(t, os.Chmod(modsDir, 0o555))
+		t.Cleanup(func() { _ = os.Chmod(modsDir, 0o755) })
+
+		if err := e.run("mv", "old", "new"); err == nil {
+			t.Fatal("mv succeeded on read-only modules dir")
+		}
+		if got := e.state(true).Modules; !slices.Equal(got, []string{"old"}) {
+			t.Errorf("system state renamed despite read-only modules dir: %v", got)
+		}
+	})
+}
+
+func TestHomeLinkRefusesDeployedFiles(t *testing.T) {
+	t.Run("plan refuses link over deployed dir and never says move it away", func(t *testing.T) {
+		e := newEnv(t)
+		e.module("a", "", map[string]string{"home/.config/app/rc": "from a"})
+		must(t, e.run("on", "-y", "a"))
+
+		e.module("b", `links = { ".config/app" = "Sync/app" }`, nil)
+		err := e.run("on", "-y", "b")
+		if err == nil {
+			t.Fatal("on b succeeded despite deployed files under .config/app")
+		}
+		if strings.Contains(err.Error(), "move it away") {
+			t.Errorf("error led user into moving deployed dir: %v", err)
+		}
+		if got := e.hostModules(); !slices.Equal(got, []string{"a"}) {
+			t.Errorf("host modules changed on refusal: %v", got)
+		}
+	})
+
+	t.Run("swap turning off deployed module succeeds", func(t *testing.T) {
+		e := newEnv(t)
+		e.module("a", "", map[string]string{"home/.config/app/rc": "from a"})
+		must(t, e.run("on", "-y", "a"))
+
+		e.module("b", "conflicts = [\"a\"]\nlinks = { \".config/app\" = \"Sync/app\" }\n", nil)
+		must(t, e.run("on", "-y", "b"))
+		got, err := os.Readlink(filepath.Join(e.home, ".config/app"))
+		must(t, err)
+		if got != filepath.Join(e.home, "Sync/app") {
+			t.Fatalf("link = %q", got)
+		}
+	})
+
+	t.Run("runtime link guard refuses even when host dir is already gone", func(t *testing.T) {
+		e := newEnv(t)
+		e.module("alpha", "", map[string]string{"home/.config/app/rc": "from alpha"})
+		must(t, e.run("on", "-y", "alpha"))
+		must(t, os.RemoveAll(filepath.Join(e.home, ".config/app")))
+
+		a := e.app("")
+		must(t, a.load(&opts{}))
+		err := a.link(".config/app -> Sync/app")
+		if err == nil || !strings.Contains(err.Error(), "alpha") || strings.Contains(err.Error(), "move it away") {
+			t.Fatalf("link() = %v, want refusal naming module alpha", err)
+		}
+		if _, statErr := os.Lstat(filepath.Join(e.home, ".config/app")); !errors.Is(statErr, iofs.ErrNotExist) {
+			t.Fatalf("link was created despite ledger entries: %v", statErr)
+		}
+	})
+}

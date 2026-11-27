@@ -61,22 +61,52 @@ func cacheEntry(e Entry) bool {
 // isPyc reports whether path is a regular file laid out like a CPython
 // bytecode cache: a magic number ending in \r\n, a flags word importlib
 // accepts (at most 3), 8 bytes of source stamp, then a marshalled code object
-// ('c', with or without the ref flag).
-func isPyc(path string) bool {
+// ('c', with or without the ref flag). Lookup or read errors are returned so
+// unreadable files aren't misclassified.
+func isPyc(path string) (bool, error) {
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() {
-		return false
+	if err != nil {
+		if isAbsent(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !info.Mode().IsRegular() {
+		return false, nil
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return false
+		if isAbsent(err) {
+			return false, nil
+		}
+		return false, err
 	}
 	defer f.Close()
 	var h [17]byte
 	if _, err := io.ReadFull(f, h[:]); err != nil {
-		return false
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return false, nil
+		}
+		return false, err
 	}
-	return h[2] == '\r' && h[3] == '\n' && binary.LittleEndian.Uint32(h[4:8]) <= 3 && h[16]&^0x80 == 'c'
+	return h[2] == '\r' && h[3] == '\n' && binary.LittleEndian.Uint32(h[4:8]) <= 3 && h[16]&^0x80 == 'c', nil
+}
+
+// isAbsent reports whether err proves nothing exists at the path: either it
+// is not found, or an ancestor is not a directory.
+func isAbsent(err error) bool {
+	return errors.Is(err, iofs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
+}
+
+func statExists(path string) (bool, error) {
+	_, err := os.Lstat(path)
+	if err == nil {
+		return true, nil
+	}
+	if isAbsent(err) {
+		return false, nil
+	}
+	return false, err
 }
 
 func exists(path string) bool {
@@ -120,9 +150,16 @@ func VerifyWritePrivilege(path string) error {
 
 // missingDirs returns the ancestors of dir (inclusive) that do not exist yet,
 // shallowest first, i.e. the directories os.MkdirAll(dir) would create.
-func missingDirs(dir string) []string {
+func missingDirs(dir string) ([]string, error) {
 	var missing []string
-	for !exists(dir) {
+	for {
+		ok, err := statExists(dir)
+		if err != nil {
+			return nil, fmt.Errorf("inspecting %q: %w", dir, err)
+		}
+		if ok {
+			break
+		}
 		missing = append([]string{dir}, missing...)
 		parent := filepath.Dir(dir)
 		if parent == dir {
@@ -130,18 +167,26 @@ func missingDirs(dir string) []string {
 		}
 		dir = parent
 	}
-	return missing
+	return missing, nil
 }
 
-// uniquePath returns base if it is free, otherwise base.1, base.2, ...
-func uniquePath(base string) string {
-	if !exists(base) {
-		return base
-	}
-	for i := 1; ; i++ {
-		candidate := fmt.Sprintf("%s.%d", base, i)
-		if !exists(candidate) {
-			return candidate
+// uniquePath returns base if it is free (not on disk and not in reserved),
+// otherwise base.1, base.2, ...
+func uniquePath(base string, reserved map[string]bool) (string, error) {
+	for i := 0; ; i++ {
+		candidate := base
+		if i > 0 {
+			candidate = fmt.Sprintf("%s.%d", base, i)
+		}
+		if reserved[candidate] {
+			continue
+		}
+		ok, err := statExists(candidate)
+		if err != nil {
+			return "", fmt.Errorf("checking %q: %w", candidate, err)
+		}
+		if !ok {
+			return candidate, nil
 		}
 	}
 }
@@ -202,26 +247,43 @@ func parseMode(mode string) (os.FileMode, error) {
 }
 
 // owns reports whether loc currently holds exactly the deployment described by e.
-func owns(e Entry, loc string) bool {
+// Lookup or read errors are returned so unreadable files aren't treated as
+// foreign or absent.
+func owns(e Entry, loc string) (bool, error) {
 	info, err := os.Lstat(loc)
 	if err != nil {
-		return false
+		if isAbsent(err) {
+			return false, nil
+		}
+		return false, err
 	}
 	switch e.Kind {
 	case KindLink:
 		if info.Mode()&os.ModeSymlink == 0 {
-			return false
+			return false, nil
 		}
 		target, err := os.Readlink(loc)
-		return err == nil && target == e.Src
+		if err != nil {
+			if isAbsent(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		return target == e.Src, nil
 	case KindCopy:
 		if !info.Mode().IsRegular() {
-			return false
+			return false, nil
 		}
 		sum, err := hashFile(loc)
-		return err == nil && sum == e.SHA256
+		if err != nil {
+			if isAbsent(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		return sum == e.SHA256, nil
 	}
-	return false
+	return false, nil
 }
 
 // renameDurable renames and fsyncs both parent directories.
@@ -247,7 +309,10 @@ func removeDurable(path string) error {
 
 // symlinkReplace points link at target, atomically replacing anything at link.
 func symlinkReplace(target, link string) error {
-	tmp := uniquePath(link + ".arcus-tmp")
+	tmp, err := uniquePath(link+".arcus-tmp", nil)
+	if err != nil {
+		return err
+	}
 	if err := os.Symlink(target, tmp); err != nil {
 		return err
 	}

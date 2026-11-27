@@ -219,3 +219,35 @@ func TestPreviewShowsReplacedFiles(t *testing.T) {
 		sb.assertNoLedgers()
 	})
 }
+
+func TestUnprivilegedSystemPreviewToleratesProtectedDirAndFreedAncestor(t *testing.T) {
+	t.Run("protected root-only directory", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses directory mode bits")
+		}
+		sb := newSandbox(t, halves[1])
+		prot := filepath.Join(sb.host, "sudoers.d")
+		must(t, os.MkdirAll(prot, 0o755))
+		must(t, os.WriteFile(filepath.Join(prot, "rule"), []byte("existing"), 0o600))
+		must(t, os.Chmod(prot, 0))
+		t.Cleanup(func() { _ = os.Chmod(prot, 0o755) })
+
+		sb.moduleFile("p", "sudoers.d/rule", "from p")
+		if _, err := sb.s.Preview("p", nil, nil); err != nil {
+			t.Fatalf("unprivileged system Preview failed on protected dir: %v", err)
+		}
+		if err := sb.activate("p"); err == nil {
+			t.Fatal("Activate succeeded on unreadable protected dir")
+		}
+	})
+
+	t.Run("freed regular file ancestor", func(t *testing.T) {
+		sb := newSandbox(t, halves[1])
+		sb.hostFile("foo", "regular file")
+		sb.moduleFile("p", "foo/bar", "from p")
+		freed := map[string]bool{filepath.Join(sb.host, "foo"): true}
+		if _, err := sb.s.Preview("p", nil, freed); err != nil {
+			t.Fatalf("Preview failed with freed regular-file ancestor: %v", err)
+		}
+	})
+}

@@ -334,6 +334,10 @@ func User(in Input, h Half) ([]Step, error) {
 			}
 		}
 	}
+	links := additions(in, h.State, Link, UserSetup, state.HomeLinks, h.Links)
+	if err := checkHomeLinks(in, h, links); err != nil {
+		return nil, err
+	}
 	layers, err := layerSteps(in, h, UserTeardown, UserSetup, unlinked)
 	if err != nil {
 		return nil, err
@@ -346,7 +350,7 @@ func User(in Input, h Half) ([]Step, error) {
 	steps = append(steps, packageRemovals(in, h, Remove, AURRemove, state.AUR)...)
 	steps = append(steps, additions(in, h.State, Install, AURInstall, state.AUR, h.Installed)...)
 	steps = append(steps, additions(in, h.State, Mkdir, UserSetup, state.HomeDirs, h.Dirs)...)
-	steps = append(steps, additions(in, h.State, Link, UserSetup, state.HomeLinks, h.Links)...)
+	steps = append(steps, links...)
 	images, err := appImageAdditions(in, h, unlinked)
 	if err != nil {
 		return nil, err
@@ -355,6 +359,56 @@ func User(in Input, h Half) ([]Step, error) {
 	steps = append(steps, layers.on...)
 	steps = append(steps, additions(in, h.State, Enable, UserSetup, state.UserUnits, h.Units)...)
 	return steps, nil
+}
+
+// checkHomeLinks refuses links being created or adopted when they collide with
+// a desired module's home/ tree or any ledger not turning off in this run.
+func checkHomeLinks(in Input, h Half, links []Step) error {
+	if len(links) == 0 || h.Layer == nil {
+		return nil
+	}
+	off := map[string]bool{}
+	for _, name := range h.State.Modules {
+		if !slices.Contains(in.Desired, name) {
+			off[name] = true
+		}
+	}
+	for _, s := range links {
+		if s.Op != Link && s.Op != Adopt {
+			continue
+		}
+		for _, n := range s.Names {
+			p, _, ok := module.SplitLink(n)
+			if !ok {
+				continue
+			}
+			host := filepath.Join(h.Layer.Target, p)
+			for _, m := range in.Desired {
+				hit, err := h.Layer.TreeCollisions(m, host)
+				if err != nil {
+					return err
+				}
+				if hit {
+					return fmt.Errorf("module %s links ~/%s, but module %s deploys files there from its home/; drop the link or the files", s.Module, p, m)
+				}
+			}
+			mods, err := h.Layer.LedgerCollisions(host, off)
+			if err != nil {
+				return err
+			}
+			if len(mods) > 0 {
+				if s.Op == Adopt {
+					return fmt.Errorf("module %s links ~/%s, which already sits over files deployed by %s; turn ~/%s back into a real directory first", s.Module, p, strings.Join(mods, ", "), p)
+				}
+				verb, pronoun := "has", mods[0]
+				if len(mods) > 1 {
+					verb, pronoun = "have", "them"
+				}
+				return fmt.Errorf("module %s links ~/%s, but %s still %s files deployed there; apply once without the link (or turn %s off), then add it back", s.Module, p, strings.Join(mods, ", "), verb, pronoun)
+			}
+		}
+	}
+	return nil
 }
 
 // appImageRemovals plans the AppImages reconciling releases. Every recorded

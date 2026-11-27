@@ -104,7 +104,7 @@ description = "Shared Wayland session pieces"
 category  = "desktop"
 requires  = ["base"]
 dirs      = ["Pictures/Screenshots"]   # created if missing; removed on off only when empty
-links     = { ".config/app/data" = "Sync/app/data" }   # symlinks in $HOME, both sides relative to it; removed on off only while unchanged
+links     = { ".config/app/data" = "Sync/app/data" }   # symlinks in $HOME, both sides relative to it; removed on off only while unchanged; can't overlap a module's home/ files (replacing a staying module's deployed files with a link takes two applies)
 conflicts = []
 groups    = ["video"]
 
