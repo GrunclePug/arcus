@@ -85,6 +85,9 @@ func TestLoadRejects(t *testing.T) {
 		{"option-like package", "p", "[packages]\npacman = [\"--noconfirm\"]", "invalid name"},
 		{"package with space", "p", "[packages]\naur = [\"a b\"]", "invalid name"},
 		{"unit without suffix", "p", "[units]\nsystem = [\"bluetooth\"]", "invalid name"},
+		{"bare system template unit", "p", "[units]\nsystem = [\"getty@.service\"]", "template unit"},
+		{"bare user template unit", "p", "[units]\nuser = [\"syncthing@.service\"]", "template unit"},
+		{"dotted bare template unit", "p", "[units]\nsystem = [\"a.b@.service\"]", "template unit"},
 		{"bad group", "p", `groups = ["Video"]`, "invalid name"},
 		{"dir outside home", "p", `dirs = ["../etc"]`, "dirs: \"../etc\""},
 		{"absolute dir", "p", `dirs = ["/srv"]`, "dirs: \"/srv\""},
@@ -336,6 +339,21 @@ func TestLocalPackagesNeedARecipe(t *testing.T) {
 	}
 	if _, err := Load(dir); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestValidNamesUnits(t *testing.T) {
+	in := []string{"sshd.service", "getty@tty1.service", "getty@.service", "a.b@.service", "foo@.bar.service", "foo.slice", `mnt-my\x2dshare.mount`}
+	ok, bad := ValidNames("units.system", in)
+	if want := []string{"sshd.service", "getty@tty1.service", "foo@.bar.service", `mnt-my\x2dshare.mount`}; !slices.Equal(ok, want) {
+		t.Errorf("ok = %v, want %v", ok, want)
+	}
+	if want := []string{"getty@.service", "a.b@.service", "foo.slice"}; !slices.Equal(bad, want) {
+		t.Errorf("bad = %v, want %v", bad, want)
+	}
+	okU, badU := ValidNames("units.user", []string{"syncthing@u.service", "syncthing@.service"})
+	if !slices.Equal(okU, []string{"syncthing@u.service"}) || !slices.Equal(badU, []string{"syncthing@.service"}) {
+		t.Errorf("user: ok=%v bad=%v", okU, badU)
 	}
 }
 

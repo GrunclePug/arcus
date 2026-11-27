@@ -31,7 +31,9 @@ func TestCommandsAgainstFakes(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if units, err := EnabledUnits(true); err != nil || len(units) != 0 {
+	sysDirs := UnitDirs(sys.Root, sys.ConfigHome, filepath.Join(filepath.Dir(sys.ConfigHome), ".local/share"), false)
+	userDirs := UnitDirs(sys.Root, sys.ConfigHome, filepath.Join(filepath.Dir(sys.ConfigHome), ".local/share"), true)
+	if units, err := EnabledUnits(sys.Root, userDirs); err != nil || len(units) != 0 {
 		t.Fatalf("an empty query is an empty set: %v, %v", units, err)
 	}
 	must(r.PacmanInstall([]string{"foot", "wmenu"}))
@@ -48,12 +50,12 @@ func TestCommandsAgainstFakes(t *testing.T) {
 	if got, want := keys(installed), []string{"base", "foot", "go", "wlr-randr-git"}; !slices.Equal(got, want) {
 		t.Errorf("installed = %v, want %v", got, want)
 	}
-	units, err := EnabledUnits(false)
+	units, err := EnabledUnits(sys.Root, sysDirs)
 	must(err)
 	if got := keys(units); !slices.Equal(got, []string{"bluetooth.service"}) {
 		t.Errorf("system units = %v", got)
 	}
-	units, err = EnabledUnits(true)
+	units, err = EnabledUnits(sys.Root, userDirs)
 	must(err)
 	if got := keys(units); !slices.Equal(got, []string{"mako.service"}) {
 		t.Errorf("user units = %v", got)
@@ -248,19 +250,336 @@ func TestCarch(t *testing.T) {
 	}
 }
 
-func TestEnabledOffPreset(t *testing.T) {
-	sys := fake.New(t)
-	sys.SetUnits(false, "sshd.service", "getty@.service", "fstrim.timer")
-	sys.SetPresets(false, "getty@.service")
-	got, err := EnabledOffPreset(false)
+func writeTestFile(t *testing.T, path, content string, mode os.FileMode) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func makeTestLink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEnabledUnits(t *testing.T) {
+	root := t.TempDir()
+	cfg := filepath.Join(root, "home/u/.config")
+	data := filepath.Join(root, "home/u/.local/share")
+	sysDirs := UnitDirs(root, cfg, data, false)
+	userDirs := UnitDirs(root, cfg, data, true)
+	etcSys := sysDirs[0]
+	libSys := sysDirs[2]
+
+	// Missing dirs[0] is an empty set, not an error.
+	if got, err := EnabledUnits(root, sysDirs); err != nil || len(got) != 0 {
+		t.Fatalf("missing system dir: %v, %v", got, err)
+	}
+	if got, err := EnabledUnits(root, nil); err != nil || len(got) != 0 {
+		t.Fatalf("empty dirs: %v, %v", got, err)
+	}
+
+	// Vendor system units.
+	for name, body := range map[string]string{
+		"sshd.service":                      "[Install]\nWantedBy=multi-user.target\n",
+		"req.service":                       "[Install]\nRequiredBy=multi-user.target\n",
+		"uph.service":                       "[Install]\nUpheldBy=multi-user.target\n",
+		"getty@.service":                    "[Install]\nAlias=autovt@.service\nWantedBy=getty.target\nDefaultInstance=tty1\n",
+		"wg-quick@.service":                 "[Install]\nWantedBy=multi-user.target\n",
+		"NetworkManager-dispatcher.service": "[Install]\nAlias=dbus-org.freedesktop.nm-dispatcher.service\n",
+		"multi-user.target":                 "[Unit]\nDescription=Multi-User\n",
+		"masked.service":                    "[Install]\nWantedBy=multi-user.target\n",
+		"empty-masked.service":              "[Install]\nWantedBy=multi-user.target\n",
+		"link-empty.service":                "[Install]\nWantedBy=multi-user.target\n",
+		"chain-mask.service":                "[Install]\nWantedBy=multi-user.target\n",
+		"brok-shadow.service":               "[Install]\nWantedBy=multi-user.target\n",
+		"dep-mask.service":                  "[Install]\nWantedBy=multi-user.target\n",
+		"dep-relmask.service":               "[Install]\nWantedBy=multi-user.target\n",
+		"alias-masked.service":              "[Install]\nAlias=am.service\n",
+		"real.service":                      "[Install]\nWantedBy=multi-user.target\n",
+		"other.service":                     "[Install]\nWantedBy=multi-user.target\n",
+		"libu.service":                      "[Install]\nAlias=libalias.service\n",
+	} {
+		writeTestFile(t, filepath.Join(libSys, name), body, 0o644)
+	}
+	// Merged-/usr /lib -> usr/lib symlink inside root.
+	makeTestLink(t, "usr/lib", filepath.Join(root, "lib"))
+
+	// Active enablement links: .wants, .requires, .upholds, template instances,
+	// stock Arch getty@.service layout (autovt@.service + getty@tty1.service),
+	// stale autovt@tty2.service, alias-only unit, merged-/usr alias,
+	// mismatched .wants target (systemd loads by entry name), and linked external
+	// alias-only unit.
+	makeTestLink(t, "/usr/lib/systemd/system/sshd.service", filepath.Join(etcSys, "multi-user.target.wants/sshd.service"))
+	makeTestLink(t, "/usr/lib/systemd/system/req.service", filepath.Join(etcSys, "multi-user.target.requires/req.service"))
+	makeTestLink(t, "/usr/lib/systemd/system/uph.service", filepath.Join(etcSys, "multi-user.target.upholds/uph.service"))
+	makeTestLink(t, "/usr/lib/systemd/system/getty@.service", filepath.Join(etcSys, "getty.target.wants/getty@tty1.service"))
+	makeTestLink(t, "/usr/lib/systemd/system/getty@.service", filepath.Join(etcSys, "autovt@.service"))
+	makeTestLink(t, "/usr/lib/systemd/system/getty@.service", filepath.Join(etcSys, "autovt@tty2.service"))
+	makeTestLink(t, "/usr/lib/systemd/system/wg-quick@.service", filepath.Join(etcSys, "multi-user.target.wants/wg-quick@wg0.service"))
+	makeTestLink(t, "/usr/lib/systemd/system/wg-quick@.service", filepath.Join(etcSys, "multi-user.target.wants/wg-quick@.service")) // bare template in wants: ignored
+	makeTestLink(t, "/usr/lib/systemd/system/NetworkManager-dispatcher.service", filepath.Join(etcSys, "dbus-org.freedesktop.nm-dispatcher.service"))
+	makeTestLink(t, "/lib/systemd/system/libu.service", filepath.Join(etcSys, "libalias.service"))
+	makeTestLink(t, "/usr/lib/systemd/system/other.service", filepath.Join(etcSys, "multi-user.target.wants/real.service"))
+
+	// Alias-only linked external unit: ext.service -> /opt/ext/ext.service,
+	// alias extalias.service -> /etc/systemd/system/ext.service.
+	writeTestFile(t, filepath.Join(root, "opt/ext/ext.service"), "[Install]\nAlias=extalias.service\n", 0o644)
+	makeTestLink(t, "/opt/ext/ext.service", filepath.Join(etcSys, "ext.service"))
+	makeTestLink(t, "/etc/systemd/system/ext.service", filepath.Join(etcSys, "extalias.service"))
+
+	// External linked fragment with a different name that happens to match a
+	// vendor unit basename must NOT be misclassified as an alias of that vendor unit.
+	writeTestFile(t, filepath.Join(root, "opt/ext/alias-masked.service"), "[Install]\nAlias=not-an-alias.service\n", 0o644)
+	makeTestLink(t, "/opt/ext/alias-masked.service", filepath.Join(etcSys, "not-an-alias.service"))
+
+	// Non-Alias= top-level link (systemctl set-default) must be ignored.
+	makeTestLink(t, "/usr/lib/systemd/system/multi-user.target", filepath.Join(etcSys, "default.target"))
+
+	// Dangling .wants link (uninstalled package) must be ignored.
+	makeTestLink(t, "/usr/lib/systemd/system/gone.service", filepath.Join(etcSys, "multi-user.target.wants/gone.service"))
+
+	// Symlinked .wants directory (not IsDir()) is safely ignored.
+	writeTestFile(t, filepath.Join(root, "opt/fakewants/target.service"), "[Unit]\n", 0o644)
+	makeTestLink(t, "/opt/fakewants", filepath.Join(etcSys, "linked.target.wants"))
+
+	// Masks: /dev/null, 0-byte file, symlink to 0-byte file, chained symlink to /dev/null,
+	// broken symlink in /etc shadowing /usr/lib, masked exact instance shadowing template,
+	// dep link to /dev/null and relative ../../../dev/null, and masked alias target.
+	makeTestLink(t, "/dev/null", filepath.Join(etcSys, "masked.service"))
+	makeTestLink(t, "/usr/lib/systemd/system/masked.service", filepath.Join(etcSys, "multi-user.target.wants/masked.service"))
+	writeTestFile(t, filepath.Join(etcSys, "empty-masked.service"), "", 0o644)
+	makeTestLink(t, "/usr/lib/systemd/system/empty-masked.service", filepath.Join(etcSys, "multi-user.target.wants/empty-masked.service"))
+	writeTestFile(t, filepath.Join(root, "opt/zero.service"), "", 0o644)
+	makeTestLink(t, "/opt/zero.service", filepath.Join(etcSys, "link-empty.service"))
+	makeTestLink(t, "/usr/lib/systemd/system/link-empty.service", filepath.Join(etcSys, "multi-user.target.wants/link-empty.service"))
+	makeTestLink(t, "/dev/null", filepath.Join(root, "opt/to-null"))
+	makeTestLink(t, "/opt/to-null", filepath.Join(etcSys, "chain-mask.service"))
+	makeTestLink(t, "/usr/lib/systemd/system/chain-mask.service", filepath.Join(etcSys, "multi-user.target.wants/chain-mask.service"))
+	makeTestLink(t, "/nonexistent/brok-shadow.service", filepath.Join(etcSys, "brok-shadow.service"))
+	makeTestLink(t, "/usr/lib/systemd/system/brok-shadow.service", filepath.Join(etcSys, "multi-user.target.wants/brok-shadow.service"))
+	makeTestLink(t, "/dev/null", filepath.Join(etcSys, "wg-quick@wg1.service"))
+	makeTestLink(t, "/usr/lib/systemd/system/wg-quick@.service", filepath.Join(etcSys, "multi-user.target.wants/wg-quick@wg1.service"))
+	makeTestLink(t, "/dev/null", filepath.Join(etcSys, "multi-user.target.wants/dep-mask.service"))
+	makeTestLink(t, "../../../../../../dev/null", filepath.Join(etcSys, "multi-user.target.wants/dep-relmask.service"))
+	makeTestLink(t, "/dev/null", filepath.Join(etcSys, "alias-masked.service"))
+	makeTestLink(t, "/usr/lib/systemd/system/alias-masked.service", filepath.Join(etcSys, "am.service"))
+
+	got, err := EnabledUnits(root, sysDirs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"fstrim.timer", "sshd.service"}; !slices.Equal(got, want) {
-		t.Errorf("got %v, want %v", got, want)
+	want := []string{
+		"NetworkManager-dispatcher.service",
+		"ext.service",
+		"getty@tty1.service",
+		"libu.service",
+		"real.service",
+		"req.service",
+		"sshd.service",
+		"uph.service",
+		"wg-quick@wg0.service",
 	}
-	if got, err := EnabledOffPreset(true); err != nil || len(got) != 0 {
-		t.Errorf("no user units: %v, %v", got, err)
+	if !slices.Equal(keys(got), want) {
+		t.Errorf("system EnabledUnits = %v\nwant %v", keys(got), want)
+	}
+
+	// User scope: ignores /etc/systemd/user/*.wants, sees ~/.config/systemd/user/*.wants,
+	// respects /etc/systemd/user masks, sees /usr/share/systemd/user units, and does
+	// not treat same-name home/-deployed unit links as enabled without a .wants link.
+	writeTestFile(t, filepath.Join(root, "usr/lib/systemd/user/pipewire.socket"), "[Install]\nWantedBy=sockets.target\n", 0o644)
+	writeTestFile(t, filepath.Join(root, "usr/lib/systemd/user/syncthing.service"), "[Install]\nWantedBy=default.target\n", 0o644)
+	writeTestFile(t, filepath.Join(root, "usr/lib/systemd/user/globally-masked.service"), "[Install]\nWantedBy=default.target\n", 0o644)
+	writeTestFile(t, filepath.Join(root, "usr/share/systemd/user/shared-app.service"), "[Install]\nWantedBy=default.target\n", 0o644)
+	writeTestFile(t, filepath.Join(root, "home/u/.config/arcus/modules/m/home/.config/systemd/user/home-unit.service"), "[Install]\nWantedBy=default.target\n", 0o644)
+
+	makeTestLink(t, "/usr/lib/systemd/user/pipewire.socket", filepath.Join(root, "etc/systemd/user/sockets.target.wants/pipewire.socket"))
+	makeTestLink(t, "/dev/null", filepath.Join(root, "etc/systemd/user/globally-masked.service"))
+	makeTestLink(t, "/usr/lib/systemd/user/syncthing.service", filepath.Join(cfg, "systemd/user/default.target.wants/syncthing.service"))
+	makeTestLink(t, "/usr/lib/systemd/user/globally-masked.service", filepath.Join(cfg, "systemd/user/default.target.wants/globally-masked.service"))
+	makeTestLink(t, "/usr/share/systemd/user/shared-app.service", filepath.Join(cfg, "systemd/user/default.target.wants/shared-app.service"))
+	makeTestLink(t, filepath.Join(root, "home/u/.config/arcus/modules/m/home/.config/systemd/user/home-unit.service"), filepath.Join(cfg, "systemd/user/home-unit.service"))
+
+	gotUser, err := EnabledUnits(root, userDirs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wantUser := []string{"shared-app.service", "syncthing.service"}; !slices.Equal(keys(gotUser), wantUser) {
+		t.Errorf("user EnabledUnits = %v, want %v", keys(gotUser), wantUser)
+	}
+
+	// Enabling the home/-deployed unit via .wants makes it visible.
+	makeTestLink(t, filepath.Join(cfg, "systemd/user/home-unit.service"), filepath.Join(cfg, "systemd/user/default.target.wants/home-unit.service"))
+	gotUser, err = EnabledUnits(root, userDirs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wantUser := []string{"home-unit.service", "shared-app.service", "syncthing.service"}; !slices.Equal(keys(gotUser), wantUser) {
+		t.Errorf("user EnabledUnits with home unit = %v, want %v", keys(gotUser), wantUser)
+	}
+}
+
+func TestEnabledUnitsPermissions(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission checks don't restrict root")
+	}
+	root := t.TempDir()
+	dirs := UnitDirs(root, filepath.Join(root, "home/u/.config"), filepath.Join(root, "home/u/.local/share"), false)
+	etcSys := dirs[0]
+
+	// A 0600 unit file with a .wants link is still seen (unitFile is stat-only),
+	// and a 0600 alias-only unit is skipped gracefully without aborting inventory.
+	writeTestFile(t, filepath.Join(etcSys, "secret.service"), "[Install]\nWantedBy=multi-user.target\nAlias=secret-alias.service\n", 0o600)
+	if err := os.Chmod(filepath.Join(etcSys, "secret.service"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(etcSys, "secret.service"), 0o644) })
+	makeTestLink(t, "/etc/systemd/system/secret.service", filepath.Join(etcSys, "multi-user.target.wants/secret.service"))
+	makeTestLink(t, "/etc/systemd/system/secret.service", filepath.Join(etcSys, "secret-alias.service"))
+
+	writeTestFile(t, filepath.Join(etcSys, "alias-only-secret.service"), "[Install]\nAlias=aos.service\n", 0o600)
+	if err := os.Chmod(filepath.Join(etcSys, "alias-only-secret.service"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(etcSys, "alias-only-secret.service"), 0o644) })
+	makeTestLink(t, "/etc/systemd/system/alias-only-secret.service", filepath.Join(etcSys, "aos.service"))
+
+	// An unrelated top-level link whose parent traverses an unreadable external
+	// directory must not abort inventory with EACCES.
+	privDir := filepath.Join(root, "root/private")
+	writeTestFile(t, filepath.Join(privDir, "nested/ext.service"), "[Unit]\n", 0o644)
+	if err := os.Chmod(privDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(privDir, 0o755) })
+	makeTestLink(t, "/root/private/nested/ext.service", filepath.Join(etcSys, "priv-ext.service"))
+
+	got, err := EnabledUnits(root, dirs)
+	if err != nil {
+		t.Fatalf("0600 units must not fail inventory: %v", err)
+	}
+	if want := []string{"secret.service"}; !slices.Equal(keys(got), want) {
+		t.Errorf("got %v, want %v", keys(got), want)
+	}
+
+	// An unreadable enablement directory itself IS an error.
+	badRoot := t.TempDir()
+	badDirs := UnitDirs(badRoot, filepath.Join(badRoot, "home/u/.config"), filepath.Join(badRoot, "home/u/.local/share"), false)
+	if err := os.MkdirAll(badDirs[0], 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(badDirs[0], 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(badDirs[0], 0o755) })
+	if _, err := EnabledUnits(badRoot, badDirs); err == nil {
+		t.Error("unreadable dirs[0] must return an error")
+	}
+}
+
+func TestResolveInRoot(t *testing.T) {
+	// Root "/" handles real absolute paths and /dev/null without double slashes.
+	tmp := t.TempDir()
+	realFile := filepath.Join(tmp, "a.service")
+	writeTestFile(t, realFile, "[Unit]\n", 0o644)
+	linkFile := filepath.Join(tmp, "link.service")
+	makeTestLink(t, realFile, linkFile)
+	resolved, fi, devNull, err := resolveInRoot("/", linkFile)
+	if err != nil || devNull || fi == nil || !fi.Mode().IsRegular() || filepath.Base(resolved) != "a.service" {
+		t.Fatalf("root=/ link: resolved=%q fi=%v devNull=%v err=%v", resolved, fi, devNull, err)
+	}
+	nullLink := filepath.Join(tmp, "mask.service")
+	makeTestLink(t, "/dev/null", nullLink)
+	if _, _, devNull, err := resolveInRoot("/", nullLink); err != nil || !devNull {
+		t.Fatalf("root=/ mask: devNull=%v err=%v", devNull, err)
+	}
+
+	// Sandboxed root clamps relative .. escapes and stays inside root.
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "etc/target"), "inside", 0o644)
+	esc := filepath.Join(root, "a/b/esc")
+	makeTestLink(t, "../../../../../../../../etc/target", esc)
+	resolved, fi, devNull, err = resolveInRoot(root, esc)
+	if err != nil || devNull || resolved != filepath.Join(root, "etc/target") || fi.Size() != 6 {
+		t.Fatalf("clamped escape: resolved=%q devNull=%v err=%v", resolved, devNull, err)
+	}
+	// Symlinked parent directory inside root resolves inside root.
+	makeTestLink(t, "/etc", filepath.Join(root, "dirlink"))
+	resolved, _, devNull, err = resolveInRoot(root, filepath.Join(root, "dirlink/target"))
+	if err != nil || devNull || resolved != filepath.Join(root, "etc/target") {
+		t.Fatalf("parent symlink: resolved=%q devNull=%v err=%v", resolved, devNull, err)
+	}
+}
+
+func TestEnabledUnitsWithSystemctl(t *testing.T) {
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		t.Skip("systemctl is not installed")
+	}
+	root := t.TempDir()
+	libSys := filepath.Join(root, "usr/lib/systemd/system")
+	etcSys := filepath.Join(root, "etc/systemd/system")
+	if err := os.MkdirAll(etcSys, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{
+		"getty@.service":  "[Install]\nAlias=autovt@.service\nWantedBy=getty.target\nDefaultInstance=tty1\n",
+		"wg@.service":     "[Install]\nWantedBy=multi-user.target\n",
+		"nm.service":      "[Install]\nWantedBy=multi-user.target\nAlso=nm-disp.service\n",
+		"nm-disp.service": "[Install]\nAlias=dbus-nm-disp.service\n",
+		"qalias.service":  "[Install]\nAlias=\"quoted-alias.service\" 'single-alias.service'\n",
+		"escaped.service": "[Install]\nAlias=\"quoted\\x2dalias.service\"\n",
+	} {
+		writeTestFile(t, filepath.Join(libSys, name), body, 0o644)
+	}
+	// Alias-only linked external unit file.
+	writeTestFile(t, filepath.Join(root, "opt/ext/ext.service"), "[Install]\nAlias=ext-alias.service\n", 0o644)
+	makeTestLink(t, "/opt/ext/ext.service", filepath.Join(etcSys, "ext.service"))
+
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("systemctl", append([]string{"--root=" + root}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("systemctl %v: %v\n%s", args, err, out)
+		}
+	}
+	run("enable", "getty@.service")
+	run("enable", "getty@tty2.service")
+	run("enable", "wg@0.service")
+	run("enable", "wg@1.service")
+	run("enable", "nm.service")
+	run("enable", "ext.service")
+	run("enable", "qalias.service")
+	run("enable", "escaped.service")
+
+	dirs := UnitDirs(root, filepath.Join(root, "home/u/.config"), filepath.Join(root, "home/u/.local/share"), false)
+	got, err := EnabledUnits(root, dirs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"escaped.service", "ext.service", "getty@tty1.service", "getty@tty2.service", "nm-disp.service", "nm.service", "qalias.service", "wg@0.service", "wg@1.service"}
+	if !slices.Equal(keys(got), want) {
+		t.Fatalf("after enable: got %v, want %v", keys(got), want)
+	}
+
+	// Disabling one instance leaves sibling instances intact, and any stale
+	// instance alias (autovt@tty2.service) is ignored.
+	run("disable", "getty@tty2.service")
+	run("disable", "wg@0.service")
+	got, err = EnabledUnits(root, dirs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = []string{"escaped.service", "ext.service", "getty@tty1.service", "nm-disp.service", "nm.service", "qalias.service", "wg@1.service"}
+	if !slices.Equal(keys(got), want) {
+		t.Fatalf("after disable: got %v, want %v", keys(got), want)
 	}
 }
 
@@ -269,37 +588,109 @@ func TestWithAlso(t *testing.T) {
 	dirs := UnitDirs(root, filepath.Join(root, "home/.config"), filepath.Join(root, "home/.local/share"), false)
 	write := func(dir, name, content string) {
 		t.Helper()
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		writeTestFile(t, filepath.Join(dir, name), content, 0o644)
 	}
-	write(dirs[2], "nm.service", "[Unit]\nAlso=not-install.service\n[Install]\nWantedBy=multi-user.target\nAlso=nm-dispatcher.service\nAlso = nm-wait.service other.socket\n")
+	write(dirs[2], "nm.service", "[Unit]\nAlso=not-install.service\n[Install]\n; semicolon comment\n# hash comment\nWantedBy=multi-user.target\nAlso=nm-dispatcher.service\nAlso = nm-wait.service other.socket\nAlso=\n")
 	write(dirs[2], "other.socket", "[Install]\nAlso=nm.service\n")
-	write(dirs[2], "tpl@.service", "[Install]\nAlso=tpl-helper.service\n")
+	write(dirs[2], "tpl@.service", "[Install]\nAlso=tpl-helper.service tpl-sub@%i.service skip@%p.service lit%%@%i.service\n")
 	// The copy in /etc wins over the vendor's.
 	write(dirs[2], "over.service", "[Install]\nAlso=vendor.service\n")
 	write(dirs[0], "over.service", "[Install]\n")
+	// Masked unit adds nothing.
+	write(dirs[2], "masked.service", "[Install]\nAlso=should-not-follow.service\n")
+	makeTestLink(t, "/dev/null", filepath.Join(dirs[0], "masked.service"))
 	// Modules deploy their own units to /usr/local.
 	write(dirs[1], "local.service", "[Install]\nAlso=local.timer\n")
+	// Order-sensitive Also= around DefaultInstance= in a bare template reached via Also=,
+	// reading the template directly (ignoring an exact instance override).
+	write(dirs[2], "parent.service", "[Install]\nAlso=order@.service\n")
+	write(dirs[2], "order@.service", "[Install]\nAlso=before@%i.service\nDefaultInstance=one\nAlso=after@%i.service\n")
+	write(dirs[0], "order@one.service", "[Install]\nAlso=override-only.service\n")
+	// DefaultInstance reset and DefaultInstance=- (like xfs_healer@.service).
+	write(dirs[2], "dash-parent.service", "[Install]\nAlso=dash@.service\n")
+	write(dirs[2], "dash@.service", "[Install]\nDefaultInstance=tmp\nDefaultInstance=\nDefaultInstance=-\n")
+	// Bare template without DefaultInstance= still walks its plain Also= entries.
+	write(dirs[2], "nodef-parent.service", "[Install]\nAlso=nodef@.service\n")
+	write(dirs[2], "nodef@.service", "[Install]\nAlso=nodef-helper.service nodef-sub@%i.service\n")
 
-	got := WithAlso(dirs, []string{"nm.service", "tpl@a.service", "over.service", "nofile.timer", "local.service"})
-	want := []string{"nm.service", "tpl@a.service", "over.service", "nofile.timer", "local.service", "nm-dispatcher.service", "nm-wait.service", "other.socket", "tpl-helper.service", "local.timer"}
+	got, err := WithAlso(root, dirs, []string{"nm.service", "tpl@a.service", "over.service", "masked.service", "nofile.timer", "local.service"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"nm.service", "tpl@a.service", "over.service", "masked.service", "nofile.timer", "local.service", "nm-dispatcher.service", "nm-wait.service", "other.socket", "tpl-helper.service", "tpl-sub@a.service", "lit%@a.service", "local.timer"}
 	if !slices.Equal(got, want) {
 		t.Errorf("got %v\nwant %v", got, want)
 	}
+
+	gotOrder, err := WithAlso(root, dirs, []string{"parent.service"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wantOrder := []string{"parent.service", "order@one.service", "after@one.service"}; !slices.Equal(gotOrder, wantOrder) {
+		t.Errorf("order-sensitive template: got %v, want %v", gotOrder, wantOrder)
+	}
+	// When order@one.service is also declared directly, its exact override is walked too.
+	gotBoth, err := WithAlso(root, dirs, []string{"parent.service", "order@one.service"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wantBoth := []string{"parent.service", "order@one.service", "override-only.service", "after@one.service"}; !slices.Equal(gotBoth, wantBoth) {
+		t.Errorf("parent + direct instance: got %v, want %v", gotBoth, wantBoth)
+	}
+
+	gotDash, err := WithAlso(root, dirs, []string{"dash-parent.service"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wantDash := []string{"dash-parent.service", "dash@-.service"}; !slices.Equal(gotDash, wantDash) {
+		t.Errorf("dash default instance: got %v, want %v", gotDash, wantDash)
+	}
+
+	gotNoDef, err := WithAlso(root, dirs, []string{"nodef-parent.service"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wantNoDef := []string{"nodef-parent.service", "nodef-helper.service"}; !slices.Equal(gotNoDef, wantNoDef) {
+		t.Errorf("no-default template Also=: got %v, want %v", gotNoDef, wantNoDef)
+	}
+
 	// A user's copy in ~/.local/share wins over the vendor's.
 	userDirs := UnitDirs(root, filepath.Join(root, "home/.config"), filepath.Join(root, "home/.local/share"), true)
-	write(userDirs[4], "u.service", "[Install]\nAlso=u-helper.service\n")
+	write(userDirs[len(userDirs)-1], "u.service", "[Install]\nAlso=u-helper.service\n")
 	write(userDirs[2], "u.service", "[Install]\n")
-	if got := WithAlso(userDirs, []string{"u.service"}); !slices.Equal(got, []string{"u.service"}) {
-		t.Errorf("user: got %v, want [u.service]", got)
+	if got, err := WithAlso(root, userDirs, []string{"u.service"}); err != nil || !slices.Equal(got, []string{"u.service"}) {
+		t.Errorf("user: got %v (%v), want [u.service]", got, err)
 	}
+
+	if os.Geteuid() != 0 {
+		secretPath := filepath.Join(dirs[0], "secret-also.service")
+		writeTestFile(t, secretPath, "[Install]\nAlso=hidden.service\n", 0o600)
+		if err := os.Chmod(secretPath, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(secretPath, 0o644) })
+		if got, err := WithAlso(root, dirs, []string{"secret-also.service"}); err != nil || !slices.Equal(got, []string{"secret-also.service"}) {
+			t.Errorf("0600 unit in WithAlso: got %v (%v)", got, err)
+		}
+	}
+
 	for in, want := range map[string]string{"a@b.service": "a@.service", "a@.service": "a@.service", "a.service": "a.service"} {
 		if got := Template(in); got != want {
 			t.Errorf("Template(%q) = %q, want %q", in, got, want)
+		}
+	}
+	for in, want := range map[string]bool{
+		"a@.service":     true,
+		"a.b@.service":   true,
+		"a@b.service":    false,
+		"a@.bar.service": false,
+		"a.service":      false,
+		"foo.bar@":       false,
+		"@.service":      false,
+		"foo@.":          false,
+	} {
+		if got := IsTemplate(in); got != want {
+			t.Errorf("IsTemplate(%q) = %v, want %v", in, got, want)
 		}
 	}
 }

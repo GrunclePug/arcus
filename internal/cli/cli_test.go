@@ -48,11 +48,17 @@ func newEnv(t *testing.T) *env {
 	t.Helper()
 	e := &env{t: t, sys: fake.New(t), root: t.TempDir(), ctx: context.Background()}
 	e.home = filepath.Join(e.root, "home", "u")
-	for _, dir := range []string{e.home, filepath.Join(e.root, "etc")} {
+	for _, dir := range []string{
+		e.home,
+		filepath.Join(e.root, "etc/systemd/system"),
+		filepath.Join(e.home, ".config/systemd/user"),
+	} {
 		must(t, os.MkdirAll(dir, 0o755))
 	}
+	e.sys.SetUnitDirs(e.root, filepath.Join(e.home, ".config"))
 	t.Setenv("HOME", e.home)
 	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("XDG_DATA_HOME", "")
 	t.Setenv("XDG_STATE_HOME", "")
 	return e
 }
@@ -650,9 +656,17 @@ func TestDoctorMachine(t *testing.T) {
 		t.Errorf("doctor found more than the stray approval:\n%s", out)
 	}
 
-	e.sys.SetUnits(false, append(e.sys.Units(false), "sshd.service", "getty@.service")...)
-	e.sys.SetPresets(false, "getty@.service")
-	e.sys.SetUnits(true, append(e.sys.Units(true), "pipewire.socket")...)
+	// Global user package links in /etc/systemd/user are ignored; user links
+	// in ~/.config/systemd/user are reported. System units are reported
+	// regardless of vendor preset, including template instances.
+	globalUserWants := filepath.Join(e.root, "etc/systemd/user/sockets.target.wants")
+	must(t, os.MkdirAll(globalUserWants, 0o755))
+	must(t, os.MkdirAll(filepath.Join(e.root, "usr/lib/systemd/user"), 0o755))
+	must(t, os.WriteFile(filepath.Join(e.root, "usr/lib/systemd/user/pipewire.socket"), []byte("[Unit]\n"), 0o644))
+	must(t, os.Symlink("/usr/lib/systemd/user/pipewire.socket", filepath.Join(globalUserWants, "pipewire.socket")))
+
+	e.sys.SetUnits(false, append(e.sys.Units(false), "sshd.service", "getty@tty1.service", "wg-quick@wg0.service")...)
+	e.sys.SetUnits(true, append(e.sys.Units(true), "syncthing.service")...)
 	me, err := user.Current()
 	must(t, err)
 	e.sys.SetGroups(append(e.sys.Groups(), me.Username, "wheel", "users", "input", "audio")...)
@@ -665,19 +679,138 @@ func TestDoctorMachine(t *testing.T) {
 		}
 		for _, want := range []string{
 			"the machine module is out of date: run 'arcus machine'",
-			"system units enabled that no module lists: sshd.service\n",
-			"user units enabled that no module lists: pipewire.socket\n",
+			"system units enabled that no module lists: getty@tty1.service sshd.service wg-quick@wg0.service\n",
+			"user units enabled that no module lists: syncthing.service\n",
 			"groups no module lists: audio input\n",
 		} {
 			if !strings.Contains(out, want) {
 				t.Errorf("%v lacks %q:\n%s", args, want, out)
 			}
 		}
+		if strings.Contains(out, "pipewire.socket") {
+			t.Errorf("%v must ignore global /etc/systemd/user links:\n%s", args, out)
+		}
 	}
 	contains(t, e.sys.Units(false), "sshd.service")
 	contains(t, e.sys.Groups(), "input")
 	if e.read("etc/arcus/modules/machine/module.toml") == "<missing>" || strings.Contains(e.read("etc/arcus/modules/machine/module.toml"), "amd-ucode") {
 		t.Error("doctor -fix rewrote the machine module")
+	}
+}
+
+// Template instances are adopted, enabled and disabled individually: listing
+// one instance never hides a sibling in doctor, turning its module off leaves
+// the sibling enabled, and stock getty@tty1.service with autovt@.service stays
+// clean. Legacy bare-template state records are dropped without calling
+// systemctl disable on the template.
+func TestTemplateInstancesAndLegacyRecords(t *testing.T) {
+	e := newEnv(t)
+	e.unitFile("getty@.service", "[Install]\nAlias=autovt@.service\nWantedBy=getty.target\nDefaultInstance=tty1\n")
+	e.unitFile("wg-quick@.service", "[Install]\nWantedBy=multi-user.target\n")
+	// Two hand-enabled WireGuard instances, then stock Arch getty layout
+	// (getty@tty1.service in getty.target.wants + top-level autovt@.service).
+	e.sys.SetUnits(false, "wg-quick@wg0.service", "wg-quick@wg1.service")
+	etcSys := filepath.Join(e.root, "etc/systemd/system")
+	must(t, os.MkdirAll(filepath.Join(etcSys, "getty.target.wants"), 0o755))
+	must(t, os.Symlink("/usr/lib/systemd/system/getty@.service", filepath.Join(etcSys, "getty.target.wants/getty@tty1.service")))
+	must(t, os.Symlink("/usr/lib/systemd/system/getty@.service", filepath.Join(etcSys, "autovt@.service")))
+
+	e.module("base", "[units]\nsystem = [\"getty@tty1.service\"]\n", nil)
+	e.module("vpn", "[units]\nsystem = [\"wg-quick@wg0.service\"]\n", nil)
+	must(t, e.run("on", "-y", "base"))
+	must(t, e.run("on", "-y", "vpn"))
+
+	// Plan is empty (adopted cleanly), and doctor reports only the sibling wg1.
+	must(t, e.run("plan"))
+	if !strings.Contains(e.out.String(), "Nothing to do.") {
+		t.Fatalf("plan after adopt:\n%s", e.out.String())
+	}
+	err := e.run("doctor")
+	if err == nil || !strings.Contains(e.out.String(), "system units enabled that no module lists: wg-quick@wg1.service\n") {
+		t.Fatalf("doctor must report sibling wg1 only (%v):\n%s", err, e.out.String())
+	}
+	if strings.Contains(e.out.String(), "getty@") || strings.Contains(e.out.String(), "wg-quick@wg0") {
+		t.Errorf("doctor reported listed units:\n%s", e.out.String())
+	}
+
+	// Turning vpn off disables wg0 and leaves wg1 and getty@tty1 intact.
+	must(t, e.run("off", "-y", "vpn"))
+	contains(t, e.sys.Units(false), "getty@tty1.service", "wg-quick@wg1.service")
+	lacks(t, e.sys.Units(false), "wg-quick@wg0.service")
+
+	// Legacy bare-template record in system state reads as absent and is
+	// dropped by doctor -fix without ever calling systemctl disable on it.
+	st := e.state(true)
+	st.Own(state.SystemUnits, "legacy", []string{"wg-quick@.service"})
+	must(t, st.Save(filepath.Join(e.root, "var/lib/arcus/state.json")))
+	before := len(e.sys.Log())
+	_ = e.run("doctor", "-fix")
+	for _, call := range e.sys.Log()[before:] {
+		if strings.Contains(call, "disable") && strings.Contains(call, "wg-quick@.service") {
+			t.Fatalf("doctor -fix disabled legacy bare template: %s", call)
+		}
+	}
+	if got := e.state(true).Owned[state.SystemUnits]["legacy"]; len(got) != 0 {
+		t.Errorf("legacy bare template still owned: %v", got)
+	}
+	contains(t, e.sys.Units(false), "wg-quick@wg1.service")
+}
+
+// Upgrading a module that previously adopted a user unit through /etc/systemd/user
+// re-enables it once in ~/.config/systemd/user without duplicating ownership,
+// and turning the module off removes only the user link while leaving the global
+// package link alone.
+func TestUserUnitGlobalScopeUpgradeAndHomeDeployedUnit(t *testing.T) {
+	e := newEnv(t)
+	globalDir := filepath.Join(e.root, "etc/systemd/user/sockets.target.wants")
+	must(t, os.MkdirAll(globalDir, 0o755))
+	must(t, os.MkdirAll(filepath.Join(e.root, "usr/lib/systemd/user"), 0o755))
+	must(t, os.WriteFile(filepath.Join(e.root, "usr/lib/systemd/user/gnome-keyring-daemon.socket"), []byte("[Install]\nWantedBy=sockets.target\n"), 0o644))
+	globalLink := filepath.Join(globalDir, "gnome-keyring-daemon.socket")
+	must(t, os.Symlink("/usr/lib/systemd/user/gnome-keyring-daemon.socket", globalLink))
+
+	e.module("keyring", "[units]\nuser = [\"gnome-keyring-daemon.socket\"]\nnow = true\n", nil)
+	must(t, os.WriteFile(e.hostPath(), []byte("modules = [\"keyring\"]\n"), 0o644))
+	// Simulate pre-0.13.0 ownership recorded from the global /etc/systemd/user link.
+	st := &state.State{Version: state.Version, Modules: []string{}}
+	st.Own(state.UserUnits, "keyring", []string{"gnome-keyring-daemon.socket"})
+	must(t, os.MkdirAll(filepath.Join(e.home, ".local/state/arcus"), 0o755))
+	must(t, st.Save(filepath.Join(e.home, ".local/state/arcus/state.json")))
+
+	// doctor sees it as absent from ~/.config/systemd/user; apply enables it there.
+	if err := e.run("doctor"); err == nil || !strings.Contains(e.out.String(), "user-units recorded as added by arcus are gone") {
+		t.Fatalf("doctor before apply (%v):\n%s", err, e.out.String())
+	}
+	must(t, e.run("apply", "-y"))
+	contains(t, e.sys.Units(true), "gnome-keyring-daemon.socket")
+	if got := e.state(false).Owned[state.UserUnits]["keyring"]; !slices.Equal(got, []string{"gnome-keyring-daemon.socket"}) {
+		t.Errorf("owned = %v, want single entry", got)
+	}
+	must(t, e.run("doctor"))
+
+	// off removes the user link and leaves the global package link untouched.
+	must(t, e.run("off", "-y", "keyring"))
+	lacks(t, e.sys.Units(true), "gnome-keyring-daemon.socket")
+	if _, err := os.Lstat(globalLink); err != nil {
+		t.Fatalf("off removed global /etc/systemd/user link: %v", err)
+	}
+
+	// A home/-deployed user unit is not counted as enabled until enabled,
+	// survives off intact until its home/ layer is removed, and round-trips cleanly.
+	e.module("custom", "[units]\nuser = [\"custom.service\"]\n", map[string]string{
+		"home/.config/systemd/user/custom.service": "[Install]\nWantedBy=default.target\n",
+	})
+	must(t, e.run("on", "-y", "custom"))
+	contains(t, e.sys.Units(true), "custom.service")
+	must(t, e.run("plan"))
+	if !strings.Contains(e.out.String(), "Nothing to do.") {
+		t.Fatalf("plan after home-unit on:\n%s", e.out.String())
+	}
+	must(t, e.run("doctor"))
+	must(t, e.run("off", "-y", "custom"))
+	lacks(t, e.sys.Units(true), "custom.service")
+	if _, err := os.Lstat(filepath.Join(e.home, ".config/systemd/user/custom.service")); !os.IsNotExist(err) {
+		t.Errorf("home-unit link left after off: %v", err)
 	}
 }
 

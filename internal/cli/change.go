@@ -315,9 +315,9 @@ func (a *app) present(kind string) (map[string]bool, error) {
 	case state.Pacman, state.AUR, state.Local:
 		return system.Installed()
 	case state.SystemUnits:
-		return system.EnabledUnits(false)
+		return system.EnabledUnits(a.root, a.unitDirs(false))
 	case state.UserUnits:
-		return system.EnabledUnits(true)
+		return system.EnabledUnits(a.root, a.unitDirs(true))
 	case state.Groups:
 		return system.Groups(a.user)
 	case state.HomeDirs:

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -124,8 +125,8 @@ func (r *Runner) AURMarkDeps(helper string, pkgs []string) error {
 
 // userScope is how arcus addresses user units: through the unit files
 // (--root=/), which needs no running user manager. The installer's chroot
-// and shells outside a login session have none. Queries go through the
-// files for system units too, for the same reason.
+// and shells outside a login session have none. Queries read the unit
+// directories directly, for the same reason.
 var userScope = []string{"--user", "--root=/"}
 
 // userManager reports whether the user's systemd instance is reachable, so
@@ -203,20 +204,15 @@ func output(name string, args ...string) (string, error) {
 }
 
 // query runs a read-only command and returns the whitespace-separated
-// fields of its output, using only the first field of each line when
-// firstField is set.
-func query(firstField bool, name string, args ...string) (map[string]bool, error) {
+// fields of its output.
+func query(name string, args ...string) (map[string]bool, error) {
 	out, err := output(name, args...)
 	if err != nil {
 		return nil, err
 	}
 	set := map[string]bool{}
 	for line := range strings.Lines(out) {
-		fields := strings.Fields(line)
-		if firstField && len(fields) > 0 {
-			fields = fields[:1]
-		}
-		for _, f := range fields {
+		for _, f := range strings.Fields(line) {
 			set[f] = true
 		}
 	}
@@ -225,12 +221,12 @@ func query(firstField bool, name string, args ...string) (map[string]bool, error
 
 // Installed returns every installed package, from the repositories or the AUR.
 func Installed() (map[string]bool, error) {
-	return query(false, "pacman", "-Qq")
+	return query("pacman", "-Qq")
 }
 
 // Explicit returns the packages installed explicitly, not as a dependency.
 func Explicit() (map[string]bool, error) {
-	return query(false, "pacman", "-Qqe")
+	return query("pacman", "-Qqe")
 }
 
 // Foreign returns the installed packages that no sync repository has:
@@ -266,7 +262,7 @@ func Foreign() (map[string]bool, error) {
 // Unrequired returns the installed packages that no installed package
 // depends on.
 func Unrequired() (map[string]bool, error) {
-	return query(false, "pacman", "-Qqt")
+	return query("pacman", "-Qqt")
 }
 
 // Package is what pacman reports about a package, as far as arcus needs
@@ -454,71 +450,244 @@ func parseSrcInfo(info, pkg, arch string) Package {
 	}
 }
 
-// listEnabled is the systemctl call that lists the enabled system or user
-// unit files: unit, state and vendor preset on each line.
-func listEnabled(user bool) []string {
-	args := []string{"list-unit-files", "--state=enabled", "--no-legend", "--no-pager"}
-	if user {
-		return slices.Concat(userScope, args)
+// EnabledUnits returns the concrete units enabled in dirs[0] (from UnitDirs):
+// symlinks inside *.wants, *.requires and *.upholds directories, plus
+// top-level non-template alias symlinks named in the target unit's [Install]
+// Alias= section. Masks (/dev/null or 0-byte unit files) and dangling links
+// whose unit file or template does not exist in dirs are skipped. Alias-only
+// template instances are not supported. All symlink resolution is confined to
+// root (empty defaults to "/").
+func EnabledUnits(root string, dirs []string) (map[string]bool, error) {
+	enabled := map[string]bool{}
+	if len(dirs) == 0 {
+		return enabled, nil
 	}
-	return slices.Concat([]string{"--root=/"}, args)
-}
-
-// EnabledUnits returns the enabled system or user units.
-func EnabledUnits(user bool) (map[string]bool, error) {
-	return query(true, "systemctl", listEnabled(user)...)
-}
-
-// EnabledOffPreset returns the enabled system or user units that their
-// vendor preset doesn't enable, so a module or a hand did, sorted.
-func EnabledOffPreset(user bool) ([]string, error) {
-	out, err := output("systemctl", listEnabled(user)...)
+	root = cleanRoot(root)
+	dir0, fi, devNull, err := resolveInRoot(root, dirs[0])
+	if errors.Is(err, iofs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || devNull {
+		return enabled, nil
+	}
 	if err != nil {
 		return nil, err
 	}
-	var units []string
-	for line := range strings.Lines(out) {
-		f := strings.Fields(line)
-		if len(f) > 0 && (len(f) < 3 || f[2] != "enabled") {
-			units = append(units, f[0])
+	if !fi.IsDir() {
+		return enabled, nil
+	}
+	entries, err := os.ReadDir(dir0)
+	if err != nil {
+		return nil, err
+	}
+
+	// Pass 1: *.wants, *.requires, *.upholds directories (stat-only, so a
+	// root-only 0600 unit file in /etc/systemd/system never breaks non-root
+	// callers).
+	for _, e := range entries {
+		if !e.IsDir() || !isDepDir(e.Name()) {
+			continue
+		}
+		depDir := filepath.Join(dir0, e.Name())
+		subs, err := os.ReadDir(depDir)
+		if err != nil {
+			return nil, err
+		}
+		for _, sub := range subs {
+			if sub.Type()&iofs.ModeSymlink == 0 {
+				continue
+			}
+			name := sub.Name()
+			if IsTemplate(name) {
+				continue
+			}
+			_, _, depDevNull, rerr := resolveInRoot(root, filepath.Join(depDir, name))
+			if depDevNull {
+				continue
+			}
+			if rerr != nil && !isBrokenLink(rerr) {
+				return nil, rerr
+			}
+			_, st, err := unitFile(root, dirs, name)
+			if err != nil {
+				return nil, err
+			}
+			if st == unitFound {
+				enabled[name] = true
+			}
 		}
 	}
-	slices.Sort(units)
-	return units, nil
+
+	// Pass 2: top-level non-template alias symlinks in dirs[0]. Resolving the
+	// first-hop parent directory inside root accepts merged-/usr targets
+	// (/lib/systemd/system) and alias-only linked units
+	// (alias.service -> /etc/systemd/system/real.service -> /opt/real.service)
+	// while ignoring external linked unit fragments (/opt/ext/custom.conf or
+	// home/-deployed units).
+	dirSet := map[string]bool{}
+	for _, d := range dirs {
+		clean := filepath.Clean(d)
+		dirSet[clean] = true
+		if rd, rfi, rdev, rerr := resolveInRoot(root, d); rerr == nil && !rdev && rfi.IsDir() {
+			dirSet[rd] = true
+		}
+	}
+	dir0Rel := toRelInRoot(root, dir0)
+	for _, e := range entries {
+		if e.Type()&iofs.ModeSymlink == 0 {
+			continue
+		}
+		linkName := e.Name()
+		linkPath := filepath.Join(dir0, linkName)
+		rawTarget, err := os.Readlink(linkPath)
+		if errors.Is(err, iofs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		var firstRel string
+		if filepath.IsAbs(rawTarget) {
+			firstRel = toRelInRoot(root, filepath.Clean(rawTarget))
+		} else {
+			firstRel = filepath.Clean(filepath.Join(dir0Rel, rawTarget))
+		}
+		if firstRel == "/dev/null" {
+			continue
+		}
+		targetBase := filepath.Base(firstRel)
+		if targetBase == "" || targetBase == "." || targetBase == ".." || targetBase == "/" || targetBase == linkName || IsTemplate(targetBase) {
+			continue
+		}
+		if enabled[targetBase] {
+			continue
+		}
+		parentPath := fromRelInRoot(root, filepath.Dir(firstRel))
+		resolvedParent, pfi, pdev, perr := resolveInRoot(root, parentPath)
+		if pdev || isBrokenLink(perr) || errors.Is(perr, iofs.ErrPermission) {
+			continue
+		}
+		if perr != nil {
+			return nil, perr
+		}
+		if !pfi.IsDir() || (!dirSet[resolvedParent] && !dirSet[parentPath]) {
+			continue
+		}
+		unitPath, st, err := unitFile(root, dirs, targetBase)
+		if err != nil {
+			return nil, err
+		}
+		if st != unitFound {
+			continue
+		}
+		inst, err := readInstall(unitPath, "", false)
+		if err != nil {
+			if errors.Is(err, iofs.ErrPermission) {
+				continue
+			}
+			return nil, err
+		}
+		if slices.Contains(inst.alias, linkName) {
+			enabled[targetBase] = true
+		}
+	}
+	return enabled, nil
 }
 
-// UnitDirs are the directories systemd reads unit files from, most
-// important first: the system's under root, or the user's, with their own
-// in configHome (~/.config) and dataHome (~/.local/share). /usr/local is
-// where modules deploy their own.
+func isDepDir(name string) bool {
+	return strings.HasSuffix(name, ".wants") || strings.HasSuffix(name, ".requires") || strings.HasSuffix(name, ".upholds")
+}
+
+func isBrokenLink(err error) bool {
+	return errors.Is(err, iofs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.ELOOP)
+}
+
+// UnitDirs are the directories systemd reads persistent unit files from,
+// most important first: the system's under root, or the user's, with their
+// own in configHome (~/.config) and dataHome (~/.local/share). /usr/local
+// is where modules deploy their own.
 func UnitDirs(root, configHome, dataHome string, user bool) []string {
 	if user {
-		return []string{filepath.Join(configHome, "systemd/user"), filepath.Join(root, "etc/systemd/user"),
-			filepath.Join(dataHome, "systemd/user"), filepath.Join(root, "usr/local/lib/systemd/user"),
-			filepath.Join(root, "usr/lib/systemd/user")}
+		return []string{
+			filepath.Join(configHome, "systemd/user"),
+			filepath.Join(root, "etc/systemd/user"),
+			filepath.Join(dataHome, "systemd/user"),
+			filepath.Join(root, "usr/local/share/systemd/user"),
+			filepath.Join(root, "usr/share/systemd/user"),
+			filepath.Join(root, "usr/local/lib/systemd/user"),
+			filepath.Join(root, "usr/lib/systemd/user"),
+		}
 	}
-	return []string{filepath.Join(root, "etc/systemd/system"), filepath.Join(root, "usr/local/lib/systemd/system"), filepath.Join(root, "usr/lib/systemd/system")}
+	return []string{
+		filepath.Join(root, "etc/systemd/system"),
+		filepath.Join(root, "usr/local/lib/systemd/system"),
+		filepath.Join(root, "usr/lib/systemd/system"),
+	}
 }
 
 // WithAlso returns units together with what their [Install] sections name
 // in Also=, recursively: the units systemctl enable enables with them. Each
-// unit file is the first one found in dirs; an instance (a@b.service) is
-// read from its template (a@.service). A unit without a file adds nothing.
-func WithAlso(dirs, units []string) []string {
+// unit file is resolved in dirs inside root (empty defaults to "/") following
+// systemd.unit(5) precedence: exact name across dirs, then its template across
+// dirs. For bare templates reached through Also=, DefaultInstance= is emitted
+// as a concrete instance and updates %i for subsequent Also= lines in that
+// template. Unreadable (permission denied) unit files add nothing.
+func WithAlso(root string, dirs, units []string) ([]string, error) {
+	root = cleanRoot(root)
 	var out []string
-	seen := map[string]bool{}
-	queue := slices.Clone(units)
+	emitted := map[string]bool{}
+	visited := map[string]bool{}
+	emit := func(u string) {
+		if !emitted[u] {
+			emitted[u] = true
+			out = append(out, u)
+		}
+	}
+	type item struct {
+		unit    string
+		initial bool
+	}
+	queue := make([]item, len(units))
+	for i, u := range units {
+		queue[i] = item{unit: u, initial: true}
+	}
 	for len(queue) > 0 {
-		u := queue[0]
+		it := queue[0]
 		queue = queue[1:]
-		if seen[u] {
+		u := it.unit
+		if it.initial {
+			emit(u)
+		}
+		if visited[u] {
 			continue
 		}
-		seen[u] = true
-		out = append(out, u)
-		queue = append(queue, installAlso(dirs, Template(u))...)
+		visited[u] = true
+		tpl := IsTemplate(u)
+		if !tpl {
+			emit(u)
+		}
+		path, st, err := unitFile(root, dirs, u)
+		if err != nil {
+			return nil, err
+		}
+		if st != unitFound {
+			continue
+		}
+		inst, err := readInstall(path, instanceOf(u), tpl)
+		if err != nil {
+			if errors.Is(err, iofs.ErrPermission) {
+				continue
+			}
+			return nil, err
+		}
+		if tpl && inst.defaultInstance != "" {
+			// Emit the concrete default instance without marking it visited so
+			// an explicit override for that instance is still walked if also
+			// declared directly.
+			emit(instantiate(u, inst.defaultInstance))
+		}
+		for _, a := range inst.also {
+			queue = append(queue, item{unit: a})
+		}
 	}
-	return out
+	return out, nil
 }
 
 // Template returns the template of an instance (a@b.service gives
@@ -531,28 +700,347 @@ func Template(unit string) string {
 	return unit[:at+1] + unit[dot:]
 }
 
-// installAlso reads the Also= lines of a unit file's [Install] section.
-func installAlso(dirs []string, file string) []string {
+// IsTemplate reports whether unit is a bare template unit (a@.service), not an
+// instance (a@b.service) or plain unit.
+func IsTemplate(unit string) bool {
+	at, dot := strings.Index(unit, "@"), strings.LastIndex(unit, ".")
+	return at > 0 && dot == at+1 && dot < len(unit)-1
+}
+
+// instanceOf returns the instance part of an instantiated unit (a@b.service
+// gives "b") and "" for plain units and bare templates.
+func instanceOf(unit string) string {
+	at, dot := strings.Index(unit, "@"), strings.LastIndex(unit, ".")
+	if at <= 0 || dot <= at+1 || dot >= len(unit)-1 {
+		return ""
+	}
+	return unit[at+1 : dot]
+}
+
+// instantiate splices inst into a bare template (a@.service + "b" -> a@b.service).
+func instantiate(tpl, inst string) string {
+	at := strings.Index(tpl, "@")
+	return tpl[:at+1] + inst + tpl[at+1:]
+}
+
+type unitStatus int
+
+const (
+	unitNotFound unitStatus = iota
+	unitMasked
+	unitFound
+)
+
+// unitFile resolves unit across dirs inside root using systemd.unit(5)
+// precedence: exact unit name across dirs, then Template(unit) across dirs if
+// not found. Stat-only: never opens file contents. A mask (/dev/null or 0-byte
+// file), broken/looping symlink, or non-regular file in a higher-priority dir
+// returns unitMasked immediately and shadows lower dirs and the template.
+func unitFile(root string, dirs []string, unit string) (string, unitStatus, error) {
+	path, st, err := lookupUnit(root, dirs, unit)
+	if err != nil || st != unitNotFound {
+		return path, st, err
+	}
+	if tpl := Template(unit); tpl != unit {
+		return lookupUnit(root, dirs, tpl)
+	}
+	return "", unitNotFound, nil
+}
+
+func lookupUnit(root string, dirs []string, name string) (string, unitStatus, error) {
 	for _, dir := range dirs {
-		data, err := os.ReadFile(filepath.Join(dir, file))
-		if err != nil {
+		rdir, dfi, ddev, derr := resolveInRoot(root, dir)
+		if ddev || isBrokenLink(derr) {
 			continue
 		}
-		var also []string
-		install := false
-		for line := range strings.Lines(string(data)) {
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "[") {
-				install = line == "[Install]"
+		if derr != nil {
+			return "", unitNotFound, derr
+		}
+		if !dfi.IsDir() {
+			continue
+		}
+		p := filepath.Join(rdir, name)
+		fi, err := os.Lstat(p)
+		if errors.Is(err, iofs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			continue
+		}
+		if err != nil {
+			return "", unitNotFound, err
+		}
+		if fi.Mode()&iofs.ModeSymlink != 0 {
+			resolved, rfi, devNull, rerr := resolveInRoot(root, p)
+			if devNull || isBrokenLink(rerr) {
+				return "", unitMasked, nil
+			}
+			if rerr != nil {
+				return "", unitNotFound, rerr
+			}
+			if !rfi.Mode().IsRegular() || rfi.Size() == 0 {
+				return "", unitMasked, nil
+			}
+			return resolved, unitFound, nil
+		}
+		if fi.Mode().IsRegular() {
+			if fi.Size() == 0 {
+				return "", unitMasked, nil
+			}
+			return p, unitFound, nil
+		}
+		return "", unitMasked, nil
+	}
+	return "", unitNotFound, nil
+}
+
+func cleanRoot(root string) string {
+	if root == "" {
+		return "/"
+	}
+	return filepath.Clean(root)
+}
+
+func toRelInRoot(root, p string) string {
+	p = filepath.Clean(p)
+	if root == "/" {
+		return p
+	}
+	if p == root {
+		return "/"
+	}
+	if strings.HasPrefix(p, root+string(filepath.Separator)) {
+		return filepath.Clean("/" + p[len(root):])
+	}
+	return p
+}
+
+func fromRelInRoot(root, rel string) string {
+	rel = filepath.Clean(rel)
+	if root == "/" {
+		return rel
+	}
+	if rel == "/" {
+		return root
+	}
+	return filepath.Join(root, rel)
+}
+
+func splitPath(rel string) []string {
+	rel = strings.Trim(filepath.Clean(rel), "/")
+	if rel == "" || rel == "." {
+		return nil
+	}
+	return strings.Split(rel, "/")
+}
+
+// resolveInRoot resolves every symlink component of p inside root (up to 40
+// hops), clamping relative escapes and prefixing unprefixed absolute targets
+// with root so sandboxed roots never touch the host filesystem. Any symlink
+// resolving to /dev/null (directly or via relative ..) returns devNull = true.
+func resolveInRoot(root, p string) (resolved string, info os.FileInfo, devNull bool, err error) {
+	root = cleanRoot(root)
+	rel := toRelInRoot(root, p)
+	if rel == "/dev/null" {
+		return "/dev/null", nil, true, nil
+	}
+	const maxHops = 40
+	hops := 0
+	cur := "/"
+	parts := splitPath(rel)
+	for len(parts) > 0 {
+		comp := parts[0]
+		parts = parts[1:]
+		nextRel := filepath.Join(cur, comp)
+		if nextRel == "/dev/null" {
+			return "/dev/null", nil, true, nil
+		}
+		host := fromRelInRoot(root, nextRel)
+		fi, lerr := os.Lstat(host)
+		if lerr != nil {
+			return "", nil, false, lerr
+		}
+		if fi.Mode()&iofs.ModeSymlink != 0 {
+			hops++
+			if hops > maxHops {
+				return "", nil, false, &os.PathError{Op: "readlink", Path: host, Err: syscall.ELOOP}
+			}
+			target, rerr := os.Readlink(host)
+			if rerr != nil {
+				return "", nil, false, rerr
+			}
+			var targetRel string
+			if filepath.IsAbs(target) {
+				targetRel = toRelInRoot(root, target)
+			} else {
+				targetRel = filepath.Clean(filepath.Join(cur, target))
+			}
+			if targetRel == "/dev/null" {
+				return "/dev/null", nil, true, nil
+			}
+			cur = "/"
+			parts = append(splitPath(targetRel), parts...)
+			continue
+		}
+		cur = nextRel
+		if len(parts) == 0 {
+			return host, fi, false, nil
+		}
+		if !fi.IsDir() {
+			return "", nil, false, &os.PathError{Op: "stat", Path: host, Err: syscall.ENOTDIR}
+		}
+	}
+	host := fromRelInRoot(root, cur)
+	fi, lerr := os.Lstat(host)
+	if lerr != nil {
+		return "", nil, false, lerr
+	}
+	return host, fi, false, nil
+}
+
+type installSection struct {
+	also            []string
+	alias           []string
+	defaultInstance string
+}
+
+// readInstall reads the [Install] section of path. When isTemplate is true,
+// DefaultInstance= updates the instance used for %i expansion on subsequent
+// Also= lines, matching systemd's line-by-line parser; otherwise initialInst
+// is fixed throughout.
+func readInstall(path, initialInst string, isTemplate bool) (installSection, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return installSection{}, err
+	}
+	var s installSection
+	curInst := initialInst
+	install := false
+	for line := range strings.Lines(string(data)) {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") {
+			install = line == "[Install]"
+			continue
+		}
+		if !install {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		switch strings.TrimSpace(key) {
+		case "Also":
+			for _, raw := range strings.Fields(value) {
+				if expanded, ok := expandAlso(raw, curInst); ok {
+					s.also = append(s.also, expanded)
+				}
+			}
+		case "Alias":
+			fields, ok := splitAliasWords(value)
+			if !ok {
 				continue
 			}
-			if key, value, ok := strings.Cut(line, "="); install && ok && strings.TrimSpace(key) == "Also" {
-				also = append(also, strings.Fields(value)...)
+			if len(fields) == 0 {
+				s.alias = nil
+			} else {
+				s.alias = append(s.alias, fields...)
+			}
+		case "DefaultInstance":
+			v := validInstance(strings.TrimSpace(value))
+			s.defaultInstance = v
+			if isTemplate {
+				curInst = v
 			}
 		}
-		return also
 	}
-	return nil
+	return s, nil
+}
+
+// expandAlso expands %% -> % and %i -> inst in a single left-to-right pass.
+// Any other % specifier, trailing %, or %i with an empty inst fails so no
+// unexpanded specifier is ever emitted.
+func expandAlso(raw, inst string) (string, bool) {
+	if !strings.Contains(raw, "%") {
+		return raw, true
+	}
+	var b strings.Builder
+	b.Grow(len(raw))
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '%' {
+			b.WriteByte(raw[i])
+			continue
+		}
+		if i+1 >= len(raw) {
+			return "", false
+		}
+		i++
+		switch raw[i] {
+		case '%':
+			b.WriteByte('%')
+		case 'i':
+			if inst == "" {
+				return "", false
+			}
+			b.WriteString(inst)
+		default:
+			return "", false
+		}
+	}
+	return b.String(), true
+}
+
+func validInstance(v string) string {
+	if v == "" || strings.ContainsAny(v, "/ \t\r\n") {
+		return ""
+	}
+	return v
+}
+
+// splitAliasWords splits a systemd Alias= value on whitespace while unquoting
+// single- and double-quoted words and retaining literal backslashes
+// (matching systemd's config_parse_strv: EXTRACT_UNQUOTE | EXTRACT_RETAIN_ESCAPE).
+func splitAliasWords(s string) ([]string, bool) {
+	var words []string
+	i, n := 0, len(s)
+	for i < n {
+		for i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n') {
+			i++
+		}
+		if i >= n {
+			break
+		}
+		var b strings.Builder
+		var quote byte
+		for i < n {
+			c := s[i]
+			if quote != 0 {
+				if c == quote {
+					quote = 0
+					i++
+					continue
+				}
+				b.WriteByte(c)
+				i++
+				continue
+			}
+			if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+				break
+			}
+			if c == '"' || c == '\'' {
+				quote = c
+				i++
+				continue
+			}
+			b.WriteByte(c)
+			i++
+		}
+		if quote != 0 {
+			return nil, false
+		}
+		words = append(words, b.String())
+	}
+	return words, true
 }
 
 // Groups returns the groups user belongs to. Group names from a directory
