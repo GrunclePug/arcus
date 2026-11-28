@@ -1,0 +1,6 @@
+# Start from Arch's stock Sway config, then override what differs.
+# Later lines win (except `set $var`, which expands as lines are read).
+include /etc/sway/config
+
+default_border pixel 2
+output * bg #202020 solid_color

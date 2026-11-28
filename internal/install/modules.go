@@ -1,42 +1,21 @@
 package install
 
 import (
-	"embed"
 	"fmt"
-	iofs "io/fs"
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 
+	"github.com/grunclepug/arcus/examples"
 	"github.com/grunclepug/arcus/internal/machine"
 	"github.com/grunclepug/arcus/internal/profile"
 )
 
-// modules are the installer modules, written to the new system when the
-// plan has no dotfiles repository.
-//
-//go:embed modules
-var modules embed.FS
-
-// WriteModules writes the installer modules into dir.
-func WriteModules(dir string) error {
-	err := iofs.WalkDir(modules, "modules", func(path string, d iofs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		target := filepath.Join(dir, strings.TrimPrefix(path, "modules"))
-		if d.IsDir() {
-			return os.MkdirAll(target, 0o755)
-		}
-		data, err := modules.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		return os.WriteFile(target, data, 0o644)
-	})
-	if err != nil {
-		return fmt.Errorf("writing the installer modules: %w", err)
+// WriteConfig writes the embedded starter config (config.toml, profiles/ and
+// modules/) into dir, used when a plan has no dotfiles repository.
+func WriteConfig(dir string) error {
+	if err := os.CopyFS(dir, examples.FS); err != nil {
+		return fmt.Errorf("writing the starter config: %w", err)
 	}
 	return nil
 }

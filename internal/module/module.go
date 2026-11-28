@@ -435,7 +435,8 @@ func (s Set) scan(dir string) error {
 }
 
 // CompareCategories orders categories for display: system, then hardware
-// (the installer's own), then the rest by name, uncategorized ("") last.
+// (the starter config's core categories), then the rest by name,
+// uncategorized ("") last.
 func CompareCategories(a, b string) int {
 	rank := func(c string) int {
 		switch c {

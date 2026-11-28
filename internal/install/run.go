@@ -465,7 +465,7 @@ func (x *installer) arcus() error {
 	return write(filepath.Join(target, "usr/local/bin/arcus"), string(x.arcusBin), 0o755)
 }
 
-// modules writes the arcus config of the new user (the installer modules,
+// modules writes the arcus config of the new user (the starter config,
 // or a clone of the dotfiles repository) and runs the first apply as the
 // user, through the same sudo path as on any other day. A temporary sudo
 // rule lets it run unattended.
@@ -479,7 +479,7 @@ func (x *installer) modules() error {
 	// is ~/.config/arcus, which links into the dotfiles clone when there is one.
 	config := filepath.Join(home, ".config/arcus")
 	if x.p.Dotfiles.URL == "" {
-		if err := WriteModules(filepath.Join(target, config, "modules")); err != nil {
+		if err := WriteConfig(filepath.Join(target, config)); err != nil {
 			return err
 		}
 	} else {

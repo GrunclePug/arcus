@@ -1,0 +1,12 @@
+# Optional arcus settings; every key defaults to the value shown below.
+
+# AUR helper used for [packages].aur ("yay", "paru" or "aurlock").
+# aur_helper = "yay"
+
+# Extra packages arcus never removes (in addition to base, base-devel,
+# linux, linux-firmware, sudo, pacman, systemd and the AUR helper).
+# protected = []
+
+# Extra directories to scan for modules (absolute or starting with ~/,
+# for example ["~/.local/share/arcus/modules"]).
+# module_dirs = []

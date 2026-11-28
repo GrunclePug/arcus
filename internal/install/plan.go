@@ -162,11 +162,7 @@ func (p *Plan) Validate() error {
 		}
 	}
 
-	if p.Dotfiles.URL == "" {
-		if len(p.Host.Profiles) > 0 {
-			fail("host.profiles needs a dotfiles repository: the installer modules have no profiles")
-		}
-	} else {
+	if p.Dotfiles.URL != "" {
 		if !urlRegex.MatchString(p.Dotfiles.URL) {
 			fail("dotfiles.url must start with https://, git@ or file:///, got %q", p.Dotfiles.URL)
 		}

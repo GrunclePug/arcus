@@ -1,0 +1,9 @@
+description = "Sway desktop with terminal and launcher"
+
+# Stacking order: later modules win a shared file.
+modules = [
+  "base",
+  "machine", # /etc/arcus/modules/machine, written by arcus machine or the installer
+  "shell",
+  "sway",
+]

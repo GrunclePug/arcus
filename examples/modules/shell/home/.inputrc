@@ -1,0 +1,5 @@
+# Start from Arch's default Readline bindings, then override what differs.
+$include /etc/inputrc
+
+set completion-ignore-case on
+set show-all-if-ambiguous on

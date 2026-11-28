@@ -3,6 +3,7 @@ package install
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/grunclepug/arcus/internal/config"
 	"github.com/grunclepug/arcus/internal/machine"
 	"github.com/grunclepug/arcus/internal/module"
 	"github.com/grunclepug/arcus/internal/profile"
@@ -104,7 +106,7 @@ func Check(ctx context.Context, p *Plan, m Machine) Result {
 }
 
 // selection resolves the plan's host selection against the modules the new
-// system will have: the installer modules, or the dotfiles repository's,
+// system will have: the starter config, or the dotfiles repository's,
 // and the machine module.
 func selection(ctx context.Context, p *Plan, f machine.Facts) ([]string, error) {
 	modules, profiles, err := Modules(ctx, p, f)
@@ -122,9 +124,9 @@ func selection(ctx context.Context, p *Plan, f machine.Facts) ([]string, error) 
 	return modules.Resolve(selected)
 }
 
-// Modules loads what a plan can select: the installer modules, or the
-// dotfiles repository's modules and profiles (cloned into a temporary
-// directory), and the machine module for f.
+// Modules loads what a plan can select: the starter config, or the dotfiles
+// repository's modules and profiles (cloned into a temporary directory), and
+// the machine module for f. It also validates config.toml when present.
 func Modules(ctx context.Context, p *Plan, f machine.Facts) (module.Set, profile.Set, error) {
 	tmp, err := os.MkdirTemp("", "arcus-modules-")
 	if err != nil {
@@ -136,21 +138,24 @@ func Modules(ctx context.Context, p *Plan, f machine.Facts) (module.Set, profile
 		return nil, nil, err
 	}
 
+	var dir string
 	if p.Dotfiles.URL == "" {
-		dir := filepath.Join(tmp, "modules")
-		if err := WriteModules(dir); err != nil {
+		dir = filepath.Join(tmp, "config")
+		if err := WriteConfig(dir); err != nil {
 			return nil, nil, err
 		}
-		modules, err := module.Scan(dir, local)
-		return modules, profile.Set{}, err
+	} else {
+		repo := filepath.Join(tmp, "dotfiles")
+		cmd := exec.CommandContext(ctx, "git", "clone", "--quiet", "--depth", "1", "--", p.Dotfiles.URL, repo)
+		cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return nil, nil, fmt.Errorf("cloning %s: %w: %s", p.Dotfiles.URL, err, strings.TrimSpace(string(out)))
+		}
+		dir = filepath.Join(repo, p.Dotfiles.Arcus)
 	}
-	repo := filepath.Join(tmp, "dotfiles")
-	cmd := exec.CommandContext(ctx, "git", "clone", "--quiet", "--depth", "1", "--", p.Dotfiles.URL, repo)
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return nil, nil, fmt.Errorf("cloning %s: %w: %s", p.Dotfiles.URL, err, strings.TrimSpace(string(out)))
+	if _, err := config.Load(filepath.Join(dir, "config.toml"), "/home/"+cmp.Or(p.User.Name, "user")); err != nil {
+		return nil, nil, err
 	}
-	dir := filepath.Join(repo, p.Dotfiles.Arcus)
 	modules, err := module.Scan(filepath.Join(dir, "modules"), local)
 	if err != nil {
 		return nil, nil, err
@@ -159,7 +164,7 @@ func Modules(ctx context.Context, p *Plan, f machine.Facts) (module.Set, profile
 	return modules, profiles, err
 }
 
-// consistent reports installer modules that contradict the plan.
+// consistent reports starter modules that contradict the plan.
 func consistent(p *Plan, desired []string, fail func(string, ...any)) {
 	on := func(name string) bool { return slices.Contains(desired, name) }
 	if on("btrfs-snapshots") && p.Disk.Filesystem != "btrfs" {

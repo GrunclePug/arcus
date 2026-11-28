@@ -1,0 +1,14 @@
+# No display manager: log in on tty1 and run sway.
+# With the proprietary NVIDIA driver, sway requires --unsupported-gpu.
+description = "Sway Wayland desktop: log in on tty1 and run sway"
+category    = "desktop"
+
+[packages]
+pacman = [
+  "sway",
+  "foot",       # terminal emulator used in the stock sway config
+  "wmenu",      # application launcher used in the stock sway config
+  "swaybg",     # wallpaper tool used by the stock sway config
+  "polkit",     # session privilege support with systemd-logind
+  "ttf-dejavu", # font family (named explicitly so pacman doesn't pick a provider)
+]

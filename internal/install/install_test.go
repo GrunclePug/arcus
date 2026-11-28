@@ -1,16 +1,26 @@
 package install
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	iofs "io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/grunclepug/arcus/internal/config"
+	"github.com/grunclepug/arcus/internal/layer"
+	"github.com/grunclepug/arcus/internal/machine"
 	"github.com/grunclepug/arcus/internal/module"
+	"github.com/grunclepug/arcus/internal/plan"
+	"github.com/grunclepug/arcus/internal/profile"
+	"github.com/grunclepug/arcus/internal/state"
 )
 
 const validPlan = `version = 1
@@ -48,6 +58,10 @@ func TestLoad(t *testing.T) {
 	if _, err := Load(writePlan(t, validPlan)); err != nil {
 		t.Fatalf("valid plan: %v", err)
 	}
+	withProfile := strings.Replace(validPlan, "[host]\n", "[host]\nprofiles = [\"desktop\"]\n", 1)
+	if _, err := Load(writePlan(t, withProfile)); err != nil {
+		t.Fatalf("valid no-dotfiles plan with profile: %v", err)
+	}
 	for _, tc := range []struct {
 		name, from, to, want string
 	}{
@@ -62,7 +76,6 @@ func TestLoad(t *testing.T) {
 		{"root user", `name  = "me"`, `name = "root"`, "user.name"},
 		{"password hash", "wheel = true", "wheel = true\npassword_hash = \"secret\"", "crypt hash"},
 		{"module twice", `"btrfs-snapshots"]`, `"btrfs-snapshots", "base"]`, "listed twice"},
-		{"profiles need dotfiles", "[host]", "[host]\nprofiles = [\"laptop\"]", "needs a dotfiles repository"},
 		{"dotfiles url", "[host]", "[dotfiles]\nurl = \"http://example.com/dot\"\n\n[host]", "dotfiles.url"},
 		{"dotfiles path", "[host]", "[dotfiles]\nurl = \"https://example.com/dot\"\npath = \"/srv/dot\"\n\n[host]", "dotfiles.path"},
 		{"encrypted swap partition", `swap       = "zram"`, "swap = \"partition\"\nswap_size = \"4G\"\nencrypt = true", "encrypted swap partition"},
@@ -80,19 +93,130 @@ func TestLoad(t *testing.T) {
 	}
 }
 
-// Every installer module loads, and the machine module follows the plan,
-// the firmware, the CPU and the audio driver.
+// The embedded starter config matches examples/ on disk byte for byte
+// (including hidden dotfiles), loads config.toml, every module and desktop,
+// and plans cleanly; the machine module follows the plan, firmware, CPU and
+// audio driver.
 func TestModulesAndMachineFacts(t *testing.T) {
 	p, err := Load(writePlan(t, validPlan))
 	if err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
-	if err := WriteModules(dir); err != nil {
+	if err := WriteConfig(dir); err != nil {
 		t.Fatal(err)
 	}
-	if set, err := module.Scan(dir); err != nil || len(set) != 4 {
-		t.Fatalf("%d installer modules (%v)", len(set), err)
+
+	// Two-way byte-for-byte comparison with ../../examples (skipping *.go).
+	readTree := func(root string, skipGo bool) map[string][]byte {
+		t.Helper()
+		files := map[string][]byte{}
+		err := filepath.WalkDir(root, func(path string, d iofs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return err
+			}
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				return err
+			}
+			if skipGo && !strings.Contains(rel, string(filepath.Separator)) && strings.HasSuffix(rel, ".go") {
+				return nil
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			files[filepath.ToSlash(rel)] = data
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return files
+	}
+	gotFiles := readTree(dir, false)
+	wantFiles := readTree(filepath.Join("..", "..", "examples"), true)
+	if !slices.Equal(slices.Sorted(maps.Keys(gotFiles)), slices.Sorted(maps.Keys(wantFiles))) {
+		t.Fatalf("embedded starter files mismatch:\ngot  %v\nwant %v", slices.Sorted(maps.Keys(gotFiles)), slices.Sorted(maps.Keys(wantFiles)))
+	}
+	for rel, wantData := range wantFiles {
+		if !bytes.Equal(gotFiles[rel], wantData) {
+			t.Errorf("embedded file %s differs from examples/%s", rel, rel)
+		}
+	}
+	for _, mustExist := range []string{
+		"config.toml",
+		"profiles/desktop.toml",
+		"modules/shell/home/.inputrc",
+		"modules/sway/home/.config/sway/config",
+	} {
+		if _, ok := gotFiles[mustExist]; !ok {
+			t.Errorf("WriteConfig missed %s", mustExist)
+		}
+	}
+
+	cfg, err := config.Load(filepath.Join(dir, "config.toml"), "/home/me")
+	if err != nil {
+		t.Fatalf("starter config.toml: %v", err)
+	}
+	defCfg, err := config.Load(filepath.Join(t.TempDir(), "missing.toml"), "/home/me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(cfg, defCfg) {
+		t.Errorf("starter config.toml = %+v, want defaults %+v", cfg, defCfg)
+	}
+
+	local := filepath.Join(t.TempDir(), "machine")
+	if err := MachineFacts(p, true, t.TempDir()).Write(filepath.Join(local, machine.Name)); err != nil {
+		t.Fatal(err)
+	}
+	set, err := module.Scan(filepath.Join(dir, "modules"), local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantMods := []string{"base", "bluetooth", "btrfs-snapshots", "machine", "shell", "sway", "vm-qemu"}
+	if got := slices.Sorted(maps.Keys(set)); !slices.Equal(got, wantMods) {
+		t.Fatalf("starter modules = %v, want %v", got, wantMods)
+	}
+	profs, err := profile.Scan(filepath.Join(dir, "profiles"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := slices.Sorted(maps.Keys(profs)); !slices.Equal(got, []string{"desktop"}) {
+		t.Fatalf("starter profiles = %v, want [desktop]", got)
+	}
+
+	// Plan desktop plus every standalone starter module.
+	selected, _, err := profs.Expand([]string{"desktop"}, []string{"bluetooth", "btrfs-snapshots", "vm-qemu"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err := set.Resolve(selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirs := map[string]string{}
+	for name, m := range set {
+		dirs[name] = m.Dir
+	}
+	in := plan.Input{Desired: desired, Modules: set, Protected: cfg.Protected}
+	sysSteps, err := plan.System(in, plan.Half{
+		State: &state.State{},
+		Layer: layer.NewSystem(t.TempDir(), t.TempDir(), dirs),
+	})
+	if err != nil {
+		t.Fatalf("plan.System(starter): %v", err)
+	}
+	usrSteps, err := plan.User(in, plan.Half{
+		State: &state.State{},
+		Layer: layer.NewHome(t.TempDir(), t.TempDir(), dirs),
+	})
+	if err != nil {
+		t.Fatalf("plan.User(starter): %v", err)
+	}
+	if len(sysSteps) == 0 || len(usrSteps) == 0 {
+		t.Errorf("expected both system and user steps for starter desktop, got sys=%d usr=%d", len(sysSteps), len(usrSteps))
 	}
 
 	// One root per CPU, read like the live system's /proc and /sys. The AMD
@@ -201,6 +325,7 @@ func TestCheck(t *testing.T) {
 		{"locale", freeDisk, func(p *Plan) { p.System.Locale = "xx_XX.UTF-8" }, "locale"},
 		{"keymap", freeDisk, func(p *Plan) { p.System.Keymap = "dvorak" }, "keymap"},
 		{"unknown module", freeDisk, func(p *Plan) { p.Host.Modules = append(p.Host.Modules, "nope") }, "nope"},
+		{"unknown starter profile", freeDisk, func(p *Plan) { p.Host.Profiles = []string{"nope"} }, "profile \"nope\""},
 		{"snapshots need btrfs", freeDisk, func(p *Plan) { p.Disk.Filesystem = "xfs" }, "btrfs-snapshots needs"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -213,6 +338,20 @@ func TestCheck(t *testing.T) {
 				t.Errorf("problems = %v, want %q", r.Problems, tc.want)
 			}
 		})
+	}
+
+	// Starter desktop profile resolves without a dotfiles repository, without
+	// prepending machine a second time.
+	pDesktop, err := Load(writePlan(t, strings.Replace(validPlan,
+		`modules = ["base", "btrfs-snapshots"]`,
+		"profiles = [\"desktop\"]\nmodules = [\"btrfs-snapshots\"]", 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rDesktop := Check(context.Background(), pDesktop, live(t, freeDisk)); len(rDesktop.Problems) > 0 {
+		t.Fatalf("starter desktop profile problems: %v", rDesktop.Problems)
+	} else if want := []string{"base", "machine", "shell", "sway", "btrfs-snapshots"}; !slices.Equal(rDesktop.Desired, want) {
+		t.Errorf("starter desktop desired = %v, want %v", rDesktop.Desired, want)
 	}
 
 	m := live(t, freeDisk)
