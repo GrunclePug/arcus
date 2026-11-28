@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	iofs "io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -521,53 +522,21 @@ func EnabledUnits(root string, dirs []string) (map[string]bool, error) {
 	// (alias.service -> /etc/systemd/system/real.service -> /opt/real.service)
 	// while ignoring external linked unit fragments (/opt/ext/custom.conf or
 	// home/-deployed units).
-	dirSet := map[string]bool{}
-	for _, d := range dirs {
-		clean := filepath.Clean(d)
-		dirSet[clean] = true
-		if rd, rfi, rdev, rerr := resolveInRoot(root, d); rerr == nil && !rdev && rfi.IsDir() {
-			dirSet[rd] = true
-		}
-	}
+	dirSet := unitDirSet(root, dirs)
 	dir0Rel := toRelInRoot(root, dir0)
 	for _, e := range entries {
 		if e.Type()&iofs.ModeSymlink == 0 {
 			continue
 		}
 		linkName := e.Name()
-		linkPath := filepath.Join(dir0, linkName)
-		rawTarget, err := os.Readlink(linkPath)
-		if errors.Is(err, iofs.ErrNotExist) {
-			continue
-		}
+		targetBase, inTree, ok, err := topLinkFirstHop(root, dir0Rel, filepath.Join(dir0, linkName), dirSet)
 		if err != nil {
 			return nil, err
 		}
-		var firstRel string
-		if filepath.IsAbs(rawTarget) {
-			firstRel = toRelInRoot(root, filepath.Clean(rawTarget))
-		} else {
-			firstRel = filepath.Clean(filepath.Join(dir0Rel, rawTarget))
-		}
-		if firstRel == "/dev/null" {
-			continue
-		}
-		targetBase := filepath.Base(firstRel)
-		if targetBase == "" || targetBase == "." || targetBase == ".." || targetBase == "/" || targetBase == linkName || IsTemplate(targetBase) {
+		if !ok || !inTree || targetBase == "" || targetBase == "." || targetBase == ".." || targetBase == "/" || targetBase == linkName || IsTemplate(targetBase) {
 			continue
 		}
 		if enabled[targetBase] {
-			continue
-		}
-		parentPath := fromRelInRoot(root, filepath.Dir(firstRel))
-		resolvedParent, pfi, pdev, perr := resolveInRoot(root, parentPath)
-		if pdev || isBrokenLink(perr) || errors.Is(perr, iofs.ErrPermission) {
-			continue
-		}
-		if perr != nil {
-			return nil, perr
-		}
-		if !pfi.IsDir() || (!dirSet[resolvedParent] && !dirSet[parentPath]) {
 			continue
 		}
 		unitPath, st, err := unitFile(root, dirs, targetBase)
@@ -589,6 +558,51 @@ func EnabledUnits(root string, dirs []string) (map[string]bool, error) {
 		}
 	}
 	return enabled, nil
+}
+
+func unitDirSet(root string, dirs []string) map[string]bool {
+	dirSet := map[string]bool{}
+	for _, d := range dirs {
+		clean := filepath.Clean(d)
+		dirSet[clean] = true
+		if rd, rfi, rdev, rerr := resolveInRoot(root, d); rerr == nil && !rdev && rfi.IsDir() {
+			dirSet[rd] = true
+		}
+	}
+	return dirSet
+}
+
+// topLinkFirstHop inspects the first hop of symlink linkPath in dirs[0] and
+// reports its target basename and whether its first-hop parent directory lies
+// inside dirSet. Masks (/dev/null), broken links, and unreadable parents
+// return ok = false.
+func topLinkFirstHop(root, dir0Rel, linkPath string, dirSet map[string]bool) (targetBase string, inTree, ok bool, err error) {
+	rawTarget, err := os.Readlink(linkPath)
+	if errors.Is(err, iofs.ErrNotExist) {
+		return "", false, false, nil
+	}
+	if err != nil {
+		return "", false, false, err
+	}
+	var firstRel string
+	if filepath.IsAbs(rawTarget) {
+		firstRel = toRelInRoot(root, filepath.Clean(rawTarget))
+	} else {
+		firstRel = filepath.Clean(filepath.Join(dir0Rel, rawTarget))
+	}
+	if firstRel == "/dev/null" {
+		return "", false, false, nil
+	}
+	parentPath := fromRelInRoot(root, filepath.Dir(firstRel))
+	resolvedParent, pfi, pdev, perr := resolveInRoot(root, parentPath)
+	if pdev || isBrokenLink(perr) || errors.Is(perr, iofs.ErrPermission) {
+		return "", false, false, nil
+	}
+	if perr != nil {
+		return "", false, false, perr
+	}
+	inTree = pfi.IsDir() && (dirSet[resolvedParent] || dirSet[parentPath])
+	return filepath.Base(firstRel), inTree, true, nil
 }
 
 func isDepDir(name string) bool {
@@ -688,6 +702,182 @@ func WithAlso(root string, dirs, units []string) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// DisableImpact describes what `systemctl disable` on a unit takes along
+// through [Install] Also= in addition to the unit itself.
+type DisableImpact struct {
+	// Units are the concrete units systemctl disable reaches through [Install]
+	// Also= (excluding the starting unit itself, sorted), including enabled
+	// instances of any bare template reached through Also=.
+	Units []string
+	// ByEnable are the concrete units systemctl enable would also enable
+	// through Also= (installable concrete targets and installable template
+	// DefaultInstance= values, excluding the starting unit itself, sorted).
+	ByEnable []string
+	// Templates maps each non-masked bare template reached through Also= to
+	// the currently enabled concrete instances of that template (sorted),
+	// including templates with no enabled instances.
+	Templates map[string][]string
+}
+
+// DisableClosure walks [Install] Also= (including unenabled Also=-only
+// intermediate units) starting from unit, returning what
+// `systemctl disable unit` would also disable. Bare templates reached via
+// Also= (unless masked) record all matching enabled instances without
+// recursing into per-instance overrides, while walking the template itself
+// with DefaultInstance=. Unreadable (permission denied) unit files are
+// skipped.
+func DisableClosure(root string, dirs []string, enabled map[string]bool, unit string) (DisableImpact, error) {
+	root = cleanRoot(root)
+	unitSet := map[string]bool{}
+	byEnableSet := map[string]bool{}
+	tplSeen := map[string]map[string]bool{}
+	visited := map[string]bool{}
+
+	type item struct {
+		unit  string
+		start bool
+	}
+	queue := []item{{unit: unit, start: true}}
+	for len(queue) > 0 {
+		it := queue[0]
+		queue = queue[1:]
+		u := it.unit
+		if visited[u] {
+			continue
+		}
+		visited[u] = true
+		tpl := IsTemplate(u)
+		path, st, err := unitFile(root, dirs, u)
+		if err != nil {
+			return DisableImpact{}, err
+		}
+		var inst installSection
+		if st == unitFound {
+			inst, err = readInstall(path, instanceOf(u), tpl)
+			if err != nil {
+				if errors.Is(err, iofs.ErrPermission) {
+					st = unitNotFound
+				} else {
+					return DisableImpact{}, err
+				}
+			}
+		}
+		if !it.start {
+			if tpl {
+				if st != unitMasked {
+					if tplSeen[u] == nil {
+						tplSeen[u] = map[string]bool{}
+					}
+					for e := range enabled {
+						if Template(e) == u {
+							tplSeen[u][e] = true
+							unitSet[e] = true
+						}
+					}
+					if st == unitFound && inst.defaultInstance != "" {
+						def := instantiate(u, inst.defaultInstance)
+						unitSet[def] = true
+						if inst.installableFor(def) {
+							byEnableSet[def] = true
+						}
+					}
+				}
+			} else if u != unit {
+				unitSet[u] = true
+				if st == unitFound && inst.installableFor(u) {
+					byEnableSet[u] = true
+				}
+			}
+		}
+		if st == unitFound {
+			for _, a := range inst.also {
+				queue = append(queue, item{unit: a})
+			}
+		}
+	}
+
+	delete(unitSet, unit)
+	delete(byEnableSet, unit)
+
+	var out DisableImpact
+	if len(unitSet) > 0 {
+		out.Units = slices.Sorted(maps.Keys(unitSet))
+	}
+	if len(byEnableSet) > 0 {
+		out.ByEnable = slices.Sorted(maps.Keys(byEnableSet))
+	}
+	if len(tplSeen) > 0 {
+		out.Templates = make(map[string][]string, len(tplSeen))
+		for tpl, insts := range tplSeen {
+			if len(insts) > 0 {
+				out.Templates[tpl] = slices.Sorted(maps.Keys(insts))
+			} else {
+				out.Templates[tpl] = nil
+			}
+		}
+	}
+	return out, nil
+}
+
+// Installable reports whether unit has [Install] directives that
+// `systemctl enable` can use to enable it (non-empty WantedBy=, RequiredBy=,
+// UpheldBy=, or Alias= for non-instance units; Also= alone does not count).
+// Returns iofs.ErrPermission when the unit file cannot be read so callers
+// can handle unreadable root-only files according to context.
+func Installable(root string, dirs []string, unit string) (bool, error) {
+	root = cleanRoot(root)
+	path, st, err := unitFile(root, dirs, unit)
+	if err != nil {
+		return false, err
+	}
+	if st != unitFound {
+		return false, nil
+	}
+	inst, err := readInstall(path, instanceOf(unit), false)
+	if err != nil {
+		return false, err
+	}
+	return inst.installableFor(unit), nil
+}
+
+// IsLinkedUnit reports whether unit has a top-level external symlink in
+// dirs[0] whose first-hop parent lies outside systemd's unit search
+// directories (such as a `systemctl link` or `home/`-deployed unit).
+// `systemctl disable` removes such top-level symlinks and `systemctl enable`
+// cannot recreate them.
+func IsLinkedUnit(root string, dirs []string, unit string) (bool, error) {
+	if len(dirs) == 0 {
+		return false, nil
+	}
+	root = cleanRoot(root)
+	dir0, fi, devNull, err := resolveInRoot(root, dirs[0])
+	if errors.Is(err, iofs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || devNull {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !fi.IsDir() {
+		return false, nil
+	}
+	p := filepath.Join(dir0, unit)
+	lfi, lerr := os.Lstat(p)
+	if errors.Is(lerr, iofs.ErrNotExist) || errors.Is(lerr, syscall.ENOTDIR) {
+		return false, nil
+	}
+	if lerr != nil {
+		return false, lerr
+	}
+	if lfi.Mode()&iofs.ModeSymlink == 0 {
+		return false, nil
+	}
+	_, inTree, ok, err := topLinkFirstHop(root, toRelInRoot(root, dir0), p, unitDirSet(root, dirs))
+	if err != nil {
+		return false, err
+	}
+	return ok && !inTree, nil
 }
 
 // Template returns the template of an instance (a@b.service gives
@@ -898,7 +1088,17 @@ func resolveInRoot(root, p string) (resolved string, info os.FileInfo, devNull b
 type installSection struct {
 	also            []string
 	alias           []string
+	wantedBy        []string
+	requiredBy      []string
+	upheldBy        []string
 	defaultInstance string
+}
+
+func (s installSection) installableFor(unit string) bool {
+	if len(s.wantedBy) > 0 || len(s.requiredBy) > 0 || len(s.upheldBy) > 0 {
+		return true
+	}
+	return instanceOf(unit) == "" && slices.ContainsFunc(s.alias, func(a string) bool { return a != "" })
 }
 
 // readInstall reads the [Install] section of path. When isTemplate is true,
@@ -946,6 +1146,12 @@ func readInstall(path, initialInst string, isTemplate bool) (installSection, err
 			} else {
 				s.alias = append(s.alias, fields...)
 			}
+		case "WantedBy":
+			parseFields(value, &s.wantedBy)
+		case "RequiredBy":
+			parseFields(value, &s.requiredBy)
+		case "UpheldBy":
+			parseFields(value, &s.upheldBy)
 		case "DefaultInstance":
 			v := validInstance(strings.TrimSpace(value))
 			s.defaultInstance = v
@@ -955,6 +1161,15 @@ func readInstall(path, initialInst string, isTemplate bool) (installSection, err
 		}
 	}
 	return s, nil
+}
+
+func parseFields(value string, dst *[]string) {
+	fields := strings.Fields(value)
+	if len(fields) == 0 {
+		*dst = nil
+	} else {
+		*dst = append(*dst, fields...)
+	}
 }
 
 // expandAlso expands %% -> % and %i -> inst in a single left-to-right pass.

@@ -445,7 +445,90 @@ func (a *app) situation(in plan.Input, h *half, aurRemoved map[string]bool) (pla
 			return plan.Half{}, err
 		}
 	}
+	unitKind, user := state.UserUnits, true
+	if h.name == "system" {
+		unitKind, user = state.SystemUnits, false
+	}
+	if leavingUnits := in.Removals(st, unitKind, s.Units); len(leavingUnits) > 0 {
+		if err := a.unitTeardownInfo(in, &s, a.unitDirs(user), unitKind, leavingUnits); err != nil {
+			return plan.Half{}, err
+		}
+	}
 	return s, nil
+}
+
+// unitTeardownInfo fills the Also= and installability metadata plan.unitRemovals
+// needs when a half is releasing units. It over-approximates over leavingUnits
+// rather than duplicating S so only package plan defines staying coverage.
+func (a *app) unitTeardownInfo(in plan.Input, s *plan.Half, dirs []string, kind string, leaving []string) error {
+	if len(dirs) > 0 {
+		s.UnitDir = dirs[0]
+	}
+	s.UnitAlso = map[string][]string{}
+	s.UnitDisable = map[string]system.DisableImpact{}
+	s.UnitInstallable = map[string]bool{}
+	s.UnitLinked = map[string]bool{}
+
+	declares := in.Declares(kind)
+	for _, mod := range in.Desired {
+		for _, u := range declares[mod] {
+			if _, ok := s.UnitAlso[u]; ok {
+				continue
+			}
+			all, err := system.WithAlso(a.root, dirs, []string{u})
+			if err != nil {
+				return err
+			}
+			if len(all) > 1 {
+				s.UnitAlso[u] = all[1:]
+			} else {
+				s.UnitAlso[u] = nil
+			}
+		}
+	}
+	for _, u := range leaving {
+		imp, err := system.DisableClosure(a.root, dirs, s.Units, u)
+		if err != nil {
+			return err
+		}
+		s.UnitDisable[u] = imp
+	}
+	// On permission errors in non-root planning, treat collateral as
+	// installable so user-side planning doesn't falsely block while root
+	// exec-system re-checks with full sight.
+	for _, u := range leaving {
+		for tpl := range s.UnitDisable[u].Templates {
+			if _, ok := s.UnitLinked[tpl]; !ok {
+				linked, err := system.IsLinkedUnit(a.root, dirs, tpl)
+				if err != nil {
+					return err
+				}
+				s.UnitLinked[tpl] = linked
+			}
+		}
+		for _, cand := range s.UnitDisable[u].Units {
+			if !s.Units[cand] {
+				continue
+			}
+			if _, ok := s.UnitInstallable[cand]; !ok {
+				inst, err := system.Installable(a.root, dirs, cand)
+				if errors.Is(err, iofs.ErrPermission) {
+					inst = true
+				} else if err != nil {
+					return err
+				}
+				s.UnitInstallable[cand] = inst
+			}
+			if _, ok := s.UnitLinked[cand]; !ok {
+				linked, err := system.IsLinkedUnit(a.root, dirs, cand)
+				if err != nil {
+					return err
+				}
+				s.UnitLinked[cand] = linked
+			}
+		}
+	}
+	return nil
 }
 
 // adoptInfo reads what marking the packages to take over needs: the user
@@ -679,7 +762,16 @@ func describe(s plan.Step) string {
 	case plan.Install:
 		return fmt.Sprintf("install %s for %s: %s", pkgs, s.Module, names)
 	case plan.Disable:
-		return fmt.Sprintf("disable %s of %s: %s%s", units, s.Module, names, now)
+		if len(s.Names) == 0 {
+			return fmt.Sprintf("keep %s of %s that another module's units enable: %s", units, s.Module, strings.Join(s.Kept, " "))
+		}
+		desc := fmt.Sprintf("disable %s of %s: %s%s", units, s.Module, names, now)
+		if len(s.Kept) > 0 {
+			desc += fmt.Sprintf("; keep %s, which another module's units enable", strings.Join(s.Kept, " "))
+		}
+		return desc
+	case plan.ReEnable:
+		return fmt.Sprintf("re-enable %s disabled with another unit: %s", units, names)
 	case plan.Enable:
 		return fmt.Sprintf("enable %s for %s: %s%s", units, s.Module, names, now)
 	case plan.Leave:
@@ -863,7 +955,20 @@ func (a *app) runSteps(h *half, st *state.State, steps []plan.Step, in plan.Inpu
 			if err := a.appImage(h, st, s, in, save); err != nil {
 				return err
 			}
-		case plan.Remove, plan.RemoveLocal, plan.Disable, plan.Leave, plan.Rmdir, plan.Unlink, plan.RemoveAppImage:
+		case plan.Disable:
+			var reEnable []string
+			if j < len(steps) && steps[j].Op == plan.ReEnable {
+				reEnable = steps[j].Names
+			}
+			if err := a.disableUnits(st, steps[i:j], reEnable, in, r, save); err != nil {
+				return err
+			}
+			if len(reEnable) > 0 {
+				i = j
+			} else {
+				i = j - 1
+			}
+		case plan.Remove, plan.RemoveLocal, plan.Leave, plan.Rmdir, plan.Unlink, plan.RemoveAppImage:
 			if err := a.remove(st, steps[i:j], in, r, save); err != nil {
 				return err
 			}
@@ -1001,12 +1106,6 @@ func (a *app) remove(st *state.State, steps []plan.Step, in plan.Input, r *syste
 				err = r.AURRemove(a.cfg.AURHelper, remove)
 			}
 		}
-	case plan.Disable:
-		for _, s := range steps {
-			if err = r.Disable(kind == state.UserUnits, s.Names, s.Now); err != nil {
-				break
-			}
-		}
 	case plan.Leave:
 		for _, g := range want {
 			if err = r.LeaveGroup(a.user, g); err != nil {
@@ -1062,6 +1161,76 @@ func (a *app) remove(st *state.State, steps []plan.Step, in plan.Input, r *syste
 		}
 	}
 	return save()
+}
+
+// disableUnits disables released units and unconditionally restores any
+// collateral staying units in reEnable once any disable has been attempted,
+// even if a later disable fails or context cancellation arrives. Ownership is
+// reconciled and saved only after both disable and restoration succeed.
+func (a *app) disableUnits(st *state.State, steps []plan.Step, reEnable []string, in plan.Input, r *system.Runner, save func() error) error {
+	kind := steps[0].Kind()
+	user := kind == state.UserUnits
+	present, err := a.present(kind)
+	if err != nil {
+		return err
+	}
+	var want []string
+	for _, s := range steps {
+		want = append(want, s.Names...)
+		want = append(want, s.Kept...)
+	}
+	want = slices.Compact(slices.Sorted(slices.Values(want)))
+	got := slices.Compact(slices.Sorted(slices.Values(in.Removals(st, kind, present))))
+	if !slices.Equal(got, want) {
+		return fmt.Errorf("the %s to remove changed since the plan was shown (now %v); run the command again", kind, got)
+	}
+
+	var ran bool
+	var disableErr error
+	for _, s := range steps {
+		if len(s.Names) == 0 {
+			continue
+		}
+		ran = true
+		if disableErr = r.Disable(user, s.Names, s.Now); disableErr != nil {
+			break
+		}
+	}
+	var reEnableErr error
+	if ran && len(reEnable) > 0 {
+		reEnableErr = a.reEnableUnits(kind, reEnable, r)
+	}
+	if disableErr != nil || reEnableErr != nil {
+		return errors.Join(disableErr, reEnableErr)
+	}
+	in.Reconcile(st, kind, present)
+	return save()
+}
+
+// reEnableUnits runs systemctl enable (never --now) on names and verifies each
+// unit is enabled afterwards, naming any still-disabled units with the exact
+// recovery command.
+func (a *app) reEnableUnits(kind string, names []string, r *system.Runner) error {
+	user := kind == state.UserUnits
+	enableErr := r.Enable(user, names, false)
+	after, presentErr := a.present(kind)
+	if presentErr != nil {
+		return errors.Join(enableErr, presentErr)
+	}
+	var missing []string
+	for _, u := range names {
+		if !after[u] {
+			missing = append(missing, u)
+		}
+	}
+	if len(missing) > 0 {
+		cmd := "systemctl enable " + strings.Join(missing, " ")
+		if user {
+			cmd = "systemctl --user enable " + strings.Join(missing, " ")
+		}
+		return errors.Join(enableErr, fmt.Errorf("units still disabled after re-enable: %s; run '%s'", strings.Join(missing, " "), cmd))
+	}
+	return enableErr
 }
 
 // link creates a home link, and its parent directories. It refuses to

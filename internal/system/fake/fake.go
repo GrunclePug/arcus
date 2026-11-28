@@ -175,12 +175,14 @@ cat $(find . -type f | sort) > "$PKGDEST/$pkgname-$pkgver-$pkgrel-x86_64.pkg.tar
 
 // systemctlScript writes and removes real enablement symlinks inside the
 // sandboxed root/config directories read from $dir/unit-root and
-// $dir/unit-config. Like real systemctl, it leaves top-level links (masks,
-// home/-deployed units) untouched on disable and removes empty *.wants dirs.
-// Unlike real systemctl, enable creates a stub [Unit] file under
-// <root>/usr/lib/systemd/{system,user} when neither the unit nor its template
-// exists yet, and links into multi-user.target.wants or default.target.wants
-// without requiring a WantedBy= line.
+// $dir/unit-config. On disable it follows plain [Install] Also= lines
+// iteratively and removes matching instances for bare templates in Also=;
+// specifiers (%i), DefaultInstance= and top-level link removal (real
+// systemctl disable also removes external linked unit symlinks) are left to
+// the real systemctl --root tests in internal/system. Unlike real systemctl,
+// enable does not follow Also=, does not require a WantedBy= line, and
+// creates a stub [Unit] file under <root>/usr/lib/systemd/{system,user} when
+// neither the unit nor its template exists yet.
 const systemctlScript = `#!/bin/sh
 dir=%DIR%
 printf 'systemctl %s\n' "$*" >> "$dir/log"
@@ -207,35 +209,67 @@ else
   lib="$root/usr/lib/systemd/system"
   target_prefix="/usr/lib/systemd/system"
 fi
-has_file() {
+find_file() {
   f=$1
   if [ "$user" = 1 ]; then
     for d in "$cfg/systemd/user" "$root/etc/systemd/user" "$data" "$root/usr/local/share/systemd/user" "$root/usr/share/systemd/user" "$root/usr/local/lib/systemd/user" "$root/usr/lib/systemd/user"; do
-      if [ -e "$d/$f" ] || [ -L "$d/$f" ]; then return 0; fi
+      if [ -e "$d/$f" ] || [ -L "$d/$f" ]; then printf '%s\n' "$d/$f"; return 0; fi
     done
   else
     for d in "$root/etc/systemd/system" "$root/usr/local/lib/systemd/system" "$root/usr/lib/systemd/system"; do
-      if [ -e "$d/$f" ] || [ -L "$d/$f" ]; then return 0; fi
+      if [ -e "$d/$f" ] || [ -L "$d/$f" ]; then printf '%s\n' "$d/$f"; return 0; fi
     done
   fi
   return 1
 }
+has_file() {
+  find_file "$1" >/dev/null 2>&1
+}
+read_also() {
+  [ -f "$1" ] || return 0
+  awk '
+    /^[ \t]*[#;]/ || /^[ \t]*$/ { next }
+    /^[ \t]*\[/ { sec = $0; gsub(/^[ \t]+|[ \t]+$/, "", sec); next }
+    sec == "[Install]" {
+      line = $0
+      sub(/^[ \t]+/, "", line)
+      if (line ~ /^Also[ \t]*=/) {
+        sub(/^Also[ \t]*=[ \t]*/, "", line)
+        n = split(line, a, /[ \t]+/)
+        for (i = 1; i <= n; i++) {
+          if (a[i] != "" && index(a[i], "%") == 0) print a[i]
+        }
+      }
+    }
+  ' "$1"
+}
 for u in "$@"; do
   case $u in -*) continue ;; esac
+  if [ "$op" = disable ] && [ -f "$dir/fail-disable" ] && grep -qx "$u" "$dir/fail-disable"; then
+    exit 1
+  fi
+  if [ "$op" = enable ] && [ -f "$dir/fail-enable" ] && grep -qx "$u" "$dir/fail-enable"; then
+    exit 1
+  fi
   tpl=$u
+  bare=0
   case $u in
     *@*.*)
       rest=${u#*@}
       suffix=.${rest##*.}
       if [ "$rest" = "$suffix" ]; then
-        printf 'fake systemctl: bare template %s\n' "$u" >&2
-        exit 1
+        bare=1
+      else
+        tpl="${u%%@*}@${suffix}"
       fi
-      tpl="${u%%@*}@${suffix}"
       ;;
   esac
   case $op in
     enable)
+      if [ "$bare" = 1 ]; then
+        printf 'fake systemctl: bare template %s\n' "$u" >&2
+        exit 1
+      fi
       if ! has_file "$u" && ! has_file "$tpl"; then
         mkdir -p "$lib"
         printf '[Unit]\n' > "$lib/$tpl"
@@ -244,11 +278,55 @@ for u in "$@"; do
       ln -sfn "$target_prefix/$tpl" "$scope/$wants/$u"
       ;;
     disable)
-      for dep in "$scope"/*.wants "$scope"/*.requires "$scope"/*.upholds; do
-        [ -d "$dep" ] || continue
-        if [ -L "$dep/$u" ]; then
-          rm -f "$dep/$u"
-          rmdir "$dep" 2>/dev/null || true
+      queue="$u"
+      seen=" "
+      while [ -n "$queue" ]; do
+        cur=${queue%% *}
+        if [ "$cur" = "$queue" ]; then
+          queue=""
+        else
+          queue=${queue#"$cur "}
+        fi
+        [ -n "$cur" ] || continue
+        case $seen in *" $cur "*) continue ;; esac
+        seen="$seen$cur "
+        cur_tpl=$cur
+        cur_bare=0
+        case $cur in
+          *@*.*)
+            crest=${cur#*@}
+            csuf=.${crest##*.}
+            if [ "$crest" = "$csuf" ]; then
+              cur_bare=1
+              cpfx=${cur%%@*}
+            else
+              cur_tpl="${cur%%@*}@${csuf}"
+            fi
+            ;;
+        esac
+        for dep in "$scope"/*.wants "$scope"/*.requires "$scope"/*.upholds; do
+          [ -d "$dep" ] || continue
+          if [ "$cur_bare" = 1 ]; then
+            for f in "$dep/${cpfx}@"*"${csuf}"; do
+              [ -L "$f" ] || continue
+              rm -f "$f"
+            done
+            rmdir "$dep" 2>/dev/null || true
+          elif [ -L "$dep/$cur" ]; then
+            rm -f "$dep/$cur"
+            rmdir "$dep" 2>/dev/null || true
+          fi
+        done
+        uf=$(find_file "$cur") || uf=$(find_file "$cur_tpl") || uf=""
+        if [ -n "$uf" ]; then
+          for nxt in $(read_also "$uf"); do
+            case $seen in *" $nxt "*) continue ;; esac
+            if [ -n "$queue" ]; then
+              queue="$queue $nxt"
+            else
+              queue="$nxt"
+            fi
+          done
         fi
       done
       ;;
@@ -514,6 +592,12 @@ func (s *System) Log() []string { return s.lines("log") }
 
 // Fail makes the named tool (pacman, yay, ...) fail its next transactions.
 func (s *System) Fail(tool string) { s.set("fail", []string{tool}) }
+
+// FailDisable makes fake systemctl disable fail when invoked on any of units.
+func (s *System) FailDisable(units ...string) { s.set("fail-disable", units) }
+
+// FailEnable makes fake systemctl enable fail when invoked on any of units.
+func (s *System) FailEnable(units ...string) { s.set("fail-enable", units) }
 
 // Slow makes package transactions take seconds, writing a "started" marker
 // when they begin and a "done" marker when they finish.
