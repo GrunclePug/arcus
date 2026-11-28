@@ -70,7 +70,8 @@ const (
 	Install  = "install"
 	Disable  = "disable" // units
 	Enable   = "enable"
-	Leave    = "leave" // groups
+	ReEnable = "re-enable" // units in a staying module's Also= closure restored after disable took them along
+	Leave    = "leave"     // groups
 	Join     = "join"
 
 	BuildLocal   = "build" // own builds: makepkg into the cache
@@ -129,7 +130,7 @@ func (s Step) Kind() string {
 			return state.Pacman
 		}
 		return state.AUR
-	case s.Op == Disable || s.Op == Enable:
+	case s.Op == Disable || s.Op == Enable || s.Op == ReEnable:
 		if s.Stage.Root() {
 			return state.SystemUnits
 		}
@@ -245,9 +246,24 @@ type Half struct {
 	// installed packages that depend on each.
 	RequiredBy map[string][]string
 	Units      map[string]bool // enabled units of this half
-	Groups     map[string]bool // system half: the main user's groups
-	Dirs       map[string]bool // user half: home directories that exist
-	Links      map[string]bool // user half: home links that point at their target
+	// UnitAlso lists, for each desired unit, the concrete units its [Install]
+	// Also= reaches when enabled (excluding itself).
+	UnitAlso map[string][]string
+	// UnitDisable lists, for each leaving unit, what systemctl disable takes
+	// along through [Install] Also=.
+	UnitDisable map[string]system.DisableImpact
+	// UnitInstallable reports whether a unit has [Install] directives that
+	// systemctl enable can use to enable it.
+	UnitInstallable map[string]bool
+	// UnitLinked reports whether a unit has a top-level external symlink in
+	// dirs[0] that systemctl disable would remove.
+	UnitLinked map[string]bool
+	// UnitDir is dirs[0] for this half, used in user teardown to detect
+	// staying modules' home/-deployed unit files reached through Also=.
+	UnitDir string
+	Groups  map[string]bool // system half: the main user's groups
+	Dirs    map[string]bool // user half: home directories that exist
+	Links   map[string]bool // user half: home links that point at their target
 	// Note, if set, receives what planning leaves alone that a user would
 	// want to know about: an AppImage that changed since arcus installed it.
 	Note func(string)
@@ -273,7 +289,11 @@ func System(in Input, h Half) ([]Step, error) {
 	}
 	var steps []Step
 	steps = append(steps, removals(in, h.State, Leave, SystemTeardown, state.Groups, h.Groups)...)
-	steps = append(steps, removals(in, h.State, Disable, SystemTeardown, state.SystemUnits, h.Units)...)
+	unitOff, err := unitRemovals(in, h, SystemTeardown, state.SystemUnits)
+	if err != nil {
+		return nil, err
+	}
+	steps = append(steps, unitOff...)
 	layers, err := layerSteps(in, h, SystemTeardown, SystemSetup, nil)
 	if err != nil {
 		return nil, err
@@ -320,7 +340,11 @@ func checkReleasedLocal(in Input, h Half) error {
 // User plans the user half: AUR packages, home files and user units.
 func User(in Input, h Half) ([]Step, error) {
 	var steps []Step
-	steps = append(steps, removals(in, h.State, Disable, UserTeardown, state.UserUnits, h.Units)...)
+	unitOff, err := unitRemovals(in, h, UserTeardown, state.UserUnits)
+	if err != nil {
+		return nil, err
+	}
+	steps = append(steps, unitOff...)
 	// The links removed leave their paths free for the layers, which come
 	// on after them.
 	unlinks := removals(in, h.State, Unlink, UserTeardown, state.HomeLinks, h.Links)
@@ -610,6 +634,196 @@ func removals(in Input, st *state.State, op string, stage Stage, kind string, pr
 		steps = append(steps, Step{Stage: stage, Op: op, Module: owner, Names: byOwner[owner], Now: now})
 	}
 	return steps
+}
+
+type unitCover struct {
+	mod  string // desired module
+	unit string // declared unit in mod (equals the covered unit when direct)
+}
+
+func (c unitCover) reason(u string) string {
+	if c.unit == u {
+		return fmt.Sprintf("wanted by %s", c.mod)
+	}
+	return fmt.Sprintf("enabled with %s (%s) through Also=", c.unit, c.mod)
+}
+
+func systemctlCmd(kind, op string, units []string) string {
+	if kind == state.UserUnits {
+		return fmt.Sprintf("systemctl --user %s %s", op, strings.Join(units, " "))
+	}
+	return fmt.Sprintf("systemctl %s %s", op, strings.Join(units, " "))
+}
+
+// unitRemovals plans the disabling of units reconciling releases while
+// protecting units that staying modules declare or pull in through [Install]
+// Also=. Leaving units already covered by staying modules stay enabled (with
+// ownership dropped); staying units taken along by disabling another unit are
+// re-enabled in the same teardown stage, or refused at plan time if they
+// cannot be restored cleanly or if disabling a bare template would wipe an
+// unmanaged sibling instance.
+func unitRemovals(in Input, h Half, stage Stage, kind string) ([]Step, error) {
+	steps := removals(in, h.State, Disable, stage, kind, h.Units)
+	if len(steps) == 0 || steps[0].Op != Disable {
+		return steps, nil // nothing to disable, or only a hand-over
+	}
+
+	declares := in.Declares(kind)
+	stay := map[string]unitCover{}
+	for _, mod := range in.Desired {
+		for _, u := range declares[mod] {
+			if _, ok := stay[u]; !ok {
+				stay[u] = unitCover{mod: mod, unit: u}
+			}
+		}
+	}
+	for _, mod := range in.Desired {
+		for _, u := range declares[mod] {
+			for _, a := range h.UnitAlso[u] {
+				if _, ok := stay[a]; !ok {
+					stay[a] = unitCover{mod: mod, unit: u}
+				}
+			}
+		}
+	}
+
+	disabled := map[string]bool{}
+	ownerOf := map[string]string{}
+	for i := range steps {
+		s := &steps[i]
+		var disable, kept []string
+		for _, u := range s.Names {
+			if c, ok := stay[u]; ok {
+				kept = append(kept, u)
+				s.Changes = append(s.Changes, fmt.Sprintf("= %s: %s", u, c.reason(u)))
+			} else {
+				disable = append(disable, u)
+				disabled[u] = true
+				ownerOf[u] = s.Module
+			}
+		}
+		s.Names = disable
+		s.Kept = kept
+		if len(s.Names) == 0 {
+			s.Now = false
+		}
+	}
+	if len(disabled) == 0 {
+		return steps, nil
+	}
+
+	disabledSorted := slices.Sorted(maps.Keys(disabled))
+	byEnable := map[string]bool{}
+	for _, a := range disabledSorted {
+		for _, u := range h.UnitDisable[a].ByEnable {
+			byEnable[u] = true
+		}
+	}
+
+	// Decision 2: refuse unmanaged non-default instances of a bare template
+	// reached through Also=.
+	for _, a := range disabledSorted {
+		imp := h.UnitDisable[a]
+		for _, tpl := range slices.Sorted(maps.Keys(imp.Templates)) {
+			var unmanaged []string
+			for _, inst := range imp.Templates[tpl] {
+				if _, inStay := stay[inst]; !inStay && !disabled[inst] && !byEnable[inst] {
+					unmanaged = append(unmanaged, inst)
+				}
+			}
+			if len(unmanaged) > 0 {
+				slices.Sort(unmanaged)
+				return nil, fmt.Errorf("disabling %s (from %s) follows Also=%s and would also disable unmanaged %s; list them in a module that stays on, or run '%s' first",
+					a, ownerOf[a], tpl, strings.Join(unmanaged, ", "), systemctlCmd(kind, "disable", unmanaged))
+			}
+		}
+	}
+
+	// In user teardown, check whether disabling any unit would remove a
+	// staying module's home/-deployed unit file through Also= (even if that
+	// module does not list the unit in [units].user, or if a bare template has
+	// no enabled instances).
+	if kind == state.UserUnits && h.Layer != nil && h.UnitDir != "" {
+		off := map[string]bool{}
+		for _, name := range h.State.Modules {
+			if !slices.Contains(in.Desired, name) {
+				off[name] = true
+			}
+		}
+		for _, a := range disabledSorted {
+			imp := h.UnitDisable[a]
+			checkPath := func(c string) error {
+				mods, err := h.Layer.LedgerCollisions(filepath.Join(h.UnitDir, c), off)
+				if err != nil {
+					return err
+				}
+				if len(mods) > 0 {
+					return fmt.Errorf("disabling %s (from %s) would remove %s deployed by %s, which systemctl --user enable cannot restore",
+						a, ownerOf[a], c, strings.Join(mods, ", "))
+				}
+				return nil
+			}
+			for _, tpl := range slices.Sorted(maps.Keys(imp.Templates)) {
+				if err := checkPath(tpl); err != nil {
+					return nil, err
+				}
+			}
+			for _, u := range imp.Units {
+				if disabled[u] {
+					continue
+				}
+				if err := checkPath(u); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+
+	causedBy := map[string][]string{}
+	for _, a := range disabledSorted {
+		for _, u := range h.UnitDisable[a].Units {
+			if disabled[u] || !h.Units[u] {
+				continue
+			}
+			if _, inStay := stay[u]; !inStay {
+				continue
+			}
+			if !slices.Contains(causedBy[u], a) {
+				causedBy[u] = append(causedBy[u], a)
+			}
+		}
+	}
+
+	collateral := slices.Sorted(maps.Keys(causedBy))
+	if len(collateral) == 0 {
+		return steps, nil
+	}
+
+	var changes []string
+	for _, u := range collateral {
+		c := stay[u]
+		first := causedBy[u][0]
+		if h.UnitLinked[u] {
+			return nil, fmt.Errorf("disabling %s (from %s) would remove the linked unit file for %s (%s), which %s cannot restore",
+				first, ownerOf[first], u, c.reason(u), systemctlCmd(kind, "enable", []string{u}))
+		}
+		if tpl := system.Template(u); tpl != u && h.UnitLinked[tpl] {
+			for _, a := range causedBy[u] {
+				if _, viaTpl := h.UnitDisable[a].Templates[tpl]; viaTpl {
+					return nil, fmt.Errorf("disabling %s (from %s) would remove the linked unit file for %s (%s), which %s cannot restore",
+						a, ownerOf[a], tpl, c.reason(u), systemctlCmd(kind, "enable", []string{u}))
+				}
+			}
+		}
+		if !h.UnitInstallable[u] {
+			return nil, fmt.Errorf("disabling %s (from %s) would also disable %s (%s), which has no [Install] directives to re-enable it; keep %s on, add an [Install] section to %s, or run '%s' first",
+				first, ownerOf[first], u, c.reason(u), ownerOf[first], u, systemctlCmd(kind, "disable", []string{u}))
+		}
+		changes = append(changes, fmt.Sprintf("+ %s: disabled with %s; %s", u, strings.Join(causedBy[u], " "), c.reason(u)))
+	}
+
+	steps = append(steps, Step{Stage: stage, Op: ReEnable, Names: collateral, Changes: changes})
+	return steps, nil
 }
 
 // packageRemovals plans the removal of the packages of kind that

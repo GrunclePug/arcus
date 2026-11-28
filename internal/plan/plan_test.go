@@ -1354,3 +1354,273 @@ func TestHomeLinkCollisions(t *testing.T) {
 		}
 	})
 }
+
+func TestUnitAlsoRemovals(t *testing.T) {
+	newSys := func(t *testing.T) (module.Set, *state.State, *layer.Stacker) {
+		t.Helper()
+		mods := module.Set{
+			"stay":  {Name: "stay"},
+			"leave": {Name: "leave"},
+		}
+		st := &state.State{}
+		return mods, st, layer.NewSystem(t.TempDir(), t.TempDir(), nil)
+	}
+
+	t.Run("leaving unit in S is kept with Now cleared", func(t *testing.T) {
+		mods, st, l := newSys(t)
+		mods["stay"].Units.System = []string{"homed.service"}
+		mods["leave"].Units.System = []string{"homed-activate.service"}
+		mods["leave"].Units.Now = true
+		st.Own(state.SystemUnits, "stay", []string{"homed.service"})
+		st.Own(state.SystemUnits, "leave", []string{"homed-activate.service"})
+
+		steps, err := System(Input{Desired: []string{"stay"}, Modules: mods}, Half{
+			State:    st,
+			Layer:    l,
+			Units:    set("homed.service", "homed-activate.service"),
+			UnitAlso: map[string][]string{"homed.service": {"homed-activate.service"}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []Step{{
+			Stage:   SystemTeardown,
+			Op:      Disable,
+			Module:  "leave",
+			Kept:    []string{"homed-activate.service"},
+			Changes: []string{"= homed-activate.service: enabled with homed.service (stay) through Also="},
+		}}
+		if !reflect.DeepEqual(steps, want) {
+			t.Fatalf("got  %+v\nwant %+v", steps, want)
+		}
+	})
+
+	t.Run("mixed disable keeps covered unit and preserves Now", func(t *testing.T) {
+		mods, st, l := newSys(t)
+		mods["stay"].Units.System = []string{"m.service"}
+		mods["leave"].Units.System = []string{"a.service", "b.service"}
+		mods["leave"].Units.Now = true
+		st.Own(state.SystemUnits, "stay", []string{"m.service"})
+		st.Own(state.SystemUnits, "leave", []string{"a.service", "b.service"})
+
+		steps, err := System(Input{Desired: []string{"stay"}, Modules: mods}, Half{
+			State:    st,
+			Layer:    l,
+			Units:    set("m.service", "a.service", "b.service"),
+			UnitAlso: map[string][]string{"m.service": {"b.service"}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []Step{{
+			Stage:   SystemTeardown,
+			Op:      Disable,
+			Module:  "leave",
+			Names:   []string{"a.service"},
+			Now:     true,
+			Kept:    []string{"b.service"},
+			Changes: []string{"= b.service: enabled with m.service (stay) through Also="},
+		}}
+		if !reflect.DeepEqual(steps, want) {
+			t.Fatalf("got  %+v\nwant %+v", steps, want)
+		}
+	})
+
+	t.Run("collateral emits ReEnable in teardown before LayerOff without Now", func(t *testing.T) {
+		root := t.TempDir()
+		leaveDir := filepath.Join(root, "modules/leave")
+		if err := os.MkdirAll(filepath.Join(leaveDir, "system/etc"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mods := module.Set{
+			"stay":  {Name: "stay"},
+			"leave": {Name: "leave", Dir: leaveDir},
+		}
+		mods["stay"].Units.System = []string{"b.service"}
+		mods["leave"].Units.System = []string{"a.service"}
+		mods["leave"].Units.Now = true
+		l := layer.NewSystem(filepath.Join(root, "sysroot"), filepath.Join(root, "state"), map[string]string{"leave": leaveDir})
+		st := &state.State{Modules: []string{"leave"}}
+		st.Own(state.SystemUnits, "stay", []string{"b.service"})
+		st.Own(state.SystemUnits, "leave", []string{"a.service"})
+
+		steps, err := System(Input{Desired: []string{"stay"}, Modules: mods}, Half{
+			State:           st,
+			Layer:           l,
+			Units:           set("a.service", "b.service"),
+			UnitDisable:     map[string]system.DisableImpact{"a.service": {Units: []string{"b.service"}, ByEnable: []string{"b.service"}}},
+			UnitInstallable: map[string]bool{"b.service": true},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []Step{
+			{Stage: SystemTeardown, Op: Disable, Module: "leave", Names: []string{"a.service"}, Now: true},
+			{Stage: SystemTeardown, Op: ReEnable, Names: []string{"b.service"}, Changes: []string{"+ b.service: disabled with a.service; wanted by stay"}},
+			{Stage: SystemTeardown, Op: LayerOff, Module: "leave"},
+		}
+		if !reflect.DeepEqual(steps, want) {
+			t.Fatalf("got  %+v\nwant %+v", steps, want)
+		}
+		if steps[1].Kind() != state.SystemUnits {
+			t.Errorf("ReEnable.Kind() = %q, want %q", steps[1].Kind(), state.SystemUnits)
+		}
+	})
+
+	t.Run("bare template classification: staying restored, leaving/ByEnable allowed, unmanaged refused", func(t *testing.T) {
+		mods, st, l := newSys(t)
+		mods["stay"].Units.System = []string{"worker@kept.service"}
+		st.Own(state.SystemUnits, "stay", []string{"worker@kept.service"})
+		st.Own(state.SystemUnits, "leave", []string{"parent.service", "worker@leaving.service"})
+
+		baseHalf := func(tplInsts []string) Half {
+			return Half{
+				State: st,
+				Layer: l,
+				Units: set("parent.service", "worker@kept.service", "worker@leaving.service", "worker@def.service", "worker@hand.service"),
+				UnitDisable: map[string]system.DisableImpact{
+					"parent.service": {
+						Units:     tplInsts,
+						ByEnable:  []string{"worker@def.service"},
+						Templates: map[string][]string{"worker@.service": tplInsts},
+					},
+				},
+				UnitInstallable: map[string]bool{"worker@kept.service": true},
+			}
+		}
+
+		// With unmanaged sibling -> refused.
+		_, err := System(Input{Desired: []string{"stay"}, Modules: mods}, baseHalf([]string{"worker@def.service", "worker@hand.service", "worker@kept.service", "worker@leaving.service"}))
+		if err == nil || !strings.Contains(err.Error(), "worker@hand.service") || !strings.Contains(err.Error(), "systemctl disable worker@hand.service") {
+			t.Fatalf("unmanaged sibling err = %v", err)
+		}
+
+		// Without unmanaged sibling -> allowed and restores worker@kept.service.
+		steps, err := System(Input{Desired: []string{"stay"}, Modules: mods}, baseHalf([]string{"worker@def.service", "worker@kept.service", "worker@leaving.service"}))
+		if err != nil {
+			t.Fatalf("unexpected err without unmanaged sibling: %v", err)
+		}
+		if len(steps) != 2 || steps[1].Op != ReEnable || !slices.Equal(steps[1].Names, []string{"worker@kept.service"}) {
+			t.Fatalf("steps = %+v, want Disable + ReEnable [worker@kept.service]", steps)
+		}
+	})
+
+	t.Run("collateral refusals: linked and not installable", func(t *testing.T) {
+		mods, st, l := newSys(t)
+		mods["stay"].Units.System = []string{"b.service"}
+		st.Own(state.SystemUnits, "stay", []string{"b.service"})
+		st.Own(state.SystemUnits, "leave", []string{"a.service"})
+		in := Input{Desired: []string{"stay"}, Modules: mods}
+		imp := map[string]system.DisableImpact{"a.service": {Units: []string{"b.service"}, ByEnable: []string{"b.service"}}}
+
+		if _, err := System(in, Half{
+			State: st, Layer: l, Units: set("a.service", "b.service"),
+			UnitDisable: imp, UnitInstallable: map[string]bool{"b.service": true}, UnitLinked: map[string]bool{"b.service": true},
+		}); err == nil || !strings.Contains(err.Error(), "linked unit file") {
+			t.Errorf("linked err = %v", err)
+		}
+
+		if _, err := System(in, Half{
+			State: st, Layer: l, Units: set("a.service", "b.service"),
+			UnitDisable: imp, UnitInstallable: map[string]bool{"b.service": false},
+		}); err == nil || !strings.Contains(err.Error(), "no [Install] directives") {
+			t.Errorf("not-installable err = %v", err)
+		}
+	})
+
+	t.Run("user half refuses staying home/-deployed unit reached via Also= even when unlisted", func(t *testing.T) {
+		root := t.TempDir()
+		home := filepath.Join(root, "home")
+		stateDir := filepath.Join(root, "state")
+		stayDir := filepath.Join(root, "modules/stay")
+		leaveDir := filepath.Join(root, "modules/leave")
+		for _, p := range []string{
+			filepath.Join(stayDir, "home/.config/systemd/user/stay-file.service"),
+			filepath.Join(leaveDir, "home/.config/systemd/user/leave-file.service"),
+		} {
+			if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, []byte("[Install]\nWantedBy=default.target\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		l := layer.NewHome(home, stateDir, map[string]string{"stay": stayDir, "leave": leaveDir})
+		st := &state.State{}
+		for _, m := range []string{"stay", "leave"} {
+			if err := l.Activate(context.Background(), m, st.Modules); err != nil {
+				t.Fatal(err)
+			}
+			st.Modules = append(st.Modules, m)
+		}
+		st.Own(state.UserUnits, "leave", []string{"a.service"})
+		mods := module.Set{
+			"stay":  {Name: "stay", Dir: stayDir},
+			"leave": {Name: "leave", Dir: leaveDir},
+		}
+		in := Input{Desired: []string{"stay"}, Modules: mods}
+		unitDir := filepath.Join(home, ".config/systemd/user")
+
+		// Staying module's home/ file -> refused even though stay doesn't list stay-file.service in [units].user.
+		_, err := User(in, Half{
+			State:       st,
+			Layer:       l,
+			Units:       set("a.service"),
+			UnitDir:     unitDir,
+			UnitDisable: map[string]system.DisableImpact{"a.service": {Units: []string{"stay-file.service"}}},
+		})
+		if err == nil || !strings.Contains(err.Error(), "stay-file.service") || !strings.Contains(err.Error(), "deployed by stay") {
+			t.Fatalf("staying home/ unit err = %v", err)
+		}
+
+		// Staying module's home/-deployed bare template with no enabled instances -> still refused.
+		tplPath := filepath.Join(stayDir, "home/.config/systemd/user/stay-tpl@.service")
+		if err := os.WriteFile(tplPath, []byte("[Install]\nWantedBy=default.target\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.Deactivate(context.Background(), "leave", st.Modules, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.Deactivate(context.Background(), "stay", []string{"stay"}, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.Activate(context.Background(), "stay", nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.Activate(context.Background(), "leave", []string{"stay"}); err != nil {
+			t.Fatal(err)
+		}
+		_, err = User(in, Half{
+			State:       st,
+			Layer:       l,
+			Units:       set("a.service"),
+			UnitDir:     unitDir,
+			UnitDisable: map[string]system.DisableImpact{"a.service": {Templates: map[string][]string{"stay-tpl@.service": nil}}},
+		})
+		if err == nil || !strings.Contains(err.Error(), "stay-tpl@.service") || !strings.Contains(err.Error(), "deployed by stay") {
+			t.Fatalf("staying home/ bare template with no instances err = %v", err)
+		}
+
+		// Concrete Also=stay-tpl@one.service does NOT delete stay-tpl@.service -> allowed.
+		if _, err := User(in, Half{
+			State:       st,
+			Layer:       l,
+			Units:       set("a.service"),
+			UnitDir:     unitDir,
+			UnitDisable: map[string]system.DisableImpact{"a.service": {Units: []string{"stay-tpl@one.service"}}},
+		}); err != nil {
+			t.Fatalf("concrete instance under staying home/ template should be allowed, got %v", err)
+		}
+
+		// Leaving module's own home/ file -> allowed.
+		if _, err := User(in, Half{
+			State:       st,
+			Layer:       l,
+			Units:       set("a.service"),
+			UnitDir:     unitDir,
+			UnitDisable: map[string]system.DisableImpact{"a.service": {Units: []string{"leave-file.service"}}},
+		}); err != nil {
+			t.Fatalf("leaving module's own home/ unit should be allowed, got %v", err)
+		}
+	})
+}

@@ -2483,3 +2483,198 @@ func TestHomeLinkRefusesDeployedFiles(t *testing.T) {
 		}
 	})
 }
+
+func TestUnitAlsoTeardown(t *testing.T) {
+	writeUnit := func(e *env, user bool, name, content string) {
+		t.Helper()
+		dir := filepath.Join(e.root, "usr/lib/systemd/system")
+		if user {
+			dir = filepath.Join(e.root, "usr/lib/systemd/user")
+		}
+		must(t, os.MkdirAll(dir, 0o755))
+		must(t, os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644))
+	}
+
+	t.Run("one-way Also= re-enables staying unit without --now", func(t *testing.T) {
+		e := newEnv(t)
+		writeUnit(e, false, "a.service", "[Install]\nWantedBy=multi-user.target\nAlso=b.service\n")
+		writeUnit(e, false, "b.service", "[Install]\nWantedBy=multi-user.target\n")
+		e.module("stay", "[units]\nsystem = [\"b.service\"]\n", nil)
+		e.module("leave", "[units]\nsystem = [\"a.service\"]\nnow = true\n", nil)
+		must(t, e.run("on", "-y", "stay"))
+		must(t, e.run("on", "-y", "leave"))
+
+		must(t, e.run("off", "-y", "leave"))
+		if got := e.sys.Units(false); !slices.Equal(got, []string{"b.service"}) {
+			t.Fatalf("enabled units after off = %v, want [b.service]", got)
+		}
+		if out := e.out.String(); !strings.Contains(out, "re-enable system units disabled with another unit: b.service") {
+			t.Errorf("plan output missing re-enable step:\n%s", out)
+		}
+		for _, line := range e.sys.Log() {
+			if strings.Contains(line, "enable --now b.service") {
+				t.Errorf("re-enable must not pass --now: %s", line)
+			}
+		}
+		must(t, e.run("apply", "-n"))
+		if !strings.Contains(e.out.String(), "Nothing to do.") {
+			t.Errorf("expected no-op apply after off, got:\n%s", e.out.String())
+		}
+	})
+
+	t.Run("shared Also= keeps staying unit enabled", func(t *testing.T) {
+		e := newEnv(t)
+		writeUnit(e, false, "a.service", "[Install]\nWantedBy=multi-user.target\nAlso=shared.socket\n")
+		writeUnit(e, false, "m.service", "[Install]\nWantedBy=multi-user.target\nAlso=shared.socket\n")
+		writeUnit(e, false, "shared.socket", "[Install]\nWantedBy=sockets.target\n")
+		e.module("stay", "[units]\nsystem = [\"m.service\"]\n", nil)
+		e.module("leave", "[units]\nsystem = [\"a.service\"]\n", nil)
+		must(t, e.run("on", "-y", "stay"))
+		must(t, e.run("on", "-y", "leave"))
+		e.sys.SetUnits(false, append(e.sys.Units(false), "shared.socket")...)
+
+		must(t, e.run("off", "-y", "leave"))
+		if got := e.sys.Units(false); !slices.Equal(got, []string{"m.service", "shared.socket"}) {
+			t.Fatalf("enabled units = %v, want [m.service shared.socket]", got)
+		}
+	})
+
+	t.Run("mutual Also= cycle keeps leaving unit covered by staying module", func(t *testing.T) {
+		e := newEnv(t)
+		writeUnit(e, false, "homed.service", "[Install]\nWantedBy=multi-user.target\nAlso=homed-activate.service\n")
+		writeUnit(e, false, "homed-activate.service", "[Install]\nWantedBy=multi-user.target\nAlso=homed.service\n")
+		e.module("stay", "[units]\nsystem = [\"homed.service\"]\n", nil)
+		e.module("leave", "[units]\nsystem = [\"homed-activate.service\"]\nnow = true\n", nil)
+		must(t, e.run("on", "-y", "stay"))
+		must(t, e.run("on", "-y", "leave"))
+
+		must(t, e.run("off", "-y", "leave"))
+		if got := e.sys.Units(false); !slices.Equal(got, []string{"homed-activate.service", "homed.service"}) {
+			t.Fatalf("enabled units = %v, want both kept", got)
+		}
+		out := e.out.String()
+		if !strings.Contains(out, "keep system units of leave") || strings.Contains(out, "(and stop them)") {
+			t.Errorf("unexpected plan description for kept-only disable:\n%s", out)
+		}
+		if len(e.state(true).Owned[state.SystemUnits]["leave"]) != 0 {
+			t.Errorf("ownership of leave was not dropped: %v", e.state(true).Owned[state.SystemUnits])
+		}
+	})
+
+	t.Run("bare template Also= restores staying instance and refuses unmanaged sibling", func(t *testing.T) {
+		e := newEnv(t)
+		writeUnit(e, false, "parent.service", "[Install]\nWantedBy=multi-user.target\nAlso=worker@.service\n")
+		writeUnit(e, false, "worker@.service", "[Install]\nWantedBy=multi-user.target\nDefaultInstance=def\n")
+		e.module("stay", "[units]\nsystem = [\"worker@kept.service\"]\n", nil)
+		e.module("leave", "[units]\nsystem = [\"parent.service\"]\n", nil)
+		must(t, e.run("on", "-y", "stay"))
+		must(t, e.run("on", "-y", "leave"))
+		e.sys.SetUnits(false, append(e.sys.Units(false), "worker@def.service", "worker@hand.service")...)
+
+		// Unmanaged non-default sibling refuses before mutating host file or units.
+		err := e.run("off", "-y", "leave")
+		if err == nil || !strings.Contains(err.Error(), "worker@hand.service") || !strings.Contains(err.Error(), "systemctl disable worker@hand.service") {
+			t.Fatalf("err = %v, want unmanaged sibling refusal", err)
+		}
+		if got := e.hostModules(); !slices.Equal(got, []string{"stay", "leave"}) {
+			t.Errorf("host modules changed on refusal: %v", got)
+		}
+
+		// Once unmanaged sibling is removed, staying instance is restored and default is disabled.
+		e.sys.SetUnits(false, "parent.service", "worker@kept.service", "worker@def.service")
+		must(t, e.run("off", "-y", "leave"))
+		if got := e.sys.Units(false); !slices.Equal(got, []string{"worker@kept.service"}) {
+			t.Fatalf("enabled units = %v, want [worker@kept.service]", got)
+		}
+	})
+
+	t.Run("partial multi-owner disable failure still restores collateral", func(t *testing.T) {
+		e := newEnv(t)
+		writeUnit(e, false, "a1.service", "[Install]\nWantedBy=multi-user.target\nAlso=b.service\n")
+		writeUnit(e, false, "a2.service", "[Install]\nWantedBy=multi-user.target\n")
+		writeUnit(e, false, "b.service", "[Install]\nWantedBy=multi-user.target\n")
+		e.module("stay", "[units]\nsystem = [\"b.service\"]\n", nil)
+		e.module("m1", "[units]\nsystem = [\"a1.service\"]\n", nil)
+		e.module("m2", "requires = [\"m1\"]\n[units]\nsystem = [\"a2.service\"]\n", nil)
+		must(t, e.run("on", "-y", "stay"))
+		must(t, e.run("on", "-y", "m1"))
+		must(t, e.run("on", "-y", "m2"))
+
+		e.sys.FailDisable("a2.service")
+		if err := e.run("off", "-y", "-f", "m1"); err == nil {
+			t.Fatal("expected off to fail on a2.service")
+		}
+		if got := e.sys.Units(false); !slices.Contains(got, "b.service") {
+			t.Fatalf("collateral b.service left disabled after partial failure: %v", got)
+		}
+	})
+
+	t.Run("user scope Also= and module swap", func(t *testing.T) {
+		e := newEnv(t)
+		writeUnit(e, true, "old.service", "[Install]\nWantedBy=default.target\nAlso=shared.service\n")
+		writeUnit(e, true, "new.service", "[Install]\nWantedBy=default.target\nAlso=shared.service\n")
+		writeUnit(e, true, "shared.service", "[Install]\nWantedBy=default.target\n")
+		e.module("old", "[units]\nuser = [\"old.service\"]\n", nil)
+		e.module("new", "conflicts = [\"old\"]\n[units]\nuser = [\"new.service\"]\n", nil)
+		must(t, e.run("on", "-y", "old"))
+		e.sys.SetUnits(true, "old.service", "shared.service")
+
+		must(t, e.run("on", "-y", "new"))
+		if got := e.sys.Units(true); !slices.Equal(got, []string{"new.service", "shared.service"}) {
+			t.Fatalf("user units after swap = %v, want [new.service shared.service]", got)
+		}
+	})
+
+	t.Run("refuses un-installable collateral before teardown", func(t *testing.T) {
+		e := newEnv(t)
+		writeUnit(e, false, "a.service", "[Install]\nWantedBy=multi-user.target\nAlso=static.service\n")
+		writeUnit(e, false, "static.service", "[Unit]\nDescription=no install\n")
+		e.module("stay", "[units]\nsystem = [\"static.service\"]\n", nil)
+		e.module("leave", "[units]\nsystem = [\"a.service\"]\n", nil)
+		must(t, e.run("on", "-y", "stay"))
+		must(t, e.run("on", "-y", "leave"))
+
+		err := e.run("off", "-y", "leave")
+		if err == nil || !strings.Contains(err.Error(), "no [Install] directives") {
+			t.Fatalf("static collateral err = %v", err)
+		}
+		if got := e.hostModules(); !slices.Equal(got, []string{"stay", "leave"}) {
+			t.Errorf("host modules changed on refusal: %v", got)
+		}
+	})
+
+	t.Run("re-enable failure reports recovery command and preserves ownership", func(t *testing.T) {
+		e := newEnv(t)
+		writeUnit(e, false, "a.service", "[Install]\nWantedBy=multi-user.target\nAlso=b.service\n")
+		writeUnit(e, false, "b.service", "[Install]\nWantedBy=multi-user.target\n")
+		e.module("stay", "[units]\nsystem = [\"b.service\"]\n", nil)
+		e.module("leave", "[units]\nsystem = [\"a.service\"]\n", nil)
+		must(t, e.run("on", "-y", "stay"))
+		must(t, e.run("on", "-y", "leave"))
+
+		e.sys.FailEnable("b.service")
+		err := e.run("off", "-y", "leave")
+		if err == nil || !strings.Contains(err.Error(), "systemctl enable b.service") {
+			t.Fatalf("re-enable failure err = %v, want recovery command", err)
+		}
+		if got := e.state(true).Owned[state.SystemUnits]["leave"]; !slices.Equal(got, []string{"a.service"}) {
+			t.Errorf("ownership reconciled despite re-enable failure: %v", got)
+		}
+	})
+
+	t.Run("user home/-deployed unit reached via Also= is refused", func(t *testing.T) {
+		e := newEnv(t)
+		writeUnit(e, true, "a.service", "[Install]\nWantedBy=default.target\nAlso=custom.service\n")
+		e.module("stay", "", map[string]string{
+			"home/.config/systemd/user/custom.service": "[Install]\nWantedBy=default.target\n",
+		})
+		e.module("leave", "[units]\nuser = [\"a.service\"]\n", nil)
+		must(t, e.run("on", "-y", "stay"))
+		must(t, e.run("on", "-y", "leave"))
+
+		err := e.run("off", "-y", "leave")
+		if err == nil || !strings.Contains(err.Error(), "custom.service") || !strings.Contains(err.Error(), "deployed by stay") {
+			t.Fatalf("home/-deployed Also= err = %v", err)
+		}
+	})
+}

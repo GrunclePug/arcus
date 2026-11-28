@@ -1,7 +1,9 @@
 package system
 
 import (
+	"errors"
 	"io"
+	iofs "io/fs"
 	"maps"
 	"os"
 	"os/exec"
@@ -277,7 +279,7 @@ func TestEnabledUnits(t *testing.T) {
 	sysDirs := UnitDirs(root, cfg, data, false)
 	userDirs := UnitDirs(root, cfg, data, true)
 	etcSys := sysDirs[0]
-	libSys := sysDirs[2]
+	libSys := sysDirs[len(sysDirs)-1]
 
 	// Missing dirs[0] is an empty set, not an error.
 	if got, err := EnabledUnits(root, sysDirs); err != nil || len(got) != 0 {
@@ -692,5 +694,260 @@ func TestWithAlso(t *testing.T) {
 		if got := IsTemplate(in); got != want {
 			t.Errorf("IsTemplate(%q) = %v, want %v", in, got, want)
 		}
+	}
+}
+
+func TestDisableClosureAndInstallable(t *testing.T) {
+	root := t.TempDir()
+	dirs := UnitDirs(root, filepath.Join(root, "home/.config"), filepath.Join(root, "home/.local/share"), false)
+	etcDir, libDir := dirs[0], dirs[2]
+	write := func(dir, name, content string) {
+		t.Helper()
+		writeTestFile(t, filepath.Join(dir, name), content, 0o644)
+	}
+
+	// Chain through unenabled Also=-only intermediate unit and mutual cycle.
+	write(libDir, "top.service", "[Install]\nWantedBy=multi-user.target\nAlso=mid.service\n")
+	write(libDir, "mid.service", "[Install]\nAlso=leaf.service\n")
+	write(libDir, "leaf.service", "[Install]\nWantedBy=multi-user.target\n")
+	write(libDir, "cyc-a.service", "[Install]\nWantedBy=multi-user.target\nAlso=cyc-b.service\n")
+	write(libDir, "cyc-b.service", "[Install]\nWantedBy=multi-user.target\nAlso=cyc-a.service\n")
+
+	// Bare template with DefaultInstance=, %i sub-unit, and exact override on another instance.
+	write(libDir, "worker@.service", "[Install]\nWantedBy=multi-user.target\nDefaultInstance=one\nAlso=sub@%i.service\n")
+	write(libDir, "sub@.service", "[Install]\nWantedBy=multi-user.target\n")
+	write(etcDir, "worker@two.service", "[Install]\nAlso=override-leaf.service\n")
+	write(libDir, "caller-tpl.service", "[Install]\nWantedBy=multi-user.target\nAlso=worker@.service\n")
+
+	// Masked bare template (skipped) vs missing bare template (still catches exact instances).
+	write(libDir, "masked-tpl@.service", "[Install]\nWantedBy=multi-user.target\n")
+	makeTestLink(t, "/dev/null", filepath.Join(etcDir, "masked-tpl@.service"))
+	write(etcDir, "masked-tpl@exact.service", "[Install]\nWantedBy=multi-user.target\n")
+	write(etcDir, "missing-tpl@exact.service", "[Install]\nWantedBy=multi-user.target\n")
+	write(libDir, "caller-mask-miss.service", "[Install]\nWantedBy=multi-user.target\nAlso=masked-tpl@.service missing-tpl@.service\n")
+
+	// Static bare template does not enter ByEnable.
+	write(libDir, "static@.service", "[Install]\nDefaultInstance=def\n")
+	write(libDir, "caller-static-tpl.service", "[Install]\nWantedBy=multi-user.target\nAlso=static@.service\n")
+
+	// Installable fixtures.
+	write(libDir, "alias-only.service", "[Install]\nAlias=ao.service\n")
+	write(libDir, "cleared.service", "[Install]\nWantedBy=multi-user.target\nWantedBy=\n")
+	write(libDir, "also-only.service", "[Install]\nAlso=leaf.service\n")
+	write(libDir, "tpl-alias-only@.service", "[Install]\nAlias=tao@%i.service\n")
+	write(libDir, "getty@.service", "[Install]\nAlias=autovt@.service\nWantedBy=getty.target\nDefaultInstance=tty1\n")
+
+	// In-tree alias vs external linked unit and linked bare template in dirs[0].
+	makeTestLink(t, "/usr/lib/systemd/system/leaf.service", filepath.Join(etcDir, "alias-leaf.service"))
+	writeTestFile(t, filepath.Join(root, "opt/ext/linked.service"), "[Install]\nWantedBy=multi-user.target\n", 0o644)
+	makeTestLink(t, "/opt/ext/linked.service", filepath.Join(etcDir, "linked.service"))
+	writeTestFile(t, filepath.Join(root, "opt/ext/ltpl@.service"), "[Install]\nWantedBy=multi-user.target\n", 0o644)
+	makeTestLink(t, "/opt/ext/ltpl@.service", filepath.Join(etcDir, "ltpl@.service"))
+	write(etcDir, "ltpl@exact.service", "[Install]\nWantedBy=multi-user.target\n")
+
+	// Chain through unenabled Also=-only intermediate.
+	imp, err := DisableClosure(root, dirs, map[string]bool{"leaf.service": true}, "top.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"leaf.service", "mid.service"}; !slices.Equal(imp.Units, want) {
+		t.Errorf("top Units = %v, want %v", imp.Units, want)
+	}
+	if want := []string{"leaf.service"}; !slices.Equal(imp.ByEnable, want) {
+		t.Errorf("top ByEnable = %v, want %v (mid is Also=-only)", imp.ByEnable, want)
+	}
+
+	// Mutual cycle excludes starting unit and terminates.
+	impCyc, err := DisableClosure(root, dirs, map[string]bool{"cyc-a.service": true, "cyc-b.service": true}, "cyc-a.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"cyc-b.service"}; !slices.Equal(impCyc.Units, want) {
+		t.Errorf("cyc-a Units = %v, want %v", impCyc.Units, want)
+	}
+
+	// Bare template matches enabled instances without recursing into override.
+	impTpl, err := DisableClosure(root, dirs, map[string]bool{
+		"worker@one.service": true, "worker@two.service": true,
+		"sub@one.service": true, "sub@two.service": true, "override-leaf.service": true,
+	}, "caller-tpl.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"sub@one.service", "worker@one.service", "worker@two.service"}; !slices.Equal(impTpl.Units, want) {
+		t.Errorf("caller-tpl Units = %v, want %v", impTpl.Units, want)
+	}
+	if want := []string{"sub@one.service", "worker@one.service"}; !slices.Equal(impTpl.ByEnable, want) {
+		t.Errorf("caller-tpl ByEnable = %v, want %v", impTpl.ByEnable, want)
+	}
+	if want := []string{"worker@one.service", "worker@two.service"}; !slices.Equal(impTpl.Templates["worker@.service"], want) {
+		t.Errorf("caller-tpl Templates = %v, want %v", impTpl.Templates, want)
+	}
+
+	// Masked bare template is skipped; missing bare template still catches exact instances.
+	impMaskMiss, err := DisableClosure(root, dirs, map[string]bool{
+		"masked-tpl@exact.service": true, "missing-tpl@exact.service": true,
+	}, "caller-mask-miss.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, hasMasked := impMaskMiss.Templates["masked-tpl@.service"]; hasMasked {
+		t.Errorf("masked bare template should be skipped: %v", impMaskMiss.Templates)
+	}
+	if want := []string{"missing-tpl@exact.service"}; !slices.Equal(impMaskMiss.Templates["missing-tpl@.service"], want) {
+		t.Errorf("missing bare template Templates = %v, want %v", impMaskMiss.Templates, want)
+	}
+
+	// Static bare template does not exempt its DefaultInstance= via ByEnable.
+	impStatic, err := DisableClosure(root, dirs, map[string]bool{"static@def.service": true}, "caller-static-tpl.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(impStatic.ByEnable) != 0 {
+		t.Errorf("static template ByEnable = %v, want empty", impStatic.ByEnable)
+	}
+
+	// Installable checks.
+	for unit, want := range map[string]bool{
+		"leaf.service":             true,
+		"alias-only.service":       true,
+		"getty@tty1.service":       true,
+		"cleared.service":          false,
+		"also-only.service":        false,
+		"tpl-alias-only@x.service": false,
+		"missing.service":          false,
+	} {
+		got, err := Installable(root, dirs, unit)
+		if err != nil {
+			t.Fatalf("Installable(%q): %v", unit, err)
+		}
+		if got != want {
+			t.Errorf("Installable(%q) = %v, want %v", unit, got, want)
+		}
+	}
+
+	// IsLinkedUnit checks (concrete instances do not inherit linked bare template).
+	for unit, want := range map[string]bool{
+		"linked.service":     true,
+		"ltpl@.service":      true,
+		"ltpl@exact.service": false,
+		"ltpl@inst.service":  false,
+		"leaf.service":       false,
+		"alias-leaf.service": false,
+	} {
+		got, err := IsLinkedUnit(root, dirs, unit)
+		if err != nil {
+			t.Fatalf("IsLinkedUnit(%q): %v", unit, err)
+		}
+		if got != want {
+			t.Errorf("IsLinkedUnit(%q) = %v, want %v", unit, got, want)
+		}
+	}
+
+	if os.Geteuid() != 0 {
+		secretUnit := filepath.Join(etcDir, "secret-inst.service")
+		writeTestFile(t, secretUnit, "[Install]\nWantedBy=multi-user.target\n", 0o600)
+		if err := os.Chmod(secretUnit, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(secretUnit, 0o644) })
+		if _, err := Installable(root, dirs, "secret-inst.service"); !errors.Is(err, iofs.ErrPermission) {
+			t.Errorf("Installable(0000 unit) err = %v, want ErrPermission", err)
+		}
+	}
+}
+
+func TestDisableClosureWithSystemctl(t *testing.T) {
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		t.Skip("systemctl is not installed")
+	}
+	root := t.TempDir()
+	libSys := filepath.Join(root, "usr/lib/systemd/system")
+	etcSys := filepath.Join(root, "etc/systemd/system")
+	if err := os.MkdirAll(etcSys, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dirs := UnitDirs(root, filepath.Join(root, "home/u/.config"), filepath.Join(root, "home/u/.local/share"), false)
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("systemctl", append([]string{"--root=" + root}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("systemctl %v: %v\n%s", args, err, out)
+		}
+	}
+	writeLib := func(name, body string) {
+		t.Helper()
+		writeTestFile(t, filepath.Join(libSys, name), body, 0o644)
+	}
+
+	// 1. Chain through unenabled Also=-only intermediate.
+	writeLib("top.service", "[Install]\nWantedBy=multi-user.target\nAlso=mid.service\n")
+	writeLib("mid.service", "[Install]\nAlso=leaf.service\n")
+	writeLib("leaf.service", "[Install]\nWantedBy=multi-user.target\n")
+
+	// 2. Bare template with default, non-default sibling, %i sub, and override.
+	writeLib("worker@.service", "[Install]\nWantedBy=multi-user.target\nDefaultInstance=one\nAlso=sub@%i.service\n")
+	writeLib("sub@.service", "[Install]\nWantedBy=multi-user.target\n")
+	writeLib("override-leaf.service", "[Install]\nWantedBy=multi-user.target\n")
+	writeTestFile(t, filepath.Join(etcSys, "worker@two.service"), "[Install]\nWantedBy=multi-user.target\nAlso=override-leaf.service\n", 0o644)
+	writeLib("caller-tpl.service", "[Install]\nWantedBy=multi-user.target\nAlso=worker@.service\n")
+
+	// 3. Masked bare template leaves exact instance alone; missing bare template removes it.
+	writeLib("mtpl@.service", "[Install]\nWantedBy=multi-user.target\n")
+	makeTestLink(t, "/dev/null", filepath.Join(etcSys, "mtpl@.service"))
+	writeTestFile(t, filepath.Join(etcSys, "mtpl@exact.service"), "[Install]\nWantedBy=multi-user.target\n", 0o644)
+	writeTestFile(t, filepath.Join(etcSys, "misstpl@exact.service"), "[Install]\nWantedBy=multi-user.target\n", 0o644)
+	writeLib("caller-mask.service", "[Install]\nWantedBy=multi-user.target\nAlso=mtpl@.service misstpl@.service\n")
+
+	run("enable", "top.service", "caller-tpl.service", "worker@two.service", "sub@two.service", "mtpl@exact.service", "misstpl@exact.service", "caller-mask.service")
+
+	for _, target := range []string{"top.service", "caller-tpl.service", "caller-mask.service"} {
+		pre, err := EnabledUnits(root, dirs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		imp, err := DisableClosure(root, dirs, pre, target)
+		if err != nil {
+			t.Fatalf("DisableClosure(%q): %v", target, err)
+		}
+		run("disable", target)
+		post, err := EnabledUnits(root, dirs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var removed []string
+		for u := range pre {
+			if !post[u] && u != target {
+				removed = append(removed, u)
+			}
+		}
+		slices.Sort(removed)
+		var predicted []string
+		for _, u := range imp.Units {
+			if pre[u] {
+				predicted = append(predicted, u)
+			}
+		}
+		if !slices.Equal(predicted, removed) {
+			t.Errorf("disable %s: DisableClosure predicted %v, real systemctl removed %v", target, predicted, removed)
+		}
+	}
+
+	// External linked unit: real systemctl disable deletes its top-level link and IsLinkedUnit detects it.
+	writeTestFile(t, filepath.Join(root, "opt/mod/ext.service"), "[Install]\nWantedBy=multi-user.target\n", 0o644)
+	makeTestLink(t, "/opt/mod/ext.service", filepath.Join(etcSys, "ext.service"))
+	wants := filepath.Join(etcSys, "multi-user.target.wants")
+	if err := os.MkdirAll(wants, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	makeTestLink(t, "/etc/systemd/system/ext.service", filepath.Join(wants, "ext.service"))
+	writeLib("caller-ext.service", "[Install]\nWantedBy=multi-user.target\nAlso=ext.service\n")
+	run("enable", "caller-ext.service")
+	if linked, err := IsLinkedUnit(root, dirs, "ext.service"); err != nil || !linked {
+		t.Fatalf("IsLinkedUnit(ext.service) = %v, %v, want true", linked, err)
+	}
+	run("disable", "caller-ext.service")
+	if _, err := os.Lstat(filepath.Join(etcSys, "ext.service")); !errors.Is(err, iofs.ErrNotExist) {
+		t.Errorf("expected real systemctl disable to delete external link ext.service, lstat err = %v", err)
 	}
 }
