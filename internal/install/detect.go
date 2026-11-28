@@ -32,7 +32,7 @@ func Detect(root string) Hardware {
 	return h
 }
 
-// Modules returns the installer modules the hardware needs.
+// Modules returns the starter modules the hardware needs.
 func (h Hardware) Modules() []string {
 	var mods []string
 	if m := vmModules[h.VM]; m != "" {

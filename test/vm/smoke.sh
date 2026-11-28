@@ -140,7 +140,7 @@ scenario_check() {
 '
 	vm check-uefi uefi 24G "$(echo "$checks" | sed 's/PLAN/uefi-btrfs.toml/')"
 	expect check-uefi "disk      /dev/vda, 24 GiB, wiped" "system    UEFI, linux, btrfs root" \
-		"modules   machine base btrfs-snapshots vm-qemu" "arcus-vm: plan accepted" \
+		"modules   base machine shell sway btrfs-snapshots vm-qemu" "arcus-vm: plan accepted" \
 		"/dev/vdb is the live medium" "arcus-vm: live medium refused" "arcus-vm: done" \
 		"vm         QEMU" "modules    vm-qemu"
 	vm check-bios bios 24G "$(echo "$checks" | sed 's/PLAN/bios-xfs.toml/')"
@@ -156,6 +156,10 @@ scenario_install() {
 	booted install
 	guest install "swap on zram" 'swapon --show=NAME --noheadings | grep -q zram'
 	guest install "snapper has a root config" 'snapper -c root list'
+	guest install "starter config and desktop profile written" 'test -f /home/tester/.config/arcus/config.toml && test -f /home/tester/.config/arcus/profiles/desktop.toml && grep -q desktop /home/tester/.local/state/arcus/host.toml'
+	guest install "starter home symlinks deployed" 'test "$(readlink /home/tester/.inputrc)" = /home/tester/.config/arcus/modules/shell/home/.inputrc && test "$(readlink /home/tester/.config/sway/config)" = /home/tester/.config/arcus/modules/sway/home/.config/sway/config'
+	guest install "sway desktop packages installed" 'pacman -Q sway foot wmenu swaybg polkit ttf-dejavu'
+	guest install "no .orig backups left in home" 'test -z "$(find /home/tester -name "*.orig")"'
 	stop install
 }
 

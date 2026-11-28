@@ -1,0 +1,5 @@
+description = "Shell tools and readline config"
+category    = "system"
+
+[packages]
+pacman = ["bash-completion", "ripgrep", "tmux", "vim"]

@@ -5,7 +5,7 @@ include config.mk
 
 export CGO_ENABLED = 0
 
-SRC = $(shell find cmd internal -type f 2>/dev/null) go.mod go.sum config.mk  # includes embedded files
+SRC = $(shell find cmd internal examples -type f 2>/dev/null) go.mod go.sum config.mk  # includes embedded files
 BIN = bin/arcus bin/arcus-install
 
 # Module paths of the Charm TUI stack. Only arcus-install may link them.

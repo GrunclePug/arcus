@@ -29,7 +29,7 @@ type Env struct {
 	Timezones []string
 	Locales   []string
 	Keymaps   []string
-	// Modules loads what the plan can select: the installer modules, or
+	// Modules loads what the plan can select: the starter config, or
 	// the dotfiles repository's modules and profiles.
 	Modules func(*install.Plan) (module.Set, profile.Set, error)
 	// Save writes the plan and returns where.
@@ -68,6 +68,7 @@ type model struct {
 	result   Result
 	modules  module.Set
 	profiles profile.Set
+	picked   []string // independent module selections kept across profile toggles
 	pages    []page
 	at       int
 	cur      step
@@ -99,6 +100,11 @@ func Run(env Env, p *install.Plan) (Result, error) {
 
 func newModel(env Env, p *install.Plan) *model {
 	m := &model{env: env, plan: p, result: Result{Plan: p}, height: 24}
+	if p.Host.Modules != nil {
+		m.picked = slices.Clone(p.Host.Modules)
+	} else if p.Dotfiles.URL == "" {
+		m.picked = append([]string{"base"}, env.Hardware.Modules()...)
+	}
 	m.pages = pages()
 	m.cur, _ = m.pages[0].build(m)
 	return m
@@ -277,9 +283,14 @@ func pages() []page {
 			}, newField("name", m.plan.User.Name, false), newField("password", m.result.Password, true), newField("again", m.result.Password, true)), nil
 		}},
 		{build: func(m *model) (step, tea.Cmd) {
-			f := newForm("Dotfiles", "A git repository with your arcus config (optional). Empty: the installer's own modules.", func(v []string) error {
+			f := newForm("Dotfiles", "A git repository with your arcus config (optional). Empty: the starter config.", func(v []string) error {
 				if v[0] != m.plan.Dotfiles.URL {
 					m.plan.Host.Profiles, m.plan.Host.Modules = nil, nil
+					if v[0] == "" {
+						m.picked = append([]string{"base"}, m.env.Hardware.Modules()...)
+					} else {
+						m.picked = nil
+					}
 				}
 				m.plan.Dotfiles.URL, m.plan.Dotfiles.Path, m.plan.Dotfiles.Arcus = v[0], v[1], v[2]
 				return m.check("dotfiles.")
@@ -378,26 +389,24 @@ func profiles(m *model) (step, tea.Cmd) {
 		submit:   func(v []string) { m.plan.Host.Profiles = v }}, nil
 }
 
-// modules offers every module by category. With the installer modules,
-// detected hardware starts checked, and zram and btrfs-snapshots follow the
-// disk screens; with dotfiles, the chosen profiles' modules are fixed.
+// modules offers every module by category. With the starter config,
+// base and detected hardware start checked and btrfs-snapshots follows the
+// disk screen; modules brought in by chosen profiles are fixed.
 func modules(m *model) (step, tea.Cmd) {
 	fromProfiles := map[string]bool{}
 	for _, name := range m.plan.Host.Profiles {
-		for _, mod := range m.profiles[name].Modules {
-			fromProfiles[mod] = true
+		if p := m.profiles[name]; p != nil {
+			for _, mod := range p.Modules {
+				fromProfiles[mod] = true
+			}
 		}
 	}
 	dotfiles := m.plan.Dotfiles.URL != ""
-	defaults := m.plan.Host.Modules
-	if !dotfiles && defaults == nil {
-		defaults = append([]string{"base"}, m.env.Hardware.Modules()...)
-	}
 
 	byCategory := map[string][]item{}
 	for _, name := range slices.Sorted(maps.Keys(m.modules)) {
 		mod := m.modules[name]
-		it := item{label: name, value: name, desc: mod.Description, checked: slices.Contains(defaults, name)}
+		it := item{label: name, value: name, desc: mod.Description, checked: slices.Contains(m.picked, name)}
 		switch {
 		case name == machine.Name:
 			it.checked, it.fixed, it.note = true, true, "always"
@@ -412,13 +421,32 @@ func modules(m *model) (step, tea.Cmd) {
 	for _, c := range slices.SortedFunc(maps.Keys(byCategory), module.CompareCategories) {
 		sections = append(sections, section{name: cmp.Or(c, "other"), items: byCategory[c]})
 	}
-	help := "Detected hardware is checked. arcus installs these on first apply; change them later with arcus on/off."
-	if dotfiles {
+	var help string
+	switch {
+	case len(fromProfiles) > 0 && !dotfiles:
+		help = "Profile modules are fixed (edit the profile to change them); detected hardware is checked, and extra modules change with arcus on/off."
+	case len(fromProfiles) > 0:
 		help = "Your profiles' modules are fixed; add any others. arcus installs these on first apply; change them later with arcus on/off."
+	case !dotfiles:
+		help = "Detected hardware is checked. arcus installs these on first apply; change them later with arcus on/off."
+	default:
+		help = "Add any modules. arcus installs these on first apply; change them later with arcus on/off."
 	}
 	return &multi{title: "Modules", help: help,
 		sections: sections, submit: func(v []string) {
-			m.plan.Host.Modules = slices.DeleteFunc(v, func(name string) bool { return fromProfiles[name] || name == machine.Name })
+			var picked []string
+			for _, name := range m.picked {
+				if fromProfiles[name] && name != machine.Name && !(name == "btrfs-snapshots" && !dotfiles) {
+					picked = append(picked, name)
+				}
+			}
+			for _, name := range v {
+				if !fromProfiles[name] && name != machine.Name && !(name == "btrfs-snapshots" && !dotfiles) {
+					picked = append(picked, name)
+				}
+			}
+			m.picked = picked
+			m.plan.Host.Modules = slices.DeleteFunc(slices.Clone(v), func(name string) bool { return fromProfiles[name] || name == machine.Name })
 		}}, nil
 }
 

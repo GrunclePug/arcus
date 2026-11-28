@@ -19,4 +19,5 @@ password_hash = "$6$arcusvmtest$tzEF88V32dcYDJZa4UQwMy1PUekFDO.C9AyBGC8H794K5gcJ
 wheel         = true
 
 [host]
-modules = ["base", "btrfs-snapshots", "vm-qemu"]
+profiles = ["desktop"]
+modules  = ["btrfs-snapshots", "vm-qemu"]

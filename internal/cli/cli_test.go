@@ -16,8 +16,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/grunclepug/arcus/examples"
 	"github.com/grunclepug/arcus/internal/host"
 	"github.com/grunclepug/arcus/internal/layer"
+	"github.com/grunclepug/arcus/internal/machine"
 	"github.com/grunclepug/arcus/internal/plan"
 	"github.com/grunclepug/arcus/internal/state"
 	"github.com/grunclepug/arcus/internal/system/fake"
@@ -2677,4 +2679,38 @@ func TestUnitAlsoTeardown(t *testing.T) {
 			t.Fatalf("home/-deployed Also= err = %v", err)
 		}
 	})
+}
+
+func TestStarterConfigExamples(t *testing.T) {
+	e := newEnv(t)
+	cfgDir := filepath.Join(e.home, ".config/arcus")
+	must(t, os.CopyFS(cfgDir, examples.FS))
+	facts := machine.Facts{UEFI: true, Kernels: []string{"linux"}, Firmware: true, GRUB: true, Filesystems: []string{"btrfs", "vfat"}, Zram: true}
+	must(t, facts.Write(filepath.Join(e.root, machine.Dir, machine.Name)))
+
+	must(t, e.run("ls"))
+	if out := e.out.String(); !strings.Contains(out, "desktop") || !strings.Contains(out, "sway") || !strings.Contains(out, "shell") {
+		t.Fatalf("ls output missing starter entries:\n%s", out)
+	}
+
+	must(t, e.run("plan", "desktop"))
+	if out := e.out.String(); !strings.Contains(out, "sway") || !strings.Contains(out, "deploy the home files of shell") || !strings.Contains(out, "deploy the home files of sway") {
+		t.Fatalf("plan desktop output missing expected steps:\n%s", out)
+	}
+
+	must(t, e.run("on", "-y", "desktop"))
+	for rel, modPath := range map[string]string{
+		".inputrc":            filepath.Join(cfgDir, "modules/shell/home/.inputrc"),
+		".config/sway/config": filepath.Join(cfgDir, "modules/sway/home/.config/sway/config"),
+	} {
+		got, err := os.Readlink(filepath.Join(e.home, rel))
+		must(t, err)
+		if got != modPath {
+			t.Errorf("~/%s -> %q, want %q", rel, got, modPath)
+		}
+	}
+	must(t, e.run("apply", "-n"))
+	if !strings.Contains(e.out.String(), "Nothing to do.") {
+		t.Fatalf("expected no-op apply after on desktop:\n%s", e.out.String())
+	}
 }

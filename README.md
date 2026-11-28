@@ -63,12 +63,12 @@ Without a clone, `arcus update` replaces the installed binary with the latest re
 ## Usage
 
 ```sh
-arcus new shell            # create ~/.config/arcus/modules/shell/module.toml
+arcus new editor           # create ~/.config/arcus/modules/editor/module.toml
 arcus new -unlisted mine   # a module of what this machine has that no module that's on lists
-arcus plan shell           # show what turning it on would do
-arcus on shell             # turn it on and record it in this machine's host file
+arcus plan editor          # show what turning it on would do
+arcus on editor            # turn it on and record it in this machine's host file
 arcus ls                   # every profile and module, its status and stack rank
-arcus off shell            # turn it off again
+arcus off editor           # turn it off again
 arcus apply                # make the system match the host file
 arcus doctor               # check state, ledgers and deployed files; list what no module declares
 arcus clean                # remove packages no module lists (shows its plan, asks first)
@@ -95,9 +95,9 @@ arcus clean -n             # shows what's left: dependencies nothing needs any m
 
 `arcus doctor` also reports what the modules don't account for: a machine module older than what `arcus machine` would write, enabled system units in `/etc/systemd/system` and user units in `$XDG_CONFIG_HOME/systemd/user` and groups that no module that's on lists (following `Also=` in the unit files), and, with aurlock, approvals no module lists. It only reports these; `-fix` never disables a unit, leaves a group or rewrites the machine module. On machines upgraded from an older arcus whose `base` module predates this check, add the system defaults you want kept (`getty@tty1.service`, `remote-fs.target`, `systemd-userdbd.socket`) to `base`. Any user unit a module previously adopted through a global `/etc/systemd/user` link is enabled once in `$XDG_CONFIG_HOME/systemd/user` on the next `apply`.
 
-On the Arch ISO, `arcus-install` opens a TUI that writes an install plan and runs it, or saves it to `/root/plan.toml`. `arcus-install detect` shows the hardware modules a machine needs, `arcus-install check plan.toml` validates a plan against the machine without changing anything, and `arcus-install run plan.toml` installs it.
+On the Arch ISO, `arcus-install` opens a TUI that writes an install plan and runs it, or saves it to `/root/plan.toml`. Without a dotfiles repository, it writes the starter config in [examples/](examples/) (`config.toml`, `profiles/` and `modules/`, including a `desktop` profile with Sway — log in on tty1 and run `sway`) to `~/.config/arcus`. `arcus-install detect` shows the hardware modules a machine needs, `arcus-install check plan.toml` validates a plan against the machine without changing anything, and `arcus-install run plan.toml` installs it.
 
-A module is a directory with a `module.toml`, a `home/` tree that is linked into `$HOME`, a `system/` tree that is copied into `/etc` and `/usr/local` as root, and a `pkg/<name>/PKGBUILD` recipe for each own build. Python bytecode caches (`__pycache__/`) in `home/` and `system/` are never deployed. The next `apply` removes those an earlier version deployed, and in `home/` also ones Python has rewritten since:
+See [examples/](examples/) for a working starter configuration laid out like `~/.config/arcus` that you can read or copy (`config.toml`, `profiles/` and `modules/`). A module is a directory with a `module.toml`, a `home/` tree that is linked into `$HOME`, a `system/` tree that is copied into `/etc` and `/usr/local` as root, and a `pkg/<name>/PKGBUILD` recipe for each own build. Python bytecode caches (`__pycache__/`) in `home/` and `system/` are never deployed. The next `apply` removes those an earlier version deployed, and in `home/` also ones Python has rewritten since:
 
 ```toml
 description = "Shared Wayland session pieces"
